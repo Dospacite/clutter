@@ -1,0 +1,42 @@
+[package]
+name = "clutter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Conservative Flutter AOT pseudocode recovery for Android APK and AAB artifacts"
+license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/clutter"
+keywords = ["flutter", "dart", "aot", "reverse-engineering", "android"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["test-apk/**", "fixtures/**", "dist/**"]
+
+[[bin]]
+name = "clutter"
+path = "src/main.rs"
+
+[dependencies]
+capstone = "0.13"
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1"
+hex = "0.4"
+gimli = { version = "0.32", default-features = false, features = ["read"] }
+object = { version = "0.37", features = ["read"] }
+prost = "0.14"
+rayon = "1.10"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+zip = { version = "4.3", default-features = false, features = ["deflate", "deflate64", "bzip2", "zstd"] }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

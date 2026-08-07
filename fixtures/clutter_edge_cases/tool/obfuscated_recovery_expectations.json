@@ -1,0 +1,42 @@
+{
+  "must_recover": [
+    "main",
+    "EdgeCaseApp",
+    "EdgeCaseScreen",
+    "_EdgeCaseScreenState",
+    "EdgeCaseHarness",
+    "recursiveChecksum",
+    "optionalPositional",
+    "optionalNamed",
+    "genericFirst",
+    "classifyRecord",
+    "closurePipeline",
+    "countedStream",
+    "guardedAsyncValue",
+    "GenericBox",
+    "EdgeVector",
+    "WordMetrics",
+    "EdgeFailure"
+  ],
+  "must_retain_by_pragma": [
+    "retainedTopLevelEntrypoint",
+    "retainedStaticEntrypoint"
+  ],
+  "must_be_tree_shaken": [
+    "treeShakenSentinel"
+  ],
+  "minimum_metrics": {
+    "recovered_functions": 30,
+    "functions_with_source_locations": 30,
+    "resolved_direct_call_sites": 150
+  },
+  "minimum_resolved_call_ratio": 0.9,
+  "minimum_source_location_ratio": 0.9,
+  "minimum_split_debug_name_ratio": 1.0,
+  "known_irrecoverable_identifiers": [
+    "ArithmeticOperation",
+    "AddOperation",
+    "MultiplyOperation"
+  ],
+  "irrecoverable_reason": "These types have no standalone AOT code after inlining, and Flutter obfuscation removes their names from both the snapshot and split debug ELF."
+}

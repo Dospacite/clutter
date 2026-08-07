@@ -1,0 +1,20 @@
+/target/
+/dist/
+/*.clutter/
+/.clutter-*/
+
+# Input application packages and local test artifacts
+*.apk
+*.apks
+*.aab
+/test-apk/
+
+# Generated decompilation output and timestamped replacements
+/mph/
+/tp/
+/*.backup.*/
+
+# Generated Flutter fixture state and build products
+/fixtures/**/.dart_tool/
+/fixtures/**/.flutter-plugins-dependencies
+/fixtures/**/build/

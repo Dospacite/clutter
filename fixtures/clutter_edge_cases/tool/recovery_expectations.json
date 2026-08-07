@@ -1,0 +1,48 @@
+{
+  "must_recover": [
+    "main",
+    "EdgeCaseApp",
+    "EdgeCaseScreen",
+    "_EdgeCaseScreenState",
+    "EdgeCaseHarness",
+    "recursiveChecksum",
+    "optionalPositional",
+    "optionalNamed",
+    "genericFirst",
+    "classifyRecord",
+    "closurePipeline",
+    "countedStream",
+    "guardedAsyncValue",
+    "ArithmeticOperation",
+    "AddOperation",
+    "MultiplyOperation",
+    "GenericBox",
+    "EdgeVector",
+    "WordMetrics",
+    "EdgeFailure"
+  ],
+  "must_retain_by_pragma": [
+    "retainedTopLevelEntrypoint",
+    "retainedStaticEntrypoint"
+  ],
+  "must_be_tree_shaken": [
+    "treeShakenSentinel"
+  ],
+  "semantic_features": [
+    "async state machines",
+    "async-star stream state machines",
+    "capturing and non-capturing closures",
+    "constructors and factory constructors",
+    "default optional positional and named arguments",
+    "enhanced enums",
+    "extensions",
+    "generic classes and generic functions",
+    "getters and operators",
+    "inheritance, interfaces, and mixins",
+    "private identifiers",
+    "records and pattern switches",
+    "recursion",
+    "try/catch/finally",
+    "Unicode and escaped strings"
+  ]
+}

@@ -1,0 +1,376 @@
+diff --git a/runtime/bin/analyze_snapshot.cc b/runtime/bin/analyze_snapshot.cc
+index eb77134d..33afba13 100644
+--- a/runtime/bin/analyze_snapshot.cc
++++ b/runtime/bin/analyze_snapshot.cc
+@@ -9,7 +9,7 @@
+ #include "bin/options.h"
+ #include "bin/platform.h"
+ 
+-#if defined(TARGET_ARCH_IS_64_BIT) && defined(DART_PRECOMPILED_RUNTIME)
++#if defined(DART_PRECOMPILED_RUNTIME)
+ #define SUPPORT_ANALYZE_SNAPSHOT
+ #endif
+ 
+@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
+   dart::Syslog::PrintErr("Unsupported platform.\n");
+   dart::Syslog::PrintErr(
+       "Requires SDK with following "
+-      "flags:\n\tTARGET_ARCH_IS_64_BIT\n\tDART_PRECOMPILED_RUNTIME");
++      "flag:\n\tDART_PRECOMPILED_RUNTIME");
+   return dart::bin::kErrorExitCode;
+ #endif
+ }
+diff --git a/runtime/runtime_args.gni b/runtime/runtime_args.gni
+index a246292a..2bbd31a6 100644
+--- a/runtime/runtime_args.gni
++++ b/runtime/runtime_args.gni
+@@ -98,10 +98,11 @@ declare_args() {
+   dart_support_perfetto =
+       !((defined(is_watchos) && is_watchos) || dart_runtime_mode == "release")
+ 
+-  # The analyze_snapshot tool is only supported on 64 bit AOT builds.
++  # The upstream analyzer is normally limited to 64-bit AOT builds. Clutter
++  # also validates it on ARMv7 so 32-bit-only Flutter APKs can be inspected.
+   build_analyze_snapshot =
+       dart_target_arch == "x64" || dart_target_arch == "arm64" ||
+-      dart_target_arch == "riscv64"
++      dart_target_arch == "riscv64" || dart_target_arch == "arm"
+ }
+ 
+ if (is_fuchsia) {
+diff --git a/runtime/vm/analyze_snapshot_api_impl.cc b/runtime/vm/analyze_snapshot_api_impl.cc
+index 9c2ee447..e904d594 100644
+--- a/runtime/vm/analyze_snapshot_api_impl.cc
++++ b/runtime/vm/analyze_snapshot_api_impl.cc
+@@ -18,11 +18,12 @@
+ #include "vm/object.h"
+ #include "vm/object_store.h"
+ #include "vm/thread.h"
++#include "vm/version.h"
+ 
+ namespace dart {
+ namespace snapshot_analyzer {
+ 
+-constexpr intptr_t kSnapshotAnalyzerVersion = 2;
++constexpr intptr_t kSnapshotAnalyzerVersion = 3;
+ constexpr intptr_t kStartIndex = 1;
+ 
+ class FieldVisitor : public ObjectPointerVisitor {
+@@ -75,7 +76,7 @@ class SnapshotAnalyzer {
+   void DumpField(const Field& field);
+   void DumpString(const String& string);
+   void DumpInstance(const Object& object);
+-  void DumpType(const Type& type);
++  void DumpAbstractType(const AbstractType& type);
+   void DumpObjectPool(const ObjectPool& pool);
+ 
+   void DumpInterestingObjects();
+@@ -87,6 +88,7 @@ class SnapshotAnalyzer {
+   std::vector<std::vector<const Field*>> class_fields_;
+   std::vector<std::vector<const Field*>> top_level_class_fields_;
+   std::unordered_map<uword, const char*> stub_names_;
++  std::unordered_map<intptr_t, intptr_t> function_code_ids_;
+ 
+   JSONWriter js_;
+   Thread* thread_;
+@@ -99,6 +101,15 @@ void SnapshotAnalyzer::DumpLibrary(const Library& library) {
+ 
+   js_.PrintProperty("toplevel_class",
+                     GetObjectId(Object::RawCast(library.toplevel_class())));
++
++  // Preserve the import graph while the VM still has authoritative object
++  // identity. This remains useful when obfuscation has replaced application
++  // URIs with short tokens.
++  js_.OpenArray("imports");
++  for (intptr_t i = 0; i < library.num_imports(); ++i) {
++    js_.PrintValue64(GetObjectId(library.ImportLibraryAt(i)));
++  }
++  js_.CloseArray();
+ }
+ 
+ void SnapshotAnalyzer::DumpArray(const Array& array, const char* name) {
+@@ -121,10 +132,42 @@ void SnapshotAnalyzer::DumpClass(const Class& klass) {
+ 
+   js_.PrintProperty("class_id", klass.id());
+   js_.PrintProperty("name", String::Handle(klass.Name()).ToCString());
++  js_.PrintProperty("scrubbed_name", klass.ScrubbedNameCString());
++  js_.PrintProperty("user_visible_name", klass.UserVisibleNameCString());
+   js_.PrintProperty("super_class", GetObjectId(klass.SuperClass()));
++  js_.PrintProperty("super_type", GetObjectId(klass.super_type()));
++  js_.PrintPropertyBool("is_top_level", klass.IsTopLevel());
++  js_.PrintPropertyBool("is_abstract", klass.is_abstract());
++  js_.PrintPropertyBool("is_const", klass.is_const());
++  js_.PrintPropertyBool("is_enum", klass.is_enum_class());
++  js_.PrintPropertyBool("is_sealed", klass.is_sealed());
++  js_.PrintPropertyBool("is_mixin_class", klass.is_mixin_class());
++  js_.PrintPropertyBool("is_base", klass.is_base_class());
++  js_.PrintPropertyBool("is_interface", klass.is_interface_class());
++  js_.PrintPropertyBool("is_final", klass.is_final());
++  js_.PrintPropertyBool("is_synthesized", klass.is_synthesized_class());
++  js_.PrintPropertyBool("is_transformed_mixin_application",
++                        klass.is_transformed_mixin_application());
++  js_.PrintProperty64("instance_size", klass.host_instance_size());
++  js_.PrintProperty64("type_arguments_field_offset",
++                      klass.host_type_arguments_field_offset());
+ 
+   Zone* zone = thread_->zone();
+   Array& array = Array::Handle(zone);
++  const TypeParameters& type_parameters =
++      TypeParameters::Handle(zone, klass.type_parameters());
++  js_.OpenArray("type_parameters");
++  if (!type_parameters.IsNull()) {
++    for (intptr_t i = 0; i < type_parameters.Length(); ++i) {
++      js_.OpenObject();
++      js_.PrintProperty(
++          "name", String::Handle(type_parameters.NameAt(i)).ToCString());
++      js_.PrintProperty("bound", GetObjectId(type_parameters.BoundAt(i)));
++      js_.PrintProperty("default", GetObjectId(type_parameters.DefaultAt(i)));
++      js_.CloseObject();
++    }
++  }
++  js_.CloseArray();
+ 
+   // We use [fields] instead of [Class.fields()] as a [Field] object may not
+   // appear in [Class.fields()] but may still be available (e.g. for
+@@ -253,11 +296,95 @@ void SnapshotAnalyzer::DumpClassInstanceSlots(
+ void SnapshotAnalyzer::DumpFunction(const Function& function) {
+   js_.PrintProperty("type", "Function");
+   js_.PrintProperty("name", function.QualifiedScrubbedNameCString());
++  js_.PrintProperty("raw_name", String::Handle(function.name()).ToCString());
++  js_.PrintProperty("user_visible_name",
++                    function.QualifiedUserVisibleNameCString());
++  js_.PrintProperty("kind", Function::KindToCString(function.kind()));
++  js_.PrintPropertyBool("is_static", function.is_static());
++  js_.PrintPropertyBool("is_const", function.is_const());
++  js_.PrintPropertyBool("is_abstract", function.is_abstract());
++  js_.PrintPropertyBool("is_external", function.is_external());
++  js_.PrintPropertyBool("is_native", function.is_native());
++  js_.PrintPropertyBool("is_synthetic", function.is_synthetic());
++  js_.PrintPropertyBool("is_visible", function.is_visible());
++  js_.PrintPropertyBool("is_debuggable", function.is_debuggable());
++  js_.PrintPropertyBool("is_async", function.IsAsyncFunction());
++  js_.PrintPropertyBool("is_sync_generator", function.IsSyncGenerator());
++  js_.PrintPropertyBool("is_async_generator", function.IsAsyncGenerator());
+ 
+   js_.PrintProperty("signature",
+                     String::Handle(function.InternalSignature()).ToCString());
+ 
+-  js_.PrintProperty("code", GetObjectId(function.CurrentCode()));
++  const FunctionType& signature = FunctionType::Handle(function.signature());
++  if (!signature.IsNull()) {
++    js_.PrintProperty(
++        "user_visible_signature",
++        String::Handle(function.UserVisibleSignature()).ToCString());
++    js_.PrintProperty64("fixed_parameter_count",
++                        function.num_fixed_parameters());
++    js_.PrintProperty64("optional_parameter_count",
++                        function.NumOptionalParameters());
++    js_.PrintProperty64("implicit_parameter_count",
++                        function.NumImplicitParameters());
++    js_.PrintPropertyBool("optional_parameters_are_named",
++                          function.HasOptionalNamedParameters());
++    js_.PrintProperty64("result_type", GetObjectId(function.result_type()));
++    const TypeParameters& type_parameters =
++        TypeParameters::Handle(function.type_parameters());
++    js_.OpenArray("type_parameters");
++    if (!type_parameters.IsNull()) {
++      for (intptr_t i = 0; i < type_parameters.Length(); ++i) {
++        js_.OpenObject();
++        js_.PrintProperty(
++            "name", String::Handle(type_parameters.NameAt(i)).ToCString());
++        js_.PrintProperty("bound", GetObjectId(type_parameters.BoundAt(i)));
++        js_.PrintProperty("default", GetObjectId(type_parameters.DefaultAt(i)));
++        js_.CloseObject();
++      }
++    }
++    js_.CloseArray();
++    js_.OpenArray("parameters");
++    for (intptr_t i = 0; i < function.NumParameters(); ++i) {
++      js_.OpenObject();
++      js_.PrintProperty64("type", GetObjectId(function.ParameterTypeAt(i)));
++      js_.PrintPropertyBool("is_implicit",
++                            i < function.NumImplicitParameters());
++      js_.PrintPropertyBool(
++          "is_named",
++          function.HasOptionalNamedParameters() &&
++              i >= function.num_fixed_parameters());
++      js_.PrintPropertyBool("is_required", function.IsRequiredAt(i));
++      if (function.HasOptionalNamedParameters() &&
++          i >= function.num_fixed_parameters()) {
++        js_.PrintProperty(
++            "name", String::Handle(function.ParameterNameAt(i)).ToCString());
++      }
++      js_.CloseObject();
++    }
++    js_.CloseArray();
++  }
++
++  // AOT snapshots produced with DWARF stack traces can retain a Function
++  // while its deserialized `code_` slot is not a usable Code object on
++  // 32-bit runtimes. Code.owner is still authoritative in that case, so use
++  // the reverse relationship collected from the object graph.
++  const Object& current_code = Object::Handle(function.CurrentCode());
++  const bool current_code_is_code = current_code.IsCode();
++  const intptr_t current_code_id = GetObjectId(current_code.ptr());
++  intptr_t code_id = current_code_is_code ? current_code_id : 0;
++  const auto owner_code = function_code_ids_.find(GetObjectId(function.ptr()));
++  if (code_id == 0 && owner_code != function_code_ids_.end()) {
++    code_id = owner_code->second;
++  }
++  js_.PrintProperty("code", code_id);
++  js_.PrintProperty("current_code", current_code_id);
++  js_.PrintPropertyBool("current_code_is_code", current_code_is_code);
++  js_.PrintProperty("code_link_source",
++                    current_code_is_code
++                        ? "current_code"
++                        : (owner_code != function_code_ids_.end()
++                               ? "code_owner"
++                               : "unavailable"));
+   js_.PrintProperty("owner_class", GetObjectId(function.Owner()));
+   if (function.IsClosureFunction()) {
+     js_.PrintProperty("parent_function",
+@@ -309,16 +436,21 @@ void SnapshotAnalyzer::DumpCode(const Code& code) {
+ 
+   if (code.owner() != Object::null()) {
+     const auto& owner = Object::Handle(code.owner());
+-    js_.PrintProperty("owner", GetObjectId(owner.ptr()));
+     if (owner.IsClass()) {
++      js_.PrintProperty("owner", GetObjectId(owner.ptr()));
++      js_.PrintProperty("owner_kind", "Class");
+       js_.PrintfProperty("name", "new %s",
+                          Class::Cast(owner).ScrubbedNameCString());
+       js_.PrintPropertyBool("is_stub", true);
+     } else if (owner.IsAbstractType()) {
++      js_.PrintProperty("owner", GetObjectId(owner.ptr()));
++      js_.PrintProperty("owner_kind", "AbstractType");
+       js_.PrintfProperty("name", "as %s",
+                          AbstractType::Cast(owner).ScrubbedNameCString());
+       js_.PrintPropertyBool("is_stub", true);
+     } else if (owner.IsFunction()) {
++      js_.PrintProperty("owner", GetObjectId(owner.ptr()));
++      js_.PrintProperty("owner_kind", "Function");
+       js_.PrintProperty("name", Function::Cast(owner).UserVisibleNameCString());
+     } else if (owner.IsSmi()) {
+       // This is a class id of the class which owned the function.
+@@ -329,9 +461,13 @@ void SnapshotAnalyzer::DumpCode(const Code& code) {
+           class_table->At(cid) != Class::null()) {
+         const auto& cls = Class::Handle(class_table->At(cid));
+         js_.PrintProperty("owner", GetObjectId(cls.ptr()));
++        js_.PrintProperty("owner_kind", "DroppedFunctionClass");
++        js_.PrintProperty("dropped_owner_class_id", cid);
+         js_.PrintfProperty("name", "unknown function of %s",
+                            Class::Cast(cls).ScrubbedNameCString());
+       } else {
++        js_.PrintProperty("owner_kind", "DroppedFunctionClass");
++        js_.PrintProperty("dropped_owner_class_id", cid);
+         js_.PrintfProperty("name", "unknown function of class #%" Pd "", cid);
+       }
+     } else {
+@@ -373,6 +509,7 @@ void SnapshotAnalyzer::DumpField(const Field& field) {
+ 
+   js_.PrintProperty("type", "Field");
+   js_.PrintProperty("name", name.ToCString());
++  js_.PrintProperty("user_visible_name", field.UserVisibleNameCString());
+   js_.PrintProperty64("type_class", GetObjectId(field.type()));
+   js_.PrintProperty("owner_class", GetObjectId(field.Owner()));
+   if (field.is_static()) {
+@@ -384,6 +521,9 @@ void SnapshotAnalyzer::DumpField(const Field& field) {
+     js_.PrintProperty("initializer_function",
+                       GetObjectId(field.InitializerFunction()));
+   }
++  if (field.is_instance()) {
++    js_.PrintProperty64("instance_field_offset", field.HostOffset());
++  }
+ 
+   js_.PrintPropertyBool("is_reference", !field.is_unboxed());
+   if (field.is_unboxed()) {
+@@ -404,13 +544,12 @@ void SnapshotAnalyzer::DumpField(const Field& field) {
+ 
+   js_.OpenArray("flags");
+   if (field.is_final()) js_.PrintValue("final");
++  if (field.is_const()) js_.PrintValue("const");
+   if (field.is_static()) {
+     js_.PrintValue("static");
+     if (field.is_shared()) js_.PrintValue("shared");
+   }
+-  if (field.is_instance()) {
+-    if (field.is_late()) js_.PrintValue("late");
+-  }
++  if (field.is_late()) js_.PrintValue("late");
+   js_.CloseArray();
+ }
+ 
+@@ -439,12 +578,29 @@ void SnapshotAnalyzer::DumpInstance(const Object& object) {
+   js_.CloseArray();
+ }
+ 
+-void SnapshotAnalyzer::DumpType(const Type& type) {
++void SnapshotAnalyzer::DumpAbstractType(const AbstractType& type) {
+   js_.PrintProperty("type", "Type");
++  js_.PrintProperty(
++      "type_kind",
++      type.IsType()          ? "Type"
++      : type.IsTypeParameter() ? "TypeParameter"
++      : type.IsFunctionType()  ? "FunctionType"
++      : type.IsRecordType()    ? "RecordType"
++                              : "AbstractType");
++  js_.PrintProperty("name", type.NameCString());
++  js_.PrintProperty("scrubbed_name", type.ScrubbedNameCString());
++  js_.PrintProperty("user_visible_name", type.UserVisibleNameCString());
++  js_.PrintProperty("nullability_suffix",
++                    type.NullabilitySuffix(PassiveObject::kUserVisibleName));
++
++  if (!type.IsType()) {
++    return;
++  }
++  const Type& concrete_type = Type::Cast(type);
++  js_.PrintProperty("type_class", GetObjectId(concrete_type.type_class()));
+ 
+-  js_.PrintProperty("type_class", GetObjectId(type.type_class()));
+-
+-  const TypeArguments& arguments = TypeArguments::Handle(type.arguments());
++  const TypeArguments& arguments =
++      TypeArguments::Handle(concrete_type.arguments());
+   js_.OpenArray("type_arguments");
+   for (intptr_t i = 0; i < arguments.Length(); ++i) {
+     js_.PrintValue64(GetObjectId(arguments.TypeAt(i)));
+@@ -559,6 +715,14 @@ void SnapshotAnalyzer::DumpInterestingObjects() {
+                                  ? ClassTable::IndexFromTopLevelCid(owner.id())
+                                  : owner.id();
+       array[index].push_back(&field);
++    } else if (object.IsCode()) {
++      const auto& code = Code::Cast(object);
++      const auto& code_owner = Object::Handle(zone, code.owner());
++      if (code_owner.IsFunction()) {
++        function_code_ids_.emplace(
++            GetObjectId(code_owner.ptr()),
++            static_cast<intptr_t>(i) + kStartIndex);
++      }
+     }
+   }
+ 
+@@ -598,8 +762,8 @@ void SnapshotAnalyzer::DumpInterestingObjects() {
+       js_.PrintProperty("type", "Array");
+       const Array& array = Array::Handle(Array::RawCast(object->ptr()));
+       DumpArray(array, "elements");
+-    } else if (object->IsType()) {
+-      DumpType(Type::Cast(*object));
++    } else if (object->IsAbstractType()) {
++      DumpAbstractType(AbstractType::Cast(*object));
+     } else if (object->IsInstance()) {
+       DumpInstance(*object);
+     }
+@@ -630,6 +794,13 @@ void SnapshotAnalyzer::DumpInterestingObjects() {
+ 
+ void SnapshotAnalyzer::DumpMetadata() {
+   js_.OpenObject("metadata");
++  js_.PrintProperty("dart_version", Version::String());
++  js_.PrintProperty("snapshot_hash", Version::SnapshotString());
++  const Library& root_library = Library::Handle(
++      thread_->isolate_group()->object_store()->root_library());
++  if (!root_library.IsNull()) {
++    js_.PrintProperty64("root_library", GetObjectId(root_library.ptr()));
++  }
+   js_.OpenObject("offsets");
+   js_.OpenObject("thread");
+   // TODO(balid): Use `dart::compiler::target::` versions.
