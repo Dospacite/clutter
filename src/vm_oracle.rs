@@ -120,6 +120,36 @@ struct AnalyzerDispatchTarget {
     owner_name: Option<String>,
 }
 
+/// The analyzer emits each populated CID run as two consecutive integers
+/// (`[start, end, start, end, …]`); older patch revisions may instead emit
+/// `[start, end]` pairs. Accept both shapes so oracle documents from either
+/// analyzer build parse identically.
+fn deserialize_cid_runs<'de, D>(deserializer: D) -> std::result::Result<Vec<(u64, u64)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Patch revisions differ on the run encoding: current builds emit two
+    // consecutive integers per run (`[start, end, …]`); older drafts emitted a
+    // `[start, end]` pair per run. Accept either shape.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Runs {
+        Paired(Vec<(u64, u64)>),
+        Flat(Vec<u64>),
+    }
+    match Runs::deserialize(deserializer)? {
+        Runs::Paired(runs) => Ok(runs),
+        Runs::Flat(flat) => {
+            let mut runs = Vec::with_capacity(flat.len() / 2);
+            let mut values = flat.into_iter();
+            while let (Some(start), Some(end)) = (values.next(), values.next()) {
+                runs.push((start, end));
+            }
+            Ok(runs)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct AnalyzerClassRangesSection {
     #[serde(default)]
@@ -128,7 +158,7 @@ struct AnalyzerClassRangesSection {
     #[serde(default)]
     #[allow(dead_code)] // consumed by the class-range attribution phase
     num_top_level_cids: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cid_runs")]
     populated_runs: Vec<(u64, u64)>,
 }
 
@@ -247,10 +277,12 @@ struct AnalyzerObject {
     #[serde(default)]
     is_stub: Option<bool>,
     /// Schema 5: raw unboxed-field bitmap per class (bit per word slot).
+    /// Serialized through `int64_t`, so masks with bit 63 set arrive negative
+    /// and are reinterpreted losslessly on load. Parsed for forward
+    /// compatibility; consumed by field layout resolution later.
     #[serde(default)]
     #[allow(dead_code)]
-    // parsed for forward compatibility; consumed by field layout resolution
-    unboxed_field_bitmap: Option<u64>,
+    unboxed_field_bitmap: Option<i64>,
     /// Schema 5: populated CID range start/end for the class.
     #[serde(default)]
     #[allow(dead_code)] // superseded by the top-level `class_ranges` section

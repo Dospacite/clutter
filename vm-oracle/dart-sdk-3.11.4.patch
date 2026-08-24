@@ -338,7 +338,7 @@ diff --git a/runtime/vm/analyze_snapshot_api_impl.cc b/runtime/vm/analyze_snapsh
 +  int64_t entry_count = 0;
 +  if (!pool.IsNull()) {
 +    const uint64_t instruction_base =
-+        reinterpret_cast<uint64_t>(info_.snapshot_text);
++        reinterpret_cast<uint64_t>(info_.vm_isolate_instructions);
 +    js_.OpenArray("targets");
 +    Zone* zone = thread_->zone();
 +    Object& entry = Object::Handle(zone);
@@ -390,7 +390,7 @@ diff --git a/runtime/vm/analyze_snapshot_api_impl.cc b/runtime/vm/analyze_snapsh
 +  if (!entries.IsNull()) {
 +    js_.PrintProperty64("code_entry_count", entries.Length());
 +    const uint64_t instruction_base =
-+        reinterpret_cast<uint64_t>(info_.snapshot_text);
++        reinterpret_cast<uint64_t>(info_.vm_isolate_instructions);
 +    js_.OpenArray("targets");
 +    Zone* zone = thread_->zone();
 +    Code& code = Code::Handle(zone);
@@ -639,16 +639,17 @@ diff --git a/runtime/vm/analyze_snapshot_api_impl.cc b/runtime/vm/analyze_snapsh
    js_.PrintProperty64("word_size", dart::compiler::target::kWordSize);
    js_.PrintProperty64("compressed_word_size",
                        dart::compiler::target::kCompressedWordSize);
-@@ -646,14 +1056,6 @@
+@@ -646,15 +1056,6 @@
  
    // Open empty object so output is valid/parsable JSON.
    js_.OpenObject();
 -  js_.OpenObject("snapshot_data");
 -  // Base addresses of the snapshot data, useful to calculate relative offsets.
--  js_.PrintfProperty("vm_data", "%p", nullptr);
--  js_.PrintfProperty("vm_instructions", "%p", nullptr);
--  js_.PrintfProperty("isolate_data", "%p", info_.snapshot_data);
--  js_.PrintfProperty("isolate_instructions", "%p", info_.snapshot_text);
+-  js_.PrintfProperty("vm_data", "%p", info_.vm_snapshot_data);
+-  js_.PrintfProperty("vm_instructions", "%p", info_.vm_snapshot_instructions);
+-  js_.PrintfProperty("isolate_data", "%p", info_.vm_isolate_data);
+-  js_.PrintfProperty("isolate_instructions", "%p",
+-                     info_.vm_isolate_instructions);
 -  js_.CloseObject();
 -
    {
