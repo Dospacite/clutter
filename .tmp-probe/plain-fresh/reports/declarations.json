@@ -1,0 +1,883 @@
+{
+  "schema": "clutter.declarations/v1",
+  "note": "A function declaration without code may have been inlined, folded, deferred, or tree-shaken; the artifact does not prove which.",
+  "declarations": [
+    {
+      "snapshot_reference": 52562,
+      "kind": "class",
+      "name": "CatalogPage",
+      "owner": "package:simple_app/main.dart",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1996,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 19526,
+          "display_name": "StatefulWidget",
+          "library_uri": "package:flutter/src/widgets/framework.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 52559,
+      "kind": "class",
+      "name": "ShopDemoApp",
+      "owner": "package:simple_app/main.dart",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1923,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 19871,
+          "display_name": "StatelessWidget",
+          "library_uri": "package:flutter/src/widgets/framework.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 53059,
+      "kind": "class",
+      "name": "_CatalogPageState",
+      "snapshot_name": "_CatalogPageState@456355460",
+      "owner": "package:simple_app/main.dart",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1718,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 21986,
+          "display_name": "State<CatalogPage>",
+          "library_uri": "package:flutter/src/widgets/framework.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 46372,
+      "kind": "function",
+      "name": "main",
+      "owner": null,
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 1,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 46373,
+      "kind": "function",
+      "name": "main",
+      "owner": null,
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "implicit_closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 42132,
+      "kind": "function",
+      "name": "createState",
+      "owner": "CatalogPage",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 40087,
+      "kind": "function",
+      "name": "build",
+      "owner": "ShopDemoApp",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41901,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 21677,
+        "parameter_types_reference": 69805,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 21677,
+            "display_name": "bool",
+            "library_uri": "dart:core/bool.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 21294,
+                "display_name": "Product",
+                "library_uri": "package:simple_app/models.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41903,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41906,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41909,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41910,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41911,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 2,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 20792,
+        "parameter_types_reference": 69806,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 20792,
+            "display_name": "ListTile",
+            "library_uri": "package:flutter/src/material/list_tile.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 19768,
+                "display_name": "BuildContext",
+                "library_uri": "package:flutter/src/widgets/framework.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            },
+            {
+              "position": 1,
+              "type": {
+                "snapshot_reference": 21686,
+                "display_name": "int",
+                "library_uri": "dart:core/int.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41912,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41914,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41916,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66925,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 21679,
+                "display_name": "String",
+                "library_uri": "dart:core/string.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41917,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 66864,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41918,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 21677,
+        "parameter_types_reference": 69805,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 21677,
+            "display_name": "bool",
+            "library_uri": "dart:core/bool.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 21294,
+                "display_name": "Product",
+                "library_uri": "package:simple_app/models.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 42131,
+      "kind": "function",
+      "name": "_CatalogPageState.",
+      "snapshot_name": "_CatalogPageState@456355460.",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "constructor",
+      "signature": null,
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 41913,
+      "kind": "function",
+      "name": "_add",
+      "snapshot_name": "_add@456355460",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41904,
+      "kind": "function",
+      "name": "_checkout",
+      "snapshot_name": "_checkout@456355460",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41890,
+      "kind": "function",
+      "name": "build",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41900,
+      "kind": "function",
+      "name": "get:_filteredProducts",
+      "snapshot_name": "get:_filteredProducts@456355460",
+      "owner": "_CatalogPageState",
+      "library_uri": "package:simple_app/main.dart",
+      "source_location": null,
+      "function_kind": "getter",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 53060,
+      "kind": "class",
+      "name": "Cart",
+      "owner": "package:simple_app/models.dart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 179,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 21692,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 53062,
+      "kind": "class",
+      "name": "CartLine",
+      "owner": "package:simple_app/models.dart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 180,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 21692,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 53068,
+      "kind": "class",
+      "name": "Category",
+      "owner": "package:simple_app/models.dart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 2770,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 19553,
+          "display_name": "_Enum",
+          "library_uri": "dart:core/enum.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": true,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false,
+        "instance_slots": [
+          {
+            "offset": 8,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 12,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          }
+        ]
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 53067,
+      "kind": "class",
+      "name": "Product",
+      "owner": "package:simple_app/models.dart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 181,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 21692,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false,
+        "instance_slots": [
+          {
+            "offset": 16,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 20,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          }
+        ]
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 41899,
+      "kind": "function",
+      "name": "firstWhereOrNull",
+      "owner": null,
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41895,
+      "kind": "function",
+      "name": "formatPrice",
+      "owner": null,
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 42130,
+      "kind": "function",
+      "name": "Cart.",
+      "owner": "Cart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "constructor",
+      "signature": null,
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 41915,
+      "kind": "function",
+      "name": "add",
+      "owner": "Cart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41907,
+      "kind": "function",
+      "name": "clear",
+      "owner": "Cart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41905,
+      "kind": "function",
+      "name": "get:isEmpty",
+      "owner": "Cart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "getter",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41908,
+      "kind": "function",
+      "name": "get:itemCount",
+      "owner": "Cart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "getter",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 41891,
+      "kind": "function",
+      "name": "get:subtotal",
+      "owner": "Cart",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "getter",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 43206,
+      "kind": "function",
+      "name": "_enumToString",
+      "snapshot_name": "_enumToString@0150898",
+      "owner": "Category",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 42772,
+      "kind": "function",
+      "name": "toString",
+      "owner": "Product",
+      "library_uri": "package:simple_app/models.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    }
+  ]
+}

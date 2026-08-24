@@ -21,7 +21,7 @@ unresolved, while machine-level evidence stays in the reports.
 
 - Android APK and AAB archives
 - `arm64-v8a`, `armeabi-v7a`, and `x86_64` Flutter AOT payloads
-- Dart 3.4 through 3.11 clustered snapshots
+- Dart 3.4 through 3.12 clustered snapshots
 - Non-obfuscated builds directly from `libapp.so`
 - Obfuscated builds directly as raw address/name evidence, optionally enriched
   by a matching obfuscation map and/or split-debug ELF
@@ -184,6 +184,8 @@ recovered/
 │   ├── assembly.s               complete annotated machine instructions
 │   ├── dispatch_table.json      compressed class-dispatch runs and targets
 │   ├── cross_abi.json           only with a successful --cross-abi comparison
+│   ├── cross_abi_consensus.json ABI-neutral consensus tiers and disputes
+│   ├── body_graph.json          physical-body/logical-occurrence resolution
 │   └── unresolved.jsonl
 ├── ir/program.json             only with --emit-ir
 ├── decompilation.json
@@ -216,9 +218,10 @@ instructions, CFG edges, VM stack maps, PC descriptors, exception handlers,
 CodeSourceMap events, and register/stack flow stay in `reports/assembly.s` and
 the JSON reports.
 
-Most bodies end in an explicit unresolved operation. Clutter emits a recovered
-return only for a branch-free, fully decoded function with one machine return
-and one high-confidence expression. Snapshot and native-pool identities remain
+Most bodies end in an explicit unresolved operation only when some reachable
+statement or exit path remains unproven; branch-free bodies with one proven
+machine return render a recovered `return` without a trailing region.
+Snapshot and native-pool identities remain
 explicit support intrinsics rather than being presented as reconstructed Dart
 values. Calls that are structurally recovered but cannot be expressed as a
 proven Dart invocation use the readable `aot.invoke` boundary; fuller semantic
@@ -311,6 +314,28 @@ contain confidential strings, API endpoints, or other sensitive material.
 
 ## Accuracy notes
 
+- Every recovered fact carries an explicit evidence tier — `proven`,
+  `cross_abi_corroborated`, `inferred`, or `speculative` (see
+  `src/evidence/tier.rs`). Merging never upgrades a claim, and LLM-assisted
+  naming (`RecoveredNameSource::LlmAssisted`) is pinned to `speculative`.
+- The physical-body / logical-occurrence graph keeps shared optimized bodies and
+  same-address closures as distinct occurrences; nothing overwrites anything at
+  the same entry offset. The resolution summary lands in
+  `reports/body_graph.json`.
+- Cross-ABI consensus (`--cross-abi`) aligns occurrences by owner, lexical
+  order, and arity rather than display name. Constants, call topology, and pool
+  identities must agree unanimously before a fact is marked
+  `cross_abi_corroborated`; disagreements are retained verbatim in
+  `reports/cross_abi_consensus.json`, never voted into generated Dart.
+- The signature solver recovers parameter shapes from argument descriptors,
+  call-site edges, receiver CIDs, and field traffic. Authoritative descriptors
+  are proven, agreement is inferred, conflicts stay bounded, and genuinely
+  erased signatures remain unknown instead of guessed.
+- Dynamic evidence is separate: an instrumented emulator writes a
+  `clutter.runtime-trace/v1` document (executed PCs, receiver CIDs, dispatch
+  targets, argument descriptors) that `clutter trace <file>` validates against
+  the exact snapshot hash. Trace facts rank plausibility in the inferred tier;
+  they never promote static claims.
 - Snapshot hashes select versioned CID/layout profiles. Compatible unknown patch
   hashes are labeled as such in the manifest.
 - The clustered-snapshot parser retains object kinds, references, scalar
@@ -320,6 +345,93 @@ contain confidential strings, API endpoints, or other sensitive material.
   as typed scalar objects instead of being skipped. `snapshot_evidence.json`
   summarizes this evidence; `--emit-ir` retains the public recovered program
   model.
+- Bodies are lifted with a worklist fixpoint over the basic-block CFG: a
+  register or stack value survives a branch join only when every predecessor
+  carries identical provenance, so recovered call arguments, conditions, and
+  returns remain sound while reaching far deeper into real functions than a
+  per-block scan.
+- The synthetic incoming-argument local (`final args = <dynamic>[…]`) is
+  emitted only when some rendered statement actually references it; unused
+  bundles are noise relative to the original source and are dropped.
+- Statements stranded after a proven machine return inside a straight-line
+  region are unreachable code and are not rendered as reachable Dart. Block
+  emission stops at any child whose every path ends in a return, so dead
+  optimizer tails no longer appear after `return`.
+- Member staticness is recovered without debug information by calibrating the
+  static bit of `Function::kind_tag_` per snapshot: the bit sits above
+  version-dependent recognizer-kind bits, so its position is derived from
+  definition-fixed constraints (implicit field accessors) and accepted only
+  when exactly one candidate satisfies all of them. Proven instance members
+  name their receiver `this`, and own-receiver calls render with Dart's
+  implicit-`this` syntax (`setState(…)`, bare property reads) instead of
+  passing the receiver as ordinary data.
+- Before dataflow, the lifter fuses Dart AOT's machine-only idioms so they
+  stop splitting values across branch joins: the stack-overflow guard,
+  the Smi/Mint untag diamond (`sbfx`/`tbz`/Mint load — both arms hold the
+  same integer), the re-tag overflow check with its Mint-allocation slow
+  path, and compressed write-barrier tag tests ahead of runtime-stub calls.
+  Untagged Smi payloads keep their source-level expression text, and only
+  the lifting stream is filtered; complete decoded instructions stay in
+  `reports/assembly.s`. Unreachable fused tails are not emitted as
+  unreachable Dart.
+- Dart's ARM64/ARM32 calling convention is modeled directly: argument zero
+  arrives in a fixed register, remaining arguments are pushed right-to-left
+  onto the stack (last at `[SP]`, addressed through FP after the prologue).
+  Incoming slots are seeded even when the signature did not survive, and a
+  call site reports exactly the register argument the caller itself wrote
+  plus its outgoing stack stores. Functions whose signature was tree-shaken
+  therefore still recover computed call arguments such as `f(value - 2)`.
+- Recovered bodies are restructured into Dart-shaped control flow: `if`/`else`
+  regions from branch diamonds, `while` loops from natural loops (with
+  negated predicates where the loop body sits on the false edge), nested
+  branches and loops re-nested recursively inside loop bodies instead of
+  being flattened in address order, resumed walks that structure diamonds
+  after a re-joining block stalls the linear pass, explicit `return`
+  statements on proven machine returns, and a linear tail for anything the
+  CFG cannot structure. Set `CLUTTER_DEBUG_STRUCTURE=1` to dump
+  the region tree per function.
+- Dart's string-interpolation lowering is recognized end-to-end: an array
+  allocation stub, compressed element stores (including spilled arrays and
+  derived element pointers), and the `_interpolate` call are rebuilt as a
+  single interpolated literal whose unproven parts become explicit
+  placeholders.
+- Recovered arithmetic, comparison, and operator expressions render as real
+  Dart: lifter-built expressions over named registers, numeric literals, and
+  field reads are emitted verbatim (`value - 2`, `left ^ right`,
+  `a ~/ b`), and recovered operator invocations such as `EdgeVector.+`
+  render as infix `receiver + operand`. Without this evidence the
+  `aot.unresolvedValue` boundary remains.
+- Call sites render as Dart calls: getters/setters become property syntax,
+  instance members keep their recovered receiver, allocator + constructor
+  stub pairs collapse into one constructor invocation, and positional slots
+  zip onto declared named parameters (leading/trailing null dummies dropped)
+  when the callee's FunctionType survived tree-shaking. VM-internal helpers
+  stay behind `aot.invoke`.
+- Canonical tagged constants are folded: ARM64 `null` register values render
+  as `null`, and the fixed true/false offsets render as booleans.
+- Async machines are recovered on two tiers. Split-debug or VM-oracle names
+  for the async stubs (`InitAsyncStub`, `AwaitStub`) become `async` members
+  with explicit `await` boundaries; unnamed snapshots fall back to a
+  Future-return-type heuristic plus an explanatory comment. Generator
+  (`sync*`/`async*`) identity is reported as documentation because recovered
+  bodies use `return`, not `yield`.
+- Closures with a provable enclosing member — an authoritative VM
+  lexical-parent link or containment inside the parent's source-line span —
+  render as local functions nested in that parent; identically named
+  siblings receive stable `_2`/`_3` suffixes. Unproven closures remain
+  ordinary members.
+- Canonical snapshot instances are labeled `snapshotInstance(Class)` from the
+  class-id table, giving const-constructor rendering and receiver-class
+  provenance for field reads through pool-loaded constants.
+- Statements stranded in machine regions the structurer cannot reach (async
+  state dispatch, table jumps) still surface under an explicit fragment
+  comment instead of being dropped.
+- Instance-field names still require receiver-class proof. Exact offsets come
+  from the VM oracle or split-debug joins; surviving Field declarations fill
+  remaining slots using Dart's deterministic layout rules (header, optional
+  type-argument slot, declaration-order references, aligned unboxed doubles).
+  Classes whose Field objects were tree-shaken fall back to slot-named
+  placeholders rather than guessed names.
 - FunctionType graphs recover return and parameter types, nested generics,
   nullability, type-parameter bounds, named names, and packed `required`
   flags. Class state bits and type edges recover modifiers, superclasses,
@@ -348,6 +460,12 @@ contain confidential strings, API endpoints, or other sensitive material.
 - A Flutter obfuscation map restores identifiers and declarations that remain
   serialized, including declaration-only classes. It cannot associate a name
   with code whose owner was discarded by AOT compilation.
+- Without the VM oracle, `libraries.json` still derives a conservative import
+  graph from resolved direct-call evidence: when a recovered function in
+  library A calls a named function attributed to library B, B is listed among
+  A's imports and type-reference dependencies. These are call-site edges, not
+  proof of an exact `import` directive; the oracle's authoritative import
+  lists take precedence when available.
 - `coverage.json` distinguishes logical function entries from unique physical
   code ranges, so deduplicated tear-offs do not inflate recovered byte and call
   counts. It separately reports code-resolved direct calls and semantically
@@ -375,14 +493,45 @@ contain confidential strings, API endpoints, or other sensitive material.
   the retained initializer reference, with an exact private-key-bearing
   `init:<field>` symbol as a unique fallback. This restores the Field's class
   and library before scope filtering without relying on readable identifiers.
-- The bounded semantic lifter supports ARM64 and ARM32 register conventions.
-  ARM32 pool constants and calls reuse the same affine provenance evidence;
-  x86_64 currently retains instruction, CFG, call, and pool evidence without
-  promoting register expressions to Dart-like semantic statements. VM
-  instance layouts are indexed by `(library, class, offset)`, and register
-  provenance carries constructor/instance class identity through moves and
-  field reads. This prevents the same numeric offset in an Array, framework
-  object, and application model from being assigned one false field name.
+- The bounded semantic lifter supports ARM64, ARM32, and x86_64 register
+  conventions. ARM32 pool constants and calls reuse the same affine provenance
+  evidence; x64 lifts its own idioms (thread-relative stack guards and write
+  barriers, `sar` Smi untags, heap-base decompression through the thread,
+  `setcc` boolean materialization) with arguments in RDI/RSI/RDX/RCX/R8/R9 and
+  right-to-left stack overflow. VM instance layouts are indexed by
+  `(library, class, offset)`, and register provenance carries
+  constructor/instance class identity through moves and field reads. This
+  prevents the same numeric offset in an Array, framework object, and
+  application model from being assigned one false field name.
+- When a receiver's class is proven but its Field declarations were
+  tree-shaken, accesses still surface as explicit low-confidence slot
+  placeholders (`slot0b`) instead of disappearing; no member name is invented.
+  Per-class allocation stubs (whose Code owner is the Class itself) donate
+  their class to freshly allocated receivers so constructor argument and
+  field-store evidence chains together.
+- Integer semantics are recovered at source level: `sdiv`+`msub` pairs render
+  as Dart `%` (with the negative-remainder adjustment diamond fused away),
+  truncating division renders `~/`, condition-set instructions materialize
+  pending comparisons as `bool`, and Smi tag/untag steps never appear in
+  expressions because untagged payloads *are* the Dart integers.
+- Boolean values are recovered from Dart's canonical-boolean machine idioms.
+  `EmitBoolTest` discriminates `true`/`false` by the object-alignment bit
+  (`pointer_tagging.h`), so `tbz`/`tbnz` on that bit (and `test`+`je`/`jne`
+  against the same mask on x64) render as the value itself with correct
+  polarity instead of an opaque `(x & (1 << 4)) != 0`; canonical constants at
+  the fixed null offsets map to `true`/`false`. Branch joins come from the
+  immediate post-dominator, so diamonds whose arms re-enter each other no
+  longer collapse into linear code. An `if (!moveNext()) {} else { rest }`
+  exit test inside a `while (true)` loop is promoted into the loop predicate,
+  recovering real `while` conditions for `for-in` loops. Decompressed
+  reference loads keep slot-placeholder provenance when Field objects were
+  tree-shaken, and comparisons over untracked registers keep their machine
+  names so branch structure survives. The code source map's last inline-depth-
+  0 line approximates a member's end line, letting closures nest inside their
+  proven parent by source-line containment even without debug information.
+- The code source map's inline-stack transitions resolve to named callees:
+  bodies list the functions the optimizer folded into them, and named record
+  types recover their field names from the snapshot graph when retained.
 - The compressed class dispatch table is recovered from the snapshot root tail
   without depending on unstable VM root counts. The decoder validates the Code
   cluster identity, repeat/recent encoding, declared length, and exact snapshot

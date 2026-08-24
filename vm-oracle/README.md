@@ -42,19 +42,59 @@ two APKs currently in `test-apk/` use snapshot hash
 `78da37fed6bf1489361a312568249f3f`, which is accepted by the Dart 3.11.4
 checkout used during development.
 
+For the Dart 3.12.2 accuracy fixtures in `test/`, use the reproducible builder:
+
+```bash
+vm-oracle/build-exact-analyzers.sh \
+  ~/Documents/Projects/dart-sdk \
+  ~/Android/Sdk/ndk/28.2.13676358 \
+  target/vm-oracle-sdk \
+  d684a576a6aa954ae107a03b2b4e1d61c3bebe93 \
+  x64c
+```
+
+This creates a disposable shared clone below the work directory, obtains
+`depot_tools`, syncs the exact revision's DEPS and CIPD tools before patching,
+and builds only in that clone. It verifies that the source SDK's commit and
+worktree status are unchanged. Repeating the command reuses the synced tools
+and build output.
+
 After syncing the Dart source dependencies with `gclient sync`, run:
 
 ```bash
 vm-oracle/build-analyzers.sh /path/to/dart-sdk /path/to/android-ndk arm arm64c
 ```
 
-The patch adds schema version 3 and enables the analyzer on ARMv7. Dart
+The patch adds schema version 5 and enables the analyzer on ARMv7. Dart
 upstream normally gates it to 64-bit targets. On ARMv7 DWARF-mode snapshots,
 `Function::CurrentCode()` can deserialize to a non-Code object even though the
 corresponding `Code.owner` still points to the Function. The patched analyzer
 pre-indexes that authoritative reverse relation, which recovers the code link
-without dereferencing the invalid forward link. Architecture names map to APK
-ABIs as follows:
+without dereferencing the invalid forward link.
+
+Schema 5 additionally emits payload-wide semantic evidence that the per-object
+graph cannot express:
+
+- `static_calls`: every Code target reachable from the global object pool.
+  Precompiled snapshots drop each Code's own `static_calls_target_table`
+  (`NOT_IN_PRECOMPILED` in the VM source), so the pool is the authoritative
+  static-call evidence; entries carry pool index, target offset, size, owner
+  id, and — when the owner is a Function — its name, staticness, and
+  parameter count (argument-descriptor seeds for the signature solver);
+- `dispatch_metadata`: the materialized dispatch table as a selector-index →
+  Code array with target offsets and owners, plus the architecture's
+  `kOriginElement` and global pool length in metadata;
+- `class_ranges`: populated `[start, end]` CID runs from the live class
+  table (obfuscation renames classes but cannot compact CIDs);
+- `unboxed_field_bitmap` per Class: the raw unboxed-field bitmap, one bit per
+  instance word slot;
+- `pc_descriptors` per linked Function: an entry count plus a kind histogram
+  (`deopt`, `ic_call`, `unopt_static_call`, `runtime_call`, `osr_entry`,
+  `rewind`, `other`);
+- `argument_descriptor` per Function: fixed/optional/positional/named/implicit
+  counts plus every surviving parameter name.
+
+Architecture names map to APK ABIs as follows:
 
 | Dart build arch | APK ABI | Pointer mode |
 | --- | --- | --- |
@@ -99,6 +139,14 @@ clutter decompile test-apk/app-release.apk \
 `--adb auto` uses the single connected device selected by `adb`. Supplying an
 explicit device serial is safer when multiple devices are attached. Without
 `--adb`, Clutter runs the analyzer as a local executable.
+
+Generation also writes `<oracle>.binding.json`. This manifest binds the raw
+oracle bytes to the complete APK/AAB digest, selected archive member and
+`libapp.so` digest, ABI, all four snapshot regions, pointer layout, analyzer
+binary digest, analyzer schema, and exact Dart commit. Decompilation rejects a
+raw analyzer document without this binding, or when any bound field differs.
+Schema 4 omits process-randomized snapshot base addresses, so repeated runs of
+the same analyzer against the same payload produce byte-identical JSON.
 
 The generated project contains:
 

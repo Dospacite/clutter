@@ -1,0 +1,78 @@
+{
+  "variants": {
+    "plain": {
+      "application_package": "simple_app",
+      "minimum_functions": 30
+    },
+    "obfuscated_map": {
+      "application_package": "simple_app_obfuscated",
+      "minimum_functions": 15
+    },
+    "obfuscated_raw": {
+      "application_package": null,
+      "minimum_functions": 12000
+    },
+    "plain_x64": {
+      "application_package": "simple_app",
+      "minimum_functions": 30
+    },
+    "obfuscated_map_x64": {
+      "application_package": "simple_app_obfuscated",
+      "minimum_functions": 15
+    },
+    "obfuscated_raw_x64": {
+      "application_package": null,
+      "minimum_functions": 12000
+    },
+    "plain_arm32": {
+      "application_package": "simple_app",
+      "minimum_functions": 30
+    },
+    "obfuscated_map_arm32": {
+      "application_package": "simple_app_obfuscated",
+      "minimum_functions": 15
+    },
+    "obfuscated_raw_arm32": {
+      "application_package": null,
+      "minimum_functions": 12000
+    }
+  },
+  "semantic_statements": [
+    {
+      "id": "negated_expensive_predicate",
+      "variants": [
+        "plain",
+        "obfuscated_map",
+        "obfuscated_raw",
+        "plain_x64",
+        "obfuscated_map_x64",
+        "obfuscated_raw_x64"
+      ],
+      "kind": "return",
+      "expression": "!(arg0._slot_10 >= 10.0)"
+    },
+    {
+      "id": "negated_expensive_predicate_arm32",
+      "variants": [
+        "plain_arm32",
+        "obfuscated_map_arm32",
+        "obfuscated_raw_arm32"
+      ],
+      "kind": "return",
+      "expression": "!(arg0._slot_c >= 10.0)"
+    },
+    {
+      "id": "boxed_double_receiver",
+      "variants": [
+        "plain"
+      ],
+      "function": "formatPrice",
+      "kind": "resolved_call",
+      "target": "_Double.toStringAsFixed",
+      "arguments": [
+        "local10",
+        "2"
+      ]
+    }
+  ]
+}

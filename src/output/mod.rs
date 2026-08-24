@@ -96,6 +96,15 @@ pub struct Coverage {
     pub decoded_function_bytes: usize,
     pub undecoded_function_bytes: usize,
     pub function_kinds: BTreeMap<&'static str, usize>,
+    /// Evidence-tier distribution of solved signature outcomes.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub signature_tiers: BTreeMap<String, usize>,
+    /// Cross-ABI consensus tier summary (corroborated / disputed / unaligned).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cross_abi_tiers: BTreeMap<String, usize>,
+    /// Physical-body graph resolution counts, when computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_graph: Option<crate::evidence::body::BodyGraphReport>,
     /// Total bytes in the selected AOT code image, including dependencies.
     pub instruction_bytes: usize,
 }
@@ -290,6 +299,12 @@ fn write_generated_files(stage: &Path, request: &WriteRequest<'_>) -> Result<()>
     if let Some(report) = &request.program.cross_abi {
         write_json(&stage.join("reports/cross_abi.json"), report)?;
     }
+    if let Some(consensus) = &request.program.cross_abi_consensus {
+        write_json(&stage.join("reports/cross_abi_consensus.json"), consensus)?;
+    }
+    if let Some(body_graph) = &request.program.body_graph_report {
+        write_json(&stage.join("reports/body_graph.json"), body_graph)?;
+    }
     if let Some(dispatch_table) = &request.program.dispatch_table {
         write_json(&stage.join("reports/dispatch_table.json"), dispatch_table)?;
     }
@@ -452,9 +467,17 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
                         resolved_indirect_call_sites += 1;
                         *call_target_scopes.entry(target_scope.label()).or_default() += 1;
                     }
-                    PseudoStatement::DispatchTableCall { .. } => {
+                    PseudoStatement::DispatchTableCall { selector_name, .. } => {
                         indirect_call_sites += 1;
-                        *call_target_scopes.entry("dynamic").or_default() += 1;
+                        resolved_dispatch_table_call_sites +=
+                            usize::from(selector_name.is_some());
+                        *call_target_scopes
+                            .entry(if selector_name.is_some() {
+                                "dynamic-named"
+                            } else {
+                                "dynamic"
+                            })
+                            .or_default() += 1;
                     }
                     _ => {}
                 }
@@ -500,6 +523,9 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
             .len()
             .saturating_sub(unique_ranges.len()),
         recovered_function_bytes: unique_ranges.iter().map(|(_, size)| *size).sum(),
+        // Authoritative shared-body counts from the physical-body graph when
+        // available; the address-based approximation remains as a fallback.
+        body_graph: request.program.body_graph_report,
         recovered_declarations: request.program.declarations.len(),
         declarations_linked_by_vm_oracle: request
             .program
@@ -643,6 +669,24 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
         decoded_function_bytes,
         undecoded_function_bytes,
         function_kinds,
+        signature_tiers: request
+            .program
+            .signature_solutions
+            .as_ref()
+            .map(|solutions| {
+                let mut tiers = BTreeMap::new();
+                for solved in solutions.values() {
+                    *tiers.entry(solved.outcome.label().to_owned()).or_default() += 1;
+                }
+                tiers
+            })
+            .unwrap_or_default(),
+        cross_abi_tiers: request
+            .program
+            .cross_abi_consensus
+            .as_ref()
+            .map(|consensus| consensus.tier_summary())
+            .unwrap_or_default(),
         instruction_bytes: request.instruction_bytes,
     }
 }

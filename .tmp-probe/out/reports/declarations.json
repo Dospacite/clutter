@@ -1,0 +1,1203 @@
+{
+  "schema": "clutter.declarations/v1",
+  "note": "A function declaration without code may have been inlined, folded, deferred, or tree-shaken; the artifact does not prove which.",
+  "declarations": [
+    {
+      "snapshot_reference": 37886,
+      "kind": "class",
+      "name": "ProbeApp",
+      "owner": "package:edge_probe/main.dart",
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1752,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 15737,
+          "display_name": "StatelessWidget",
+          "library_uri": "package:flutter/src/widgets/framework.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 32859,
+      "kind": "function",
+      "name": "main",
+      "owner": null,
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 1,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 32860,
+      "kind": "function",
+      "name": "main",
+      "owner": null,
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": "implicit_closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 8,
+        "parameter_types_reference": 47434,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 8,
+            "display_name": "void",
+            "library_uri": "dart:core"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29919,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "ProbeApp",
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16514,
+        "parameter_types_reference": 49504,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16514,
+            "display_name": "Center",
+            "library_uri": "package:flutter/src/widgets/basic.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 15404,
+                "display_name": "BuildContext",
+                "library_uri": "package:flutter/src/widgets/framework.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29993,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "ProbeApp",
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16899,
+        "parameter_types_reference": 47386,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16899,
+            "display_name": "String",
+            "library_uri": "dart:core/string.dart"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29994,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": "ProbeApp",
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 2,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16527,
+        "parameter_types_reference": 49503,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16527,
+            "display_name": "Text",
+            "library_uri": "package:flutter/src/widgets/text.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 15404,
+                "display_name": "BuildContext",
+                "library_uri": "package:flutter/src/widgets/framework.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            },
+            {
+              "position": 1,
+              "type": {
+                "snapshot_reference": 17099,
+                "display_name": "AsyncSnapshot<int>",
+                "library_uri": "package:flutter/src/widgets/async.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29918,
+      "kind": "function",
+      "name": "build",
+      "owner": "ProbeApp",
+      "library_uri": "package:edge_probe/main.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 38020,
+      "kind": "class",
+      "name": "_MixinApplication1&E20Base&Counter",
+      "snapshot_name": "_MixinApplication1&E20Base&Counter@18353248",
+      "owner": "dart:mixin_deduplication",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1166,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16522,
+          "display_name": "E20Base",
+          "library_uri": "package:edge_probe/probe_code.dart"
+        },
+        "interfaces": [
+          {
+            "snapshot_reference": 16523,
+            "display_name": "Counter",
+            "library_uri": "package:edge_probe/probe_code.dart"
+          }
+        ],
+        "is_abstract": true,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": true
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 38019,
+      "kind": "class",
+      "name": "_MixinApplication2&E20Base&Counter&Loud",
+      "snapshot_name": "_MixinApplication2&E20Base&Counter&Loud@18353248",
+      "owner": "dart:mixin_deduplication",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1167,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16521,
+          "display_name": "_MixinApplication1&E20Base&Counter",
+          "library_uri": "package:edge_probe/probe_code.dart"
+        },
+        "interfaces": [
+          {
+            "snapshot_reference": 16524,
+            "display_name": "Loud",
+            "library_uri": "package:edge_probe/probe_code.dart"
+          }
+        ],
+        "is_abstract": true,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": true
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 38022,
+      "kind": "class",
+      "name": "Counter",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1164,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16912,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": true,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 38016,
+      "kind": "class",
+      "name": "E13Dynamic",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 758,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16912,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 38024,
+      "kind": "class",
+      "name": "E14Statics",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 757,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16912,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": true,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 36779,
+      "kind": "class",
+      "name": "E15Vec",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 756,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16912,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [
+          {
+            "snapshot_reference": 17444,
+            "display_name": "Comparable<E15Vec>",
+            "library_uri": "dart:core/comparable.dart"
+          }
+        ],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false,
+        "instance_slots": [
+          {
+            "offset": 8,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 12,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 16,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 20,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          }
+        ]
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 38021,
+      "kind": "class",
+      "name": "E20Base",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1165,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16912,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": true,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 38018,
+      "kind": "class",
+      "name": "E20Combo",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1168,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16520,
+          "display_name": "_MixinApplication2&E20Base&Counter&Loud",
+          "library_uri": "package:edge_probe/probe_code.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 38017,
+      "kind": "class",
+      "name": "E21Mode",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 2388,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 15433,
+          "display_name": "_Enum",
+          "library_uri": "dart:core/enum.dart"
+        },
+        "interfaces": [],
+        "is_abstract": false,
+        "is_enum": true,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false,
+        "instance_slots": [
+          {
+            "offset": 8,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 12,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 20,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          },
+          {
+            "offset": 24,
+            "is_reference": false,
+            "slot_type": "unboxed_field"
+          }
+        ]
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 38023,
+      "kind": "class",
+      "name": "Loud",
+      "owner": "package:edge_probe/probe_code.dart",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "class_metadata": {
+        "class_id": 1163,
+        "type_parameters": [],
+        "super_type": {
+          "snapshot_reference": 16912,
+          "display_name": "Object",
+          "library_uri": "dart:core/object.dart"
+        },
+        "interfaces": [],
+        "is_abstract": true,
+        "is_enum": false,
+        "is_sealed": false,
+        "is_mixin_class": false,
+        "is_base": false,
+        "is_interface": false,
+        "is_final": false,
+        "is_transformed_mixin_application": false
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 40349,
+      "kind": "field",
+      "name": "stamp",
+      "owner": "E14Statics",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": null,
+      "signature": null,
+      "field_metadata": {
+        "type_reference": 16906,
+        "type": {
+          "snapshot_reference": 16906,
+          "display_name": "int",
+          "library_uri": "dart:core/int.dart"
+        },
+        "initializer_reference": 29976,
+        "offset_or_field_id_reference": 12360,
+        "is_static": true,
+        "is_final": true,
+        "is_const": false,
+        "is_late": true,
+        "has_initializer": true,
+        "has_nontrivial_initializer": true
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 29961,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 17331,
+        "parameter_types_reference": 49483,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 17331,
+            "display_name": "Map<String, Object?>",
+            "library_uri": "dart:core/map.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 17650,
+                "display_name": "Map",
+                "library_uri": "dart:core/map.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29985,
+      "kind": "function",
+      "name": "<anonymous closure>",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "closure",
+      "signature": {
+        "fixed_parameter_count": 2,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 17640,
+        "parameter_types_reference": 49496,
+        "named_parameter_names_reference": 4,
+        "flags": 5,
+        "packed_type_parameter_counts": 2,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 17640,
+            "display_name": "MapEntry<String, num>",
+            "library_uri": "dart:core/map.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 16899,
+                "display_name": "String",
+                "library_uri": "dart:core/string.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            },
+            {
+              "position": 1,
+              "type": {
+                "snapshot_reference": 15249,
+                "display_name": "U"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29990,
+      "kind": "function",
+      "name": "e01InterpChain",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29989,
+      "kind": "function",
+      "name": "e02Cascade",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29988,
+      "kind": "function",
+      "name": "e04BitTwiddle",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16906,
+        "parameter_types_reference": 1,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16906,
+            "display_name": "int",
+            "library_uri": "dart:core/int.dart"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29987,
+      "kind": "function",
+      "name": "e05NullFlow",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29986,
+      "kind": "function",
+      "name": "e06RecordDestructure",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29984,
+      "kind": "function",
+      "name": "e07GenericBound",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 39127,
+        "result_type_reference": 17627,
+        "parameter_types_reference": 49497,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 512,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 17627,
+            "display_name": "Map<String, num>",
+            "library_uri": "dart:core/map.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 17533,
+                "display_name": "Map<String, U>",
+                "library_uri": "dart:core/map.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            }
+          ],
+          "type_parameters": [
+            {
+              "name": "T",
+              "bound": {
+                "snapshot_reference": 16907,
+                "display_name": "num",
+                "library_uri": "dart:core/num.dart"
+              }
+            },
+            {
+              "name": "U",
+              "bound": {
+                "snapshot_reference": 15206,
+                "display_name": "T"
+              }
+            }
+          ]
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29920,
+      "kind": "function",
+      "name": "e08LabeledLoops",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16906,
+        "parameter_types_reference": 1,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16906,
+            "display_name": "int",
+            "library_uri": "dart:core/int.dart"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": false
+    },
+    {
+      "snapshot_reference": 29983,
+      "kind": "function",
+      "name": "e09TryRethrow",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29982,
+      "kind": "function",
+      "name": "e10AsyncLoop",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29981,
+      "kind": "function",
+      "name": "e11SyncGen",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29963,
+      "kind": "function",
+      "name": "e16SortedCopy",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29959,
+      "kind": "function",
+      "name": "e17JsonRoundTrip",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29931,
+      "kind": "function",
+      "name": "e18NumericEdges",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 27031,
+      "kind": "function",
+      "name": "e19Ackermann",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 1,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16906,
+        "parameter_types_reference": 48022,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16906,
+            "display_name": "int",
+            "library_uri": "dart:core/int.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 16906,
+                "display_name": "int",
+                "library_uri": "dart:core/int.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            },
+            {
+              "position": 1,
+              "type": {
+                "snapshot_reference": 16906,
+                "display_name": "int",
+                "library_uri": "dart:core/int.dart"
+              },
+              "is_named": false,
+              "is_required": false
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 27032,
+      "kind": "function",
+      "name": "e19Ackermann",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "implicit_closure",
+      "signature": {
+        "fixed_parameter_count": 1,
+        "optional_parameter_count": 1,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 1,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16906,
+        "parameter_types_reference": 48021,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16906,
+            "display_name": "int",
+            "library_uri": "dart:core/int.dart"
+          },
+          "parameters": [
+            {
+              "position": 0,
+              "type": {
+                "snapshot_reference": 16906,
+                "display_name": "int",
+                "library_uri": "dart:core/int.dart"
+              },
+              "is_named": false,
+              "is_required": true
+            },
+            {
+              "position": 1,
+              "type": {
+                "snapshot_reference": 16906,
+                "display_name": "int",
+                "library_uri": "dart:core/int.dart"
+              },
+              "is_named": false,
+              "is_required": false
+            }
+          ],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29923,
+      "kind": "function",
+      "name": "e23DynamicApply",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29921,
+      "kind": "function",
+      "name": "e25Intrinsics",
+      "owner": null,
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16897,
+        "parameter_types_reference": 1,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16897,
+            "display_name": "bool",
+            "library_uri": "dart:core/bool.dart"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 30105,
+      "kind": "function",
+      "name": "noSuchMethod",
+      "owner": "E13Dynamic",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29922,
+      "kind": "function",
+      "name": "probe",
+      "owner": "E13Dynamic",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29975,
+      "kind": "function",
+      "name": "bump",
+      "owner": "E14Statics",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": {
+        "fixed_parameter_count": 0,
+        "optional_parameter_count": 0,
+        "optional_parameters_are_named": false,
+        "implicit_parameter_count": 0,
+        "type_parameters_reference": 1,
+        "result_type_reference": 16906,
+        "parameter_types_reference": 1,
+        "named_parameter_names_reference": 4,
+        "flags": 3,
+        "packed_type_parameter_counts": 0,
+        "resolved": {
+          "return_type": {
+            "snapshot_reference": 16906,
+            "display_name": "int",
+            "library_uri": "dart:core/int.dart"
+          },
+          "parameters": [],
+          "type_parameters": []
+        }
+      },
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 31334,
+      "kind": "function",
+      "name": "==",
+      "owner": "E15Vec",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 27030,
+      "kind": "function",
+      "name": "compareTo",
+      "owner": "E15Vec",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 31016,
+      "kind": "function",
+      "name": "get:hashCode",
+      "owner": "E15Vec",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "getter",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29929,
+      "kind": "function",
+      "name": "greet",
+      "owner": "E20Combo",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 30474,
+      "kind": "function",
+      "name": "_enumToString",
+      "snapshot_name": "_enumToString@0150898",
+      "owner": "E21Mode",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    },
+    {
+      "snapshot_reference": 29927,
+      "kind": "function",
+      "name": "parse",
+      "owner": "E21Mode",
+      "library_uri": "package:edge_probe/probe_code.dart",
+      "source_location": null,
+      "function_kind": "regular",
+      "signature": null,
+      "has_code": true
+    }
+  ]
+}

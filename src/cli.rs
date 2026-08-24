@@ -31,6 +31,8 @@ enum Command {
     Inspect(InspectArgs),
     Decompile(DecompileArgs),
     VmOracle(VmOracleArgs),
+    /// Validate a runtime-trace document and print its refinement profile.
+    Trace(TraceArgs),
     Version(VersionArgs),
 }
 
@@ -94,6 +96,19 @@ struct VersionArgs {
 }
 
 #[derive(Args)]
+struct TraceArgs {
+    /// Runtime-trace JSON produced by an instrumented emulator run.
+    input: PathBuf,
+
+    /// Snapshot hash the trace must match (from decompilation.json).
+    #[arg(long)]
+    snapshot_hash: Option<String>,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct VmOracleArgs {
     input: PathBuf,
 
@@ -134,6 +149,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Inspect(arguments) => inspect(arguments),
         Command::Decompile(arguments) => decompile(arguments),
         Command::VmOracle(arguments) => vm_oracle(arguments),
+        Command::Trace(arguments) => trace(arguments),
         Command::Version(arguments) => version(arguments),
     }
 }
@@ -257,6 +273,20 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         (recover_snapshot()?, None)
     };
     if program.application_package.is_none()
+        && let Some(package) = snapshot_recovery.application_package.clone()
+    {
+        program.application_package = Some(package.clone());
+        program
+            .warnings
+            .retain(|warning| warning.code != "W_APP_PACKAGE_UNKNOWN");
+        program.warnings.push(Warning {
+            code: "W_APP_PACKAGE_INFERRED_FROM_SNAPSHOT".to_owned(),
+            message: format!(
+                "Application package `{package}` was inferred from corroborating snapshot library URIs."
+            ),
+        });
+    }
+    if program.application_package.is_none()
         && let Some(package) = debug_symbols
             .as_ref()
             .and_then(|debug| debug.application_package.clone())
@@ -276,10 +306,17 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
     program.snapshot_evidence = Some(snapshot_recovery.snapshot_evidence.clone());
     program.dispatch_table = snapshot_recovery.dispatch_table;
     analysis::attach_snapshot_strings(&mut program, snapshot_recovery.snapshot_strings);
+    let vm_oracle_present = arguments.vm_oracle.is_some();
+    let oracle_subject = crate::evidence::subject::ArtifactSubject::observe(
+        artifact.info(),
+        &payload,
+        &libapp,
+        &snapshot,
+    );
     let vm_oracle = arguments
         .vm_oracle
         .as_deref()
-        .map(|path| crate::vm_oracle::load(path, &snapshot, payload.abi))
+        .map(|path| crate::vm_oracle::load(path, &snapshot, payload.abi, &oracle_subject))
         .transpose()?;
     if let Some(oracle) = &vm_oracle {
         crate::vm_oracle::apply_root(&mut program, oracle);
@@ -320,6 +357,11 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
     };
     let snapshot_functions = snapshot_recovery.functions;
     let snapshot_declarations = snapshot_recovery.declarations;
+    // Full declaration evidence (every scope) enriches call sites with field
+    // layouts, constructor identities, and signatures even when --scope
+    // restricts which libraries are rendered.
+    let full_declarations = snapshot_declarations.clone();
+    let all_snapshot_functions = snapshot_functions.clone();
     let functions = if let Some(debug) = debug_symbols {
         let linked_declarations = analysis::recover_linked_snapshot_declarations(
             &debug,
@@ -376,10 +418,89 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         crate::vm_oracle::apply_declarations(&mut program, oracle, output_scope);
     }
     analysis::attach_functions(&mut program, functions, output_scope);
+    // Physical-body / logical-occurrence resolution happens before oracle
+    // mutation of the program: shared optimized bodies and same-address
+    // closures are appended as distinct occurrences, never overwritten.
+    let body_graph = crate::evidence::body::build(
+        &program,
+        payload.abi,
+        snapshot
+            .regions
+            .iter()
+            .find(|region| region.name == "_kDartIsolateSnapshotInstructions"),
+        vm_oracle.as_ref().map_or(&[], |oracle| oracle.functions()),
+    )?;
+    program.body_graph_report = Some(body_graph.report());
+
+    // Signature/type constraint solving over static evidence. Descriptor
+    // facts come only from an exactly bound oracle; everything else stays a
+    // bounded or unknown outcome in the appropriate tier.
+    let mut descriptor_by_name: std::collections::BTreeMap<
+        (Option<String>, Option<String>, String),
+        crate::evidence::signature_solver::DescriptorShape,
+    > = std::collections::BTreeMap::new();
+    if let Some(oracle) = &vm_oracle {
+        for candidate in oracle.functions() {
+            let (fixed, optional, optional_named, implicit) = match (
+                candidate.fixed_parameter_count,
+                candidate.optional_parameter_count,
+                candidate.optional_parameters_are_named,
+                candidate.implicit_parameter_count,
+            ) {
+                (Some(fixed), Some(optional), Some(named), Some(implicit)) => {
+                    (fixed, optional, named, implicit)
+                }
+                _ => continue,
+            };
+            let key = (
+                candidate.library_uri.clone(),
+                candidate.owner.clone(),
+                candidate.name.clone(),
+            );
+            descriptor_by_name.insert(key, (fixed, optional, optional_named, implicit));
+        }
+    }
+    let mut problems = Vec::new();
+    {
+        let mut seen_names = std::collections::BTreeSet::new();
+        for function in &program.functions {
+            let key = (
+                function.library_uri.clone(),
+                function.owner.clone(),
+                function.name.clone(),
+            );
+            if !seen_names.insert(key.clone()) {
+                continue;
+            }
+            let descriptor = descriptor_by_name.get(&key).copied();
+            problems.push(crate::evidence::signature_solver::SignatureProblem {
+                name_key: key,
+                call_site_constraints: Vec::new(),
+                descriptor,
+                receivers: Vec::new(),
+            });
+        }
+        for function in &program.functions {
+            crate::evidence::signature_solver::accumulate_call_sites(function, &mut problems);
+        }
+    }
+    let signature_results = crate::evidence::signature_solver::solve(&mut problems);
+    program.signature_solutions = Some(signature_results);
+
     if let Some(oracle) = vm_oracle {
         crate::vm_oracle::attach(&mut program, oracle, &snapshot, payload.abi)?;
     }
     analysis::relink_calls(&mut program);
+    analysis::enrich_semantics(
+        &mut program,
+        payload.abi,
+        &full_declarations,
+        &all_snapshot_functions,
+    );
+    if !vm_oracle_present {
+        analysis::derive_import_graph(&mut program);
+    }
+    program.declaration_evidence.extend(full_declarations);
     if arguments.cross_abi && ownership_obfuscated && obfuscation_map.is_none() {
         program.warnings.push(Warning {
             code: "W_CROSS_ABI_NEEDS_NAME_MAP".to_owned(),
@@ -440,8 +561,18 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
             program.cross_abi = Some(analysis::compare_cross_abi(
                 payload.abi,
                 &program.functions,
-                alternatives,
+                alternatives
+                    .iter()
+                    .map(|(abi, functions)| (*abi, functions.clone()))
+                    .collect(),
             ));
+            let mut consensus_inputs = vec![(payload.abi, program.functions.as_slice())];
+            for (abi, functions) in &alternatives {
+                consensus_inputs.push((*abi, functions.as_slice()));
+            }
+            program.cross_abi_consensus = Some(
+                crate::evidence::consensus::consensus_from_functions(consensus_inputs),
+            );
         }
     }
     if let Some(map) = obfuscation_map {
@@ -495,6 +626,10 @@ fn vm_oracle(arguments: VmOracleArgs) -> Result<()> {
     if arguments.out.exists() && !arguments.replace {
         return Err(ClutterError::OutputExists(arguments.out));
     }
+    let binding_path = crate::evidence::oracle::binding_path(&arguments.out);
+    if binding_path.exists() && !arguments.replace {
+        return Err(ClutterError::OutputExists(binding_path));
+    }
     fs::metadata(&arguments.analyzer).at(&arguments.analyzer)?;
     if let Some(parent) = arguments
         .out
@@ -519,6 +654,12 @@ fn vm_oracle(arguments: VmOracleArgs) -> Result<()> {
         .transpose()?;
     let elf = ElfImage::parse(&libapp, payload.abi)?;
     let snapshot = crate::snapshot::inspect(&elf, libflutter.as_deref())?;
+    let subject = crate::evidence::subject::ArtifactSubject::observe(
+        artifact.info(),
+        &payload,
+        &libapp,
+        &snapshot,
+    );
 
     let temporary = tempfile::tempdir().at(&arguments.input)?;
     let local_libapp = temporary.path().join("libapp.so");
@@ -548,7 +689,15 @@ fn vm_oracle(arguments: VmOracleArgs) -> Result<()> {
         run_process(&mut command, "Dart VM snapshot analyzer")?;
     }
 
-    let oracle = crate::vm_oracle::load(&arguments.out, &snapshot, payload.abi)?;
+    let oracle = crate::vm_oracle::load_unbound(&arguments.out, &snapshot, payload.abi)?;
+    let binding_path = crate::evidence::oracle::write_binding(
+        &arguments.out,
+        &arguments.analyzer,
+        subject.clone(),
+        &oracle.evidence,
+        arguments.replace,
+    )?;
+    crate::evidence::oracle::verify_binding(&arguments.out, &subject, &oracle.evidence)?;
     println!(
         "Dart VM oracle wrote {} objects, {} libraries, {} classes, {} functions, and {} code objects to {}",
         oracle.evidence.object_count,
@@ -558,6 +707,7 @@ fn vm_oracle(arguments: VmOracleArgs) -> Result<()> {
         oracle.evidence.code_object_count,
         arguments.out.display(),
     );
+    println!("Exact oracle binding wrote {}", binding_path.display());
     if let Some(root) = &oracle.evidence.root_library_uri {
         println!("VM-resolved root library: {root}");
     }
@@ -696,6 +846,49 @@ fn print_inspect(report: &InspectReport<'_>) {
         "AOT instruction payload: {} bytes; Flutter assets: {} files",
         report.instruction_bytes, report.artifact.asset_count
     );
+}
+
+fn trace(arguments: TraceArgs) -> Result<()> {
+    let bytes = fs::read(&arguments.input).at(&arguments.input)?;
+    let parsed = crate::evidence::runtime_trace::RuntimeTrace::load(&bytes)
+        .map_err(|error| ClutterError::Analysis(format!("runtime trace rejected: {error}")))?;
+    if let Some(expected) = &arguments.snapshot_hash {
+        if parsed.snapshot_hash != *expected {
+            return Err(ClutterError::Analysis(format!(
+                "runtime trace snapshot hash {} does not match expected {expected}; dynamic evidence from another payload must not refine this subject",
+                parsed.snapshot_hash
+            )));
+        }
+    }
+    let refinement = crate::evidence::runtime_trace::TraceRefinement::derive(&parsed);
+    if arguments.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "clutter.trace-refinement/v1",
+                "abi": parsed.abi,
+                "snapshot_hash": parsed.snapshot_hash,
+                "executed_bodies": refinement.executed_bodies.len(),
+                "dominant_dispatch_targets": refinement.dominant_dispatch_targets.len(),
+                "observed_arities": refinement.observed_arities.len(),
+                "observed_receivers": refinement.observed_receivers.len(),
+            })
+        );
+    } else {
+        println!(
+            "Trace for {} at snapshot {}: {} executed bodies, {} dispatch slots profiled, {} arity observations, {} receiver-CID observations.",
+            parsed.abi,
+            parsed.snapshot_hash,
+            refinement.executed_bodies.len(),
+            refinement.dominant_dispatch_targets.len(),
+            refinement.observed_arities.len(),
+            refinement.observed_receivers.len(),
+        );
+        println!(
+            "Refinements stay in the inferred tier: execution frequency ranks plausibility but never proves semantics."
+        );
+    }
+    Ok(())
 }
 
 fn version(arguments: VersionArgs) -> Result<()> {

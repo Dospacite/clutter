@@ -112,8 +112,12 @@ pub fn recover(libapp: &[u8], snapshot: &SnapshotInfo, scope: Scope) -> Recovere
         snapshot_evidence: None,
         dispatch_table: None,
         cross_abi: None,
+        cross_abi_consensus: None,
+        body_graph_report: None,
+        signature_solutions: None,
         deferred_units: Vec::new(),
         warnings,
+        declaration_evidence: Vec::new(),
     }
 }
 
@@ -252,6 +256,56 @@ pub(crate) fn reconcile_libraries(program: &mut RecoveredProgram, scope: Scope) 
     program
         .libraries
         .sort_by(|left, right| left.output_path.cmp(&right.output_path));
+}
+
+/// Derives a conservative import graph from resolved direct-call evidence:
+/// when a function in library A calls a named function attributed to library
+/// B, A plausibly imports B (directly or through a re-export). This fills the
+/// gap when no VM oracle ran; the oracle's own authoritative import lists are
+/// merged on top elsewhere.
+pub(crate) fn derive_import_graph(program: &mut RecoveredProgram) {
+    let mut references: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let record = |from: &Option<String>,
+                  to: &Option<String>,
+                  references: &mut BTreeMap<String, BTreeSet<String>>| {
+        if let (Some(from), Some(to)) = (from.clone(), to.clone())
+            && from != to
+            && !to.is_empty()
+        {
+            references.entry(from).or_default().insert(to);
+        }
+    };
+    for function in &program.functions {
+        for statement in &function.statements {
+            match statement {
+                crate::model::PseudoStatement::DirectCall {
+                    target_library_uri, ..
+                }
+                | crate::model::PseudoStatement::RecoveredIndirectCall {
+                    target_library_uri, ..
+                } => {
+                    record(&function.library_uri, target_library_uri, &mut references);
+                }
+                _ => {}
+            }
+        }
+    }
+    for library in &mut program.libraries {
+        let derived = references.get(&library.uri).cloned().unwrap_or_default();
+        if derived.is_empty() {
+            continue;
+        }
+        for uri in derived {
+            if !library.imports.contains(&uri) {
+                library.imports.push(uri.clone());
+            }
+            if !library.referenced_libraries.contains(&uri) {
+                library.referenced_libraries.push(uri);
+            }
+        }
+        library.imports.sort();
+        library.referenced_libraries.sort();
+    }
 }
 
 fn restore_function_signature_type_names(
@@ -686,6 +740,170 @@ pub(crate) fn readable_snapshot_name(value: &str) -> String {
     PRIVATE_KEY.replace_all(value, "").into_owned()
 }
 
+/// Re-lifts every recovered function with full semantic evidence:
+/// parameter names from resolved signatures, VM-verified field layouts for
+/// every surviving class (including out-of-scope Flutter/Dart SDK classes),
+/// constructor result classes, and call-target symbols. This is what turns
+/// raw machine code into named field reads/writes, string interpolations,
+/// and receiver-aware calls.
+pub fn enrich_semantics(
+    program: &mut RecoveredProgram,
+    abi: crate::model::Abi,
+    extra_declarations: &[RecoveredDeclaration],
+    extra_functions: &[crate::model::RecoveredFunction],
+) {
+    use crate::analysis::disassembly::{build_function_symbols, semantic_parameter_hints};
+
+    let application_package = program.application_package.clone();
+    let mut all_functions = extra_functions.to_vec();
+    all_functions.extend(program.functions.iter().cloned());
+    let (mut symbols, target_library_candidates) =
+        build_function_symbols(&all_functions, application_package.as_deref());
+    // The initial snapshot lift names calls through every code range,
+    // including out-of-scope Flutter/Dart SDK targets. Preserve those names
+    // when re-lifting with enriched layouts.
+    for function in program.functions.iter() {
+        for statement in function.statements.iter() {
+            let crate::model::PseudoStatement::DirectCall {
+                target_address,
+                target: Some(target),
+                target_library_uri,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let Some(address) = parse_hex_address(target_address) else {
+                continue;
+            };
+            let symbol = disassembly::Symbol::new(
+                target.clone(),
+                target_library_uri.clone(),
+                application_package.as_deref(),
+            )
+            .with_code_identity(
+                address,
+                0,
+                crate::model::DirectCallResolution::ExactEntry,
+            );
+            match symbols.get(&address) {
+                Some(existing) if existing.semantic_name => {}
+                _ => {
+                    symbols.insert(address, symbol);
+                }
+            }
+        }
+    }
+    let target_libraries = target_library_candidates
+        .into_iter()
+        .filter_map(|(target, libraries)| {
+            (libraries.len() == 1).then(|| (target, libraries.into_iter().next().flatten()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut layout_declarations = extra_declarations.to_vec();
+    layout_declarations.extend(program.declarations.iter().cloned());
+    let layouts = disassembly::RecoveredFieldLayout::from_declarations(abi, &layout_declarations);
+
+    // Per-class allocation stubs surface as ranges named after their Class
+    // but carry no function kind. Backfill their result class from class
+    // declarations so field stores through freshly allocated objects resolve
+    // real field names instead of raw slot offsets.
+    let mut class_lookup: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    for declaration in layout_declarations.iter() {
+        if declaration.kind != crate::model::RecoveredDeclarationKind::Class {
+            continue;
+        }
+        let name = readable_snapshot_name(&declaration.name);
+        if let Some(entry) = class_lookup.get(&name) {
+            // Ambiguous across libraries: drop the mapping.
+            if entry.1 != declaration.library_uri {
+                class_lookup.remove(&name);
+            }
+            continue;
+        }
+        class_lookup.insert(name.clone(), (name, declaration.library_uri.clone()));
+    }
+    for symbol in symbols.values_mut() {
+        if symbol.result_class.is_some() || !symbol.semantic_name {
+            continue;
+        }
+        let leaf = symbol.label.rsplit('.').next().unwrap_or(&symbol.label);
+        if let Some((class, library_uri)) = class_lookup.get(leaf) {
+            symbol.result_class = Some(class.clone());
+            if symbol.library_uri.is_none() {
+                symbol.library_uri = library_uri.clone();
+            }
+        }
+    }
+
+    for function in &mut program.functions {
+        let parameter_hints = semantic_parameter_hints(function);
+        let owner = function.owner.as_deref().map(readable_snapshot_name);
+        let receiver_class = owner
+            .as_deref()
+            .map(|owner| (owner, function.library_uri.as_deref()));
+        function.semantic_statements = disassembly::relift_semantics(
+            function,
+            abi,
+            &parameter_hints,
+            Some(&layouts),
+            receiver_class,
+            &symbols,
+        );
+        promote_recovered_indirect_calls(
+            function,
+            &target_libraries,
+            application_package.as_deref(),
+        );
+        function.machine_code.semantic_statements = function.semantic_statements.len();
+    }
+}
+
+pub(crate) fn promote_recovered_indirect_calls(
+    function: &mut crate::model::RecoveredFunction,
+    target_libraries: &BTreeMap<String, Option<String>>,
+    application_package: Option<&str>,
+) {
+    let recovered_indirect_targets = function
+        .semantic_statements
+        .iter()
+        .filter_map(|statement| match statement {
+            crate::model::SemanticStatement::ResolvedCall {
+                target, address, ..
+            } => Some((address.clone(), target.clone())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for statement in &mut function.statements {
+        let crate::model::PseudoStatement::IndirectCall {
+            address,
+            expression,
+        } = statement
+        else {
+            continue;
+        };
+        let Some(target) = recovered_indirect_targets.get(address).cloned() else {
+            continue;
+        };
+        let address = address.clone();
+        let expression = expression.clone();
+        let target_library_uri = target_libraries.get(&target).cloned().flatten();
+        let target_scope = crate::analysis::disassembly::call_target_scope(
+            &target,
+            target_library_uri.as_deref(),
+            application_package,
+        );
+        *statement = crate::model::PseudoStatement::RecoveredIndirectCall {
+            address,
+            expression,
+            target,
+            target_library_uri,
+            target_scope,
+        };
+    }
+}
+
 fn propagate_matching_signatures(functions: &mut [crate::model::RecoveredFunction]) {
     let signatures = functions
         .iter()
@@ -973,7 +1191,11 @@ fn function_name_priority(source: crate::model::RecoveredNameSource) -> u8 {
         crate::model::RecoveredNameSource::ObfuscationMap => 4,
         crate::model::RecoveredNameSource::Snapshot => 3,
         crate::model::RecoveredNameSource::DartVmOracle => 2,
-        crate::model::RecoveredNameSource::Synthetic => 0,
+        // Guesses rank below every evidence-backed name; LLM-assisted names
+        // additionally lose to plain synthetic labels because they look
+        // authoritative while having no provenance.
+        crate::model::RecoveredNameSource::Synthetic => 1,
+        crate::model::RecoveredNameSource::LlmAssisted => 0,
     }
 }
 
@@ -992,7 +1214,7 @@ fn include_uri(uri: Option<&str>, scope: Scope, application_package: Option<&str
     }
 }
 
-fn choose_application_package(libraries: &BTreeSet<String>) -> Option<String> {
+pub(crate) fn choose_application_package(libraries: &BTreeSet<String>) -> Option<String> {
     let mut candidates = BTreeMap::<String, (usize, bool)>::new();
     for uri in libraries {
         let Some(package) = package_name(uri) else {
@@ -1006,21 +1228,25 @@ fn choose_application_package(libraries: &BTreeSet<String>) -> Option<String> {
         candidate.0 += 1;
         candidate.1 |= is_main;
     }
-    candidates
+    let eligible = candidates
         .into_iter()
         // One isolated package URI is commonly a surviving dependency string,
         // not proof of application ownership. A main library or corroborating
         // URIs are required before narrowing `--scope app`.
         .filter(|(_, (count, has_main))| *has_main || *count >= 2)
-        .max_by(
-            |(left_name, (left_count, left_main)), (right_name, (right_count, right_main))| {
-                left_main
-                    .cmp(right_main)
-                    .then(left_count.cmp(right_count))
-                    .then_with(|| right_name.cmp(left_name))
-            },
-        )
-        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let best_evidence = eligible
+        .iter()
+        .map(|(_, (count, has_main))| (*has_main, *count))
+        .max()?;
+    let mut best = eligible
+        .into_iter()
+        .filter(|(_, (count, has_main))| (*has_main, *count) == best_evidence);
+    let (name, _) = best.next()?;
+    // Equal evidence is ambiguity, not a reason to pick whichever package
+    // name happens to sort first and then discard the other package at app
+    // scope.
+    best.next().is_none().then_some(name)
 }
 
 fn package_name(uri: &str) -> Option<&str> {
@@ -1104,9 +1330,11 @@ mod tests {
             source_location: None,
             inlined_functions: Vec::new(),
             kind: Some(RecoveredFunctionKind::Regular),
+            is_static: Some(true),
             signature: None,
             signature_source: None,
             parameter_count: None,
+            lexical_parent: None,
             vm_evidence: None,
             address: "0x1000".to_owned(),
             size: 8,
@@ -1204,6 +1432,17 @@ mod tests {
         let libraries = BTreeSet::from([
             "package:ffi/src/allocation.dart".to_owned(),
             "package:flutter/widgets.dart".to_owned(),
+        ]);
+        assert_eq!(choose_application_package(&libraries), None);
+    }
+
+    #[test]
+    fn leaves_equally_supported_packages_ambiguous() {
+        let libraries = BTreeSet::from([
+            "package:first/main.dart".to_owned(),
+            "package:first/model.dart".to_owned(),
+            "package:second/main.dart".to_owned(),
+            "package:second/model.dart".to_owned(),
         ]);
         assert_eq!(choose_application_package(&libraries), None);
     }

@@ -6,7 +6,7 @@ pub struct Profile {
     pub match_kind: ProfileMatch,
 }
 
-const KNOWN: [(&str, &str); 10] = [
+const KNOWN: [(&str, &str); 11] = [
     ("d20a1be77c3d3c41b2a5accaee1ce549", "3.4.3"),
     ("80a49c7111088100a233b2ae788e1f48", "3.5.0"),
     ("cda356e9bae476c70de33809fd92e009", "3.5.1"),
@@ -16,7 +16,8 @@ const KNOWN: [(&str, &str); 10] = [
     ("97ff04a728735e6b6b098bdf983faaba", "3.9.2"),
     ("1ce86630892e2dca9a8543fdb8ed8e22", "3.10.7"),
     ("78da37fed6bf1489361a312568249f3f", "3.11.0"),
-    ("bf2a89a0870c9457c268c1bc89403fe1", "3.12.0-dev"),
+    ("bf2a89a0870c9457c268c1bc89403fe1", "3.12.0"),
+    ("ace654289f5abc240509fc941453ebc5", "3.12.2"),
 ];
 
 pub fn detect(hash: &str, runtime_version: Option<&str>) -> Profile {
@@ -41,11 +42,11 @@ pub fn detect(hash: &str, runtime_version: Option<&str>) -> Profile {
             let minor = parts.next()?.parse::<u32>().ok()?;
             Some((major, minor))
         })
-        .is_some_and(|(major, minor)| major == 3 && (4..=11).contains(&minor));
+        .is_some_and(|(major, minor)| major == 3 && (4..=12).contains(&minor));
 
     if supported_runtime {
         Profile {
-            id: "dart-3.4-3.11-compatible-object-header".to_owned(),
+            id: "dart-3.4-3.12-compatible-object-header".to_owned(),
             version: None,
             match_kind: ProfileMatch::Compatible,
         }

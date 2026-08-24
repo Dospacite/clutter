@@ -111,10 +111,10 @@ pub fn profile_for(info: &SnapshotInfo, pointer_width: usize) -> Result<Profile>
     let cids = match minor {
         4 | 5 => CIDS_343,
         6..=8 => CIDS_362,
-        9..=11 => CIDS_392,
+        9..=12 => CIDS_392,
         _ => {
             return Err(ClutterError::Unsupported(format!(
-                "Dart {version} clustered objects are outside the supported 3.4–3.11 range"
+                "Dart {version} clustered objects are outside the supported 3.4–3.12 range"
             )));
         }
     };
@@ -345,6 +345,11 @@ const CIDS_392: Cids = common_cids!(
     growable: 92, string: 93, one_string: 94, two_string: 95,
     typed_first: 112, byte_view: 168, predefined: 175
 );
+
+#[cfg(test)]
+pub(crate) fn test_cids() -> Cids {
+    CIDS_392
+}
 
 #[cfg(test)]
 mod tests {

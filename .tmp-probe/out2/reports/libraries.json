@@ -1,0 +1,79 @@
+{
+  "schema": "clutter.libraries/v1",
+  "libraries": [
+    {
+      "uri": "package:edge_probe/main.dart",
+      "package": "edge_probe",
+      "output_path": "main.dart",
+      "is_application": true,
+      "imports": [
+        "dart:_compact_hash",
+        "dart:core-patch/growable_array.dart",
+        "dart:core-patch/integers.dart",
+        "dart:core-patch/string_patch.dart",
+        "package:edge_probe/probe_code.dart",
+        "package:flutter/src/material/app.dart",
+        "package:flutter/src/material/scaffold.dart",
+        "package:flutter/src/painting/text_scaler.dart",
+        "package:flutter/src/widgets/async.dart",
+        "package:flutter/src/widgets/basic.dart",
+        "package:flutter/src/widgets/binding.dart",
+        "package:flutter/src/widgets/text.dart"
+      ],
+      "referenced_libraries": [
+        "dart:_compact_hash",
+        "dart:core-patch/growable_array.dart",
+        "dart:core-patch/integers.dart",
+        "dart:core-patch/string_patch.dart",
+        "package:edge_probe/probe_code.dart",
+        "package:flutter/src/material/app.dart",
+        "package:flutter/src/material/scaffold.dart",
+        "package:flutter/src/painting/text_scaler.dart",
+        "package:flutter/src/widgets/async.dart",
+        "package:flutter/src/widgets/basic.dart",
+        "package:flutter/src/widgets/binding.dart",
+        "package:flutter/src/widgets/text.dart"
+      ]
+    },
+    {
+      "uri": "package:edge_probe/probe_code.dart",
+      "package": "edge_probe",
+      "output_path": "probe_code.dart",
+      "is_application": true,
+      "imports": [
+        "dart:_compact_hash",
+        "dart:async/future.dart",
+        "dart:async/future_impl.dart",
+        "dart:collection/list.dart",
+        "dart:collection/splay_tree.dart",
+        "dart:core-patch/array.dart",
+        "dart:core-patch/bigint_patch.dart",
+        "dart:core-patch/double.dart",
+        "dart:core-patch/growable_array.dart",
+        "dart:core-patch/integers.dart",
+        "dart:core-patch/invocation_mirror_patch.dart",
+        "dart:core-patch/string_patch.dart",
+        "dart:core/exceptions.dart",
+        "dart:core/iterable.dart",
+        "dart:core/map.dart"
+      ],
+      "referenced_libraries": [
+        "dart:_compact_hash",
+        "dart:async/future.dart",
+        "dart:async/future_impl.dart",
+        "dart:collection/list.dart",
+        "dart:collection/splay_tree.dart",
+        "dart:core-patch/array.dart",
+        "dart:core-patch/bigint_patch.dart",
+        "dart:core-patch/double.dart",
+        "dart:core-patch/growable_array.dart",
+        "dart:core-patch/integers.dart",
+        "dart:core-patch/invocation_mirror_patch.dart",
+        "dart:core-patch/string_patch.dart",
+        "dart:core/exceptions.dart",
+        "dart:core/iterable.dart",
+        "dart:core/map.dart"
+      ]
+    }
+  ]
+}

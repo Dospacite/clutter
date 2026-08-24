@@ -172,6 +172,59 @@ impl<'a> TypeRecovery<'a> {
             })
             .unwrap_or_default();
         contextualize_class_types(&mut type_parameters, &mut super_type, &mut interfaces);
+        // Unboxed-field bitmaps turn bare slot offsets into typed
+        // placeholders that survive even when the Field names themselves
+        // were tree-shaken. Bit w marks word w from the object start
+        // (headers included), matching how fill_skip.instance reads them.
+        // The Instance cluster's `next_field_words` bounds the class's TRUE
+        // field count: walking past it turns bitmap padding or neighbouring-
+        // class bits into phantom fields (probe EC-7 gave `E15Vec` four
+        // slots for two source fields), and clear bits inside the range are
+        // ordinary reference slots the unboxed bitmap never records.
+        let (header_words, word_size): (i64, i64) = match self.abi {
+            Abi::Arm64V8a => (2, 4),
+            Abi::ArmeabiV7a => (1, 4),
+            Abi::X86_64 => (2, 8),
+        };
+        let header_bytes = header_words * word_size;
+        let mut instance_slots = Vec::new();
+        for snapshot in [self.isolate, self.vm] {
+            let Some(bitmap) = snapshot.instance_bitmaps.get(&class_id) else {
+                continue;
+            };
+            // Same cluster that wrote the bitmap carries the field count.
+            let next_field_words = snapshot
+                .clusters
+                .iter()
+                .find(|cluster| cluster.cid == class_id && cluster.next_field_words > 0)
+                .map(|cluster| i64::from(cluster.next_field_words));
+            let field_end = next_field_words
+                .map(|words| words.min(64))
+                .unwrap_or(64);
+            for word in header_words..field_end {
+                if word < 0 {
+                    continue;
+                }
+                let unboxed = bitmap & (1u64 << word) != 0;
+                if !unboxed && next_field_words.is_none() {
+                    // Without a trustworthy field count only unboxed bits
+                    // mean anything; clear bits could be anything.
+                    continue;
+                }
+                instance_slots.push(crate::model::RecoveredInstanceSlot {
+                    offset: header_bytes + (word - header_words) * word_size,
+                    is_reference: !unboxed,
+                    slot_type: if unboxed {
+                        "unboxed_field".to_owned()
+                    } else {
+                        "reference".to_owned()
+                    },
+                    field_name: None,
+                    field_object_id: None,
+                });
+            }
+            break;
+        }
         Some(RecoveredClassMetadata {
             class_id,
             type_parameters,
@@ -187,7 +240,7 @@ impl<'a> TypeRecovery<'a> {
             is_final: bit(state_bits, 18),
             instance_size: None,
             type_arguments_field_offset: None,
-            instance_slots: Vec::new(),
+            instance_slots,
         })
     }
 
@@ -498,10 +551,47 @@ impl<'a> TypeRecovery<'a> {
             .filter_map(|reference| self.recover_type_inner(reference, depth + 1, visiting))
             .map(|value| value.display_name)
             .collect::<Vec<_>>();
-        let field_names_index = shape.map_or(0, |value| value >> 16);
-        let mut display_name = if field_names_index == 0 && !field_types.is_empty() {
-            let comma = if field_types.len() == 1 { "," } else { "" };
-            format!("({}{comma})", field_types.join(", "))
+        // The shape packs the named-field count in its high bits.
+        let named_field_count = shape.map_or(0, |value| (value >> 16) as usize);
+        // Named record fields precede positional ones; their names live in a
+        // dedicated Array-of-String reference. Try the leading references so
+        // minor layout shifts still resolve.
+        let mut field_names: Vec<String> = Vec::new();
+        if named_field_count > 0 {
+            for candidate in references.iter().take(2) {
+                let elements = self.array_elements(*candidate);
+                if elements.len() != named_field_count {
+                    continue;
+                }
+                let names = elements
+                    .iter()
+                    .filter_map(|element| self.string_value(*element))
+                    .collect::<Vec<_>>();
+                if names.len() == named_field_count {
+                    field_names = names;
+                    break;
+                }
+            }
+        }
+        let mut display_name = if !field_types.is_empty() {
+            let named = field_names
+                .iter()
+                .zip(field_types.iter())
+                .map(|(name, type_name)| format!("{name}: {type_name}"))
+                .collect::<Vec<_>>();
+            let positional = field_types
+                .iter()
+                .skip(named.len())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut parts = named;
+            parts.extend(positional);
+            let comma = if parts.len() == 1 && !field_names.is_empty() {
+                ","
+            } else {
+                ""
+            };
+            format!("({}{comma})", parts.join(", "))
         } else {
             "Record".to_owned()
         };
@@ -694,6 +784,18 @@ impl<'a> TypeRecovery<'a> {
         self.string(object.name_ref)
     }
 
+    /// Reads a String object by snapshot reference, independent of the
+    /// named-object tables.
+    fn string_value(&self, reference: i32) -> Option<String> {
+        let (snapshot, object) = self.object(reference)?;
+        if object.kind != SnapshotObjectKind::String {
+            return None;
+        }
+        Some(crate::snapshot::cluster::types::decode_one_byte_string(
+            snapshot.bytes_of(object),
+        ))
+    }
+
     fn string(&self, reference: i32) -> Option<&str> {
         self.isolate
             .strings
@@ -824,7 +926,156 @@ fn render_type_parameters(parameters: &[RecoveredTypeParameter]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{bit, render_type_parameters, replace_type_parameter};
-    use crate::model::{RecoveredType, RecoveredTypeParameter};
+    use crate::model::{Abi, RecoveredType, RecoveredTypeParameter};
+    use crate::snapshot::cluster::cid::test_cids;
+    use crate::snapshot::cluster::types::{
+        ClusterHeader, ParseResult, SnapshotObjectKind, SnapshotObjectPayload,
+    };
+
+    #[test]
+    fn derives_typed_unboxed_instance_slots_from_instance_bitmaps() {
+        let cids = test_cids();
+        let mut snapshot = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        // Two consecutive unboxed words (schema-5 bitmap convention shared
+        // with fill_skip: bit w = word w from the object start, headers
+        // included, so the first field word is bit 2).
+        snapshot.insert_object(
+            60,
+            cids.class,
+            false,
+            SnapshotObjectKind::Class,
+            SnapshotObjectPayload {
+                references: Vec::new(),
+                scalars: vec![
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(44),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                ],
+                bytes: Vec::new(),
+            },
+        );
+        snapshot.instance_bitmaps.insert(44, 0b1100);
+
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::Arm64V8a, None);
+        let metadata = types.class_metadata(60).expect("class metadata");
+        let slots = &metadata.instance_slots;
+        assert_eq!(slots.len(), 2);
+        // ARM64 compressed layout: 8-byte header, 4-byte field words.
+        assert!(!slots[0].is_reference);
+        assert_eq!(slots[0].offset, 8);
+        assert_eq!(slots[0].slot_type, "unboxed_field");
+        assert_eq!(slots[1].offset, 12);
+        assert!(!slots[1].is_reference);
+    }
+
+    #[test]
+    fn bounds_slot_walk_by_cluster_field_count_and_marks_reference_slots() {
+        let cids = test_cids();
+        let mut snapshot = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        snapshot.insert_object(
+            62,
+            cids.class,
+            false,
+            SnapshotObjectKind::Class,
+            SnapshotObjectPayload {
+                references: Vec::new(),
+                scalars: vec![
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(46),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                ],
+                bytes: Vec::new(),
+            },
+        );
+        // Bitmap bit 6 is padding noise beyond the class's true layout
+        // (`next_field_words` says header 2 + 3 field words); bits 2/3 are
+        // clear reference slots the unboxed bitmap never records, bit 4 is
+        // a genuine unboxed word.
+        snapshot.instance_bitmaps.insert(46, 0b101_0000);
+        snapshot.clusters.push(crate::snapshot::cluster::types::Cluster {
+            cid: 46,
+            canonical: false,
+            count: 1,
+            start_ref: 0,
+            next_field_words: 5,
+            main_count: 0,
+            lengths: Vec::new(),
+            predefined_cids: Vec::new(),
+            discarded: Vec::new(),
+            allocation_values: Vec::new(),
+        });
+
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::Arm64V8a, None);
+        let metadata = types.class_metadata(62).expect("class metadata");
+        let slots = &metadata.instance_slots;
+        assert_eq!(slots.len(), 3, "bits beyond next_field_words must not appear");
+        assert_eq!(slots[0].slot_type, "reference");
+        assert!(slots[0].is_reference);
+        assert!(slots[1].is_reference);
+        assert_eq!(slots[2].slot_type, "unboxed_field");
+        assert!(!slots[2].is_reference);
+        assert_eq!(slots[2].offset, 16);
+    }
+
+    #[test]
+    fn leaves_instance_slots_empty_without_bitmap_evidence() {
+        let cids = test_cids();
+        let mut snapshot = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        snapshot.insert_object(
+            61,
+            cids.class,
+            false,
+            SnapshotObjectKind::Class,
+            SnapshotObjectPayload {
+                references: Vec::new(),
+                scalars: vec![
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(45),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                    crate::snapshot::cluster::types::SnapshotScalar::Tagged32(0),
+                ],
+                bytes: Vec::new(),
+            },
+        );
+        let types = super::TypeRecovery::new(
+            &snapshot,
+            &snapshot,
+            &cids,
+            Abi::Arm64V8a,
+            None,
+        );
+        let metadata = types.class_metadata(61).expect("class metadata");
+        assert!(metadata.instance_slots.is_empty());
+    }
 
     #[test]
     fn decodes_stable_class_and_field_flag_positions() {

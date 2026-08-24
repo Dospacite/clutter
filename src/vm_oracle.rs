@@ -6,8 +6,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::diagnostic::{ClutterError, IoContext, Result};
+use crate::evidence::subject::ArtifactSubject;
 use crate::model::{
-    Abi, RecoveredClassMetadata, RecoveredDeclaration, RecoveredDeclarationKind,
+    Abi, PseudoStatement, RecoveredClassMetadata, RecoveredDeclaration, RecoveredDeclarationKind,
     RecoveredFieldMetadata, RecoveredFunction, RecoveredFunctionKind, RecoveredInstanceSlot,
     RecoveredLibrary, RecoveredNameSource, RecoveredParameter, RecoveredProgram,
     RecoveredSignature, RecoveredSignatureDetails, RecoveredSignatureSource, RecoveredType,
@@ -23,11 +24,26 @@ pub(crate) struct LoadedVmOracle {
     declarations: Vec<RecoveredDeclaration>,
     libraries: Vec<RecoveredLibrary>,
     object_pool_labels: BTreeMap<usize, String>,
+    /// Schema 5 dispatch rows: selector index -> owner function name. Exact
+    /// receiver-CID evidence for recovered indirect calls.
+    dispatch_selectors: BTreeMap<usize, String>,
+}
+
+impl LoadedVmOracle {
+    /// Function evidence for the body/occurrence graph. Includes every
+    /// retained entry: matched functions, code-owner links, stubs, and
+    /// unattributed code boundaries.
+    pub(crate) fn functions(&self) -> &[VmFunctionEvidence] {
+        &self.functions
+    }
 }
 
 struct AnalyzerDocument {
     objects: Vec<AnalyzerObject>,
     metadata: AnalyzerMetadata,
+    static_calls: Option<AnalyzerStaticCallsSection>,
+    dispatch_metadata: Option<AnalyzerDispatchMetadataSection>,
+    class_ranges: Option<AnalyzerClassRangesSection>,
 }
 
 #[derive(Deserialize)]
@@ -35,12 +51,93 @@ struct AnalyzerEnvelope {
     #[serde(default)]
     objects: Vec<serde_json::Value>,
     metadata: AnalyzerMetadata,
+    /// Schema 5 emits payload-wide semantic evidence as top-level keys after
+    /// the objects array; older schemas omit them entirely.
+    #[serde(default)]
+    static_calls: Option<AnalyzerStaticCallsSection>,
+    #[serde(default)]
+    dispatch_metadata: Option<AnalyzerDispatchMetadataSection>,
+    #[serde(default)]
+    class_ranges: Option<AnalyzerClassRangesSection>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnalyzerStaticCallsSection {
+    #[serde(default)]
+    targets: Vec<AnalyzerStaticCall>,
+    #[serde(default)]
+    entry_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnalyzerStaticCall {
+    #[serde(default)]
+    pool_index: u64,
+    // Identity fields beyond pool_index/owner_name are retained as part of the
+    // row schema; later accuracy phases join them against Code/Function ids.
+    #[serde(default)]
+    #[allow(dead_code)]
+    target_offset: i64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    size: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner_id: Option<u64>,
+    #[serde(default)]
+    owner_name: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner_is_static: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner_parameter_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnalyzerDispatchMetadataSection {
+    #[serde(default)]
+    #[allow(dead_code)] // reported alongside dispatch selectors in a later phase
+    code_entry_count: Option<u64>,
+    #[serde(default)]
+    targets: Vec<AnalyzerDispatchTarget>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnalyzerDispatchTarget {
+    #[serde(default)]
+    selector_index: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    target_offset: i64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    size: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner_id: Option<u64>,
+    #[serde(default)]
+    owner_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnalyzerClassRangesSection {
+    #[serde(default)]
+    #[allow(dead_code)] // consumed by the class-range attribution phase
+    num_cids: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)] // consumed by the class-range attribution phase
+    num_top_level_cids: Option<u64>,
+    #[serde(default)]
+    populated_runs: Vec<(u64, u64)>,
 }
 
 #[derive(Default, Deserialize)]
 struct AnalyzerMetadata {
     #[serde(default)]
     dart_version: Option<String>,
+    #[serde(default)]
+    dart_commit: Option<String>,
     #[serde(default)]
     snapshot_hash: String,
     #[serde(default)]
@@ -51,6 +148,12 @@ struct AnalyzerMetadata {
     compressed_word_size: u64,
     #[serde(default)]
     analyzer_version: u64,
+    /// Schema 5: length of the AOT global object pool.
+    #[serde(default)]
+    global_object_pool_length: Option<u64>,
+    /// Schema 5: dispatch table origin element for the analyzer's target arch.
+    #[serde(default)]
+    dispatch_table_origin_element: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -143,6 +246,18 @@ struct AnalyzerObject {
     section: Option<String>,
     #[serde(default)]
     is_stub: Option<bool>,
+    /// Schema 5: raw unboxed-field bitmap per class (bit per word slot).
+    #[serde(default)]
+    #[allow(dead_code)]
+    // parsed for forward compatibility; consumed by field layout resolution
+    unboxed_field_bitmap: Option<u64>,
+    /// Schema 5: populated CID range start/end for the class.
+    #[serde(default)]
+    #[allow(dead_code)] // superseded by the top-level `class_ranges` section
+    cid_range_start: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cid_range_end: Option<i64>,
     #[serde(default)]
     flags: Vec<String>,
     #[serde(default)]
@@ -215,6 +330,71 @@ struct AnalyzerTypeParameter {
     default_type: Option<u64>,
 }
 
+/// Overlays schema-5 static-call rows onto the object-pool labels. Rows carry
+/// the pool index plus the target Code's owner identity, so entries whose
+/// graph walk dead-ended still get the owner's name. Existing labels (from
+/// deeper graph evidence) always win.
+fn overlay_static_call_labels(labels: &mut BTreeMap<usize, String>, rows: &[AnalyzerStaticCall]) {
+    for row in rows {
+        let Ok(index) = usize::try_from(row.pool_index) else {
+            continue;
+        };
+        if labels.contains_key(&index) {
+            continue;
+        }
+        if let Some(name) = row
+            .owner_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            labels.insert(index, name.to_owned());
+        }
+    }
+}
+
+/// Applies oracle-proven dispatch selector names to recovered indirect calls.
+/// Returns how many statements gained a proven selector name. A selector the
+/// oracle names is exact evidence: it overrides heuristic synthetic labels and
+/// clears candidate lists derived from them.
+pub(crate) fn apply_dispatch_selector_evidence(
+    functions: &mut [RecoveredFunction],
+    selectors: &BTreeMap<usize, String>,
+) -> usize {
+    let mut resolved = 0usize;
+    let looks_synthetic = |label: &str| {
+        label.is_empty()
+            || label.starts_with("sub_")
+            || label.starts_with("0x")
+            || label.starts_with("dispatch[")
+    };
+    for function in functions {
+        for statement in &mut function.statements {
+            let PseudoStatement::DispatchTableCall {
+                selector_offset,
+                selector_name,
+                candidate_targets,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let Some(name) = selectors.get(selector_offset) else {
+                continue;
+            };
+            let improves = selector_name.as_deref().is_none_or(looks_synthetic);
+            if improves && !name.is_empty() {
+                *selector_name = Some(name.clone());
+                candidate_targets.retain(|target| !looks_synthetic(target));
+                resolved += 1;
+            }
+        }
+    }
+    resolved
+}
+
+/// Labels object-pool entries by walking each entry's referenced object graph
+/// and rendering the first meaningful identity (function name, field, class,
+/// type, library, string payload).
 fn recover_object_pool_labels(
     objects: &[AnalyzerObject],
     classes: &HashMap<u64, (Option<String>, Option<u64>)>,
@@ -345,7 +525,22 @@ fn vm_object_label(
     label
 }
 
-pub(crate) fn load(path: &Path, snapshot: &SnapshotInfo, abi: Abi) -> Result<LoadedVmOracle> {
+pub(crate) fn load(
+    path: &Path,
+    snapshot: &SnapshotInfo,
+    abi: Abi,
+    subject: &ArtifactSubject,
+) -> Result<LoadedVmOracle> {
+    let oracle = load_unbound(path, snapshot, abi)?;
+    crate::evidence::oracle::verify_binding(path, subject, &oracle.evidence)?;
+    Ok(oracle)
+}
+
+pub(crate) fn load_unbound(
+    path: &Path,
+    snapshot: &SnapshotInfo,
+    abi: Abi,
+) -> Result<LoadedVmOracle> {
     let metadata = fs::metadata(path).at(path)?;
     if metadata.len() > MAX_ORACLE_BYTES {
         return Err(ClutterError::InvalidArtifact(format!(
@@ -365,6 +560,9 @@ pub(crate) fn load(path: &Path, snapshot: &SnapshotInfo, abi: Abi) -> Result<Loa
     let document = AnalyzerDocument {
         objects,
         metadata: envelope.metadata,
+        static_calls: envelope.static_calls,
+        dispatch_metadata: envelope.dispatch_metadata,
+        class_ranges: envelope.class_ranges,
     };
 
     validate_metadata(&document.metadata, snapshot, abi)?;
@@ -445,6 +643,12 @@ pub(crate) fn load(path: &Path, snapshot: &SnapshotInfo, abi: Abi) -> Result<Loa
         })
         .collect::<HashMap<_, _>>();
     let object_pool_labels = recover_object_pool_labels(&document.objects, &classes, &libraries);
+    // Schema 5 static-call rows identify pool entries whose Code target has a
+    // Function owner even when the graph walk cannot reach the owner object.
+    let mut object_pool_labels = object_pool_labels;
+    if let Some(static_calls) = &document.static_calls {
+        overlay_static_call_labels(&mut object_pool_labels, &static_calls.targets);
+    }
     let class_type_parameters = document
         .objects
         .iter()
@@ -998,6 +1202,7 @@ pub(crate) fn load(path: &Path, snapshot: &SnapshotInfo, abi: Abi) -> Result<Loa
         source_size: metadata.len(),
         source_sha256,
         dart_version: document.metadata.dart_version,
+        dart_commit: document.metadata.dart_commit,
         snapshot_hash: document.metadata.snapshot_hash,
         analyzer_version: document.metadata.analyzer_version,
         target_arch,
@@ -1063,6 +1268,18 @@ pub(crate) fn load(path: &Path, snapshot: &SnapshotInfo, abi: Abi) -> Result<Loa
             .filter(|object| object.object_type.as_deref() == Some("ObjectPool"))
             .map(|object| object.references.len() / 3)
             .sum(),
+        global_object_pool_length: document.metadata.global_object_pool_length,
+        dispatch_table_origin_element: document.metadata.dispatch_table_origin_element,
+        // Schema 5 emits one StaticCalls pseudo-object carrying the pool's
+        // code targets; older schemas simply report zero.
+        static_call_targets: document.static_calls.as_ref().map_or(0, |section| {
+            section.entry_count.unwrap_or(section.targets.len() as u64) as usize
+        }),
+        class_id_ranges: document
+            .class_ranges
+            .as_ref()
+            .map(|ranges| ranges.populated_runs.clone())
+            .unwrap_or_default(),
         library_import_edges: document
             .objects
             .iter()
@@ -1082,6 +1299,20 @@ pub(crate) fn load(path: &Path, snapshot: &SnapshotInfo, abi: Abi) -> Result<Loa
         declarations,
         libraries: recovered_libraries,
         object_pool_labels,
+        dispatch_selectors: document
+            .dispatch_metadata
+            .map(|section| {
+                section
+                    .targets
+                    .into_iter()
+                    .filter_map(|target| {
+                        let name = target.owner_name.filter(|name| !name.is_empty())?;
+                        let index = usize::try_from(target.selector_index).ok()?;
+                        Some((index, name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1194,6 +1425,12 @@ pub(crate) fn apply_declarations(
             program.libraries.push(recovered);
         }
     }
+    // Keep every oracle declaration as enrichment evidence even when
+    // --scope filters what is rendered: field layouts, signatures, and
+    // constructor identities sharpen call sites across all libraries.
+    program
+        .declaration_evidence
+        .extend(oracle.declarations.clone());
     crate::analysis::attach_declarations(program, oracle.declarations.clone(), scope);
     crate::analysis::reconcile_libraries(program, scope);
 }
@@ -1300,6 +1537,13 @@ pub(crate) fn attach(
     let enriched_pool_entries =
         enrich_object_pool_evidence(&mut program.functions, &oracle.object_pool_labels);
     oracle.evidence.enriched_object_pool_entries = enriched_pool_entries;
+    // Oracle dispatch rows name selectors exactly; apply them after the pool
+    // enrichment so proven names override any heuristic labels.
+    let resolved_dispatch_selectors = if oracle.dispatch_selectors.is_empty() {
+        0
+    } else {
+        apply_dispatch_selector_evidence(&mut program.functions, &oracle.dispatch_selectors)
+    };
     enrich_semantics(program, abi);
 
     oracle.evidence.matched_functions = matched;
@@ -1314,7 +1558,7 @@ pub(crate) fn attach(
     program.warnings.push(Warning {
         code: "W_VM_ORACLE_APPLIED".to_owned(),
         message: format!(
-            "A matching Dart VM snapshot analyzer identified root library `{root}` and linked {matched} recovered function entries across {} exact isolate-instruction offsets ({strong} name-corroborated). The VM loaded the snapshot but did not invoke `main`.",
+            "A matching Dart VM snapshot analyzer identified root library `{root}` and linked {matched} recovered function entries across {} exact isolate-instruction offsets ({strong} name-corroborated, {resolved_dispatch_selectors} dispatch selectors named). The VM loaded the snapshot but did not invoke `main`.",
             matched_code_offsets.len(),
         ),
     });
@@ -1353,201 +1597,10 @@ fn enrich_object_pool_evidence(
 }
 
 fn enrich_semantics(program: &mut RecoveredProgram, abi: Abi) {
-    let application_package = program.application_package.as_deref();
-    let mut symbols = BTreeMap::<u64, crate::analysis::disassembly::Symbol>::new();
-    let mut target_library_candidates = BTreeMap::<String, BTreeSet<Option<String>>>::new();
-    for function in &program.functions {
-        let Some(address) = parse_address(&function.address) else {
-            continue;
-        };
-        let semantic = function.name_source != RecoveredNameSource::Synthetic
-            && !function.name.starts_with("sub_")
-            && function.name != "unknownFunction";
-        if semantic {
-            let qualified = match function.owner.as_deref() {
-                Some(owner) if !matches!(owner, "::" | "top_level") => {
-                    format!("{owner}.{}", function.name)
-                }
-                _ => function.name.clone(),
-            };
-            target_library_candidates
-                .entry(qualified)
-                .or_default()
-                .insert(function.library_uri.clone());
-        }
-        let result_class = (function.kind == Some(RecoveredFunctionKind::Constructor))
-            .then(|| function.owner.clone())
-            .flatten()
-            .map(|owner| crate::analysis::readable_snapshot_name(&owner));
-        let symbol = if semantic {
-            let label = match function.owner.as_deref() {
-                Some(owner) if !matches!(owner, "::" | "top_level") => {
-                    format!("{owner}.{}", function.name)
-                }
-                _ => function.name.clone(),
-            };
-            crate::analysis::disassembly::Symbol::new(
-                label,
-                function.library_uri.clone(),
-                application_package,
-            )
-            .with_code_identity(address, 0, crate::model::DirectCallResolution::ExactEntry)
-            .with_result_class(result_class)
-        } else {
-            crate::analysis::disassembly::Symbol::code_boundary(address)
-        };
-        match symbols.get(&address) {
-            Some(existing) if existing.semantic_name || !symbol.semantic_name => {}
-            _ => {
-                symbols.insert(address, symbol.clone());
-            }
-        }
-        if let Some(offset) = function
-            .code_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.unchecked_entry_offset)
-            .filter(|offset| *offset > 0 && *offset < function.size)
-        {
-            let unchecked = symbol.with_code_identity(
-                address,
-                offset,
-                crate::model::DirectCallResolution::UncheckedEntry,
-            );
-            let entry = address.saturating_add(offset);
-            match symbols.get(&entry) {
-                Some(existing) if existing.semantic_name || !unchecked.semantic_name => {}
-                _ => {
-                    symbols.insert(entry, unchecked);
-                }
-            }
-        }
-    }
-    let target_libraries = target_library_candidates
-        .into_iter()
-        .filter_map(|(target, libraries)| {
-            (libraries.len() == 1).then(|| (target, libraries.into_iter().next().flatten()))
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let mut layouts = crate::analysis::disassembly::RecoveredFieldLayout::default();
-    for declaration in &program.declarations {
-        if declaration.kind != RecoveredDeclarationKind::Field {
-            continue;
-        }
-        let (Some(owner), Some(offset)) = (
-            declaration.owner.as_deref(),
-            declaration
-                .field_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.instance_field_offset),
-        ) else {
-            continue;
-        };
-        let declared_type = declaration
-            .field_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.declared_type.as_ref());
-        let value_class = declared_type.and_then(|value| simple_class_type(&value.display_name));
-        let value_library_uri = declared_type.and_then(|value| value.library_uri.clone());
-        layouts.insert(
-            declaration.library_uri.clone(),
-            crate::analysis::readable_snapshot_name(owner),
-            offset,
-            crate::analysis::readable_snapshot_name(&declaration.name),
-            value_class,
-            value_library_uri,
-        );
-    }
-    for declaration in &program.declarations {
-        if declaration.kind != RecoveredDeclarationKind::Class {
-            continue;
-        }
-        let Some(metadata) = declaration.class_metadata.as_ref() else {
-            continue;
-        };
-        let class_name = crate::analysis::readable_snapshot_name(&declaration.name);
-        for slot in &metadata.instance_slots {
-            if slot.slot_type == "type_arguments_field" {
-                continue;
-            }
-            let name = slot.field_name.clone().unwrap_or_else(|| {
-                format!("_slot_{:x}", u64::try_from(slot.offset).unwrap_or_default())
-            });
-            layouts.insert(
-                declaration.library_uri.clone(),
-                class_name.clone(),
-                slot.offset,
-                crate::analysis::readable_snapshot_name(&name),
-                None,
-                None,
-            );
-        }
-    }
-
-    for function in &mut program.functions {
-        let parameter_names = semantic_parameter_names(function);
-        let owner = function
-            .owner
-            .as_deref()
-            .map(crate::analysis::readable_snapshot_name);
-        let receiver_class = owner
-            .as_deref()
-            .map(|owner| (owner, function.library_uri.as_deref()));
-        function.semantic_statements = crate::analysis::disassembly::relift_semantics(
-            function,
-            abi,
-            &parameter_names,
-            Some(&layouts),
-            receiver_class,
-            &symbols,
-        );
-        promote_recovered_indirect_calls(function, &target_libraries, application_package);
-        function.machine_code.semantic_statements = function.semantic_statements.len();
-    }
-}
-
-fn promote_recovered_indirect_calls(
-    function: &mut RecoveredFunction,
-    target_libraries: &BTreeMap<String, Option<String>>,
-    application_package: Option<&str>,
-) {
-    let recovered_indirect_targets = function
-        .semantic_statements
-        .iter()
-        .filter_map(|statement| match statement {
-            crate::model::SemanticStatement::ResolvedCall {
-                target, address, ..
-            } => Some((address.clone(), target.clone())),
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
-    for statement in &mut function.statements {
-        let crate::model::PseudoStatement::IndirectCall {
-            address,
-            expression,
-        } = statement
-        else {
-            continue;
-        };
-        let Some(target) = recovered_indirect_targets.get(address).cloned() else {
-            continue;
-        };
-        let address = address.clone();
-        let expression = expression.clone();
-        let target_library_uri = target_libraries.get(&target).cloned().flatten();
-        let target_scope = crate::analysis::disassembly::call_target_scope(
-            &target,
-            target_library_uri.as_deref(),
-            application_package,
-        );
-        *statement = crate::model::PseudoStatement::RecoveredIndirectCall {
-            address,
-            expression,
-            target,
-            target_library_uri,
-            target_scope,
-        };
-    }
+    // The shared pass rebuilds call symbols and field layouts from every
+    // surviving declaration (oracle-enriched declarations included) and
+    // re-lifts all functions with full semantic evidence.
+    crate::analysis::enrich_semantics(program, abi, &[], &[]);
 }
 
 fn recover_library_references(
@@ -1667,68 +1720,6 @@ fn recover_library_references(
         }
     }
     references
-}
-
-fn simple_class_type(display_name: &str) -> Option<String> {
-    let value = display_name.trim_end_matches('?');
-    let root = value.split('<').next()?.trim();
-    if root.is_empty()
-        || root.contains([' ', '(', ')', '[', ']', '{', '}', ','])
-        || matches!(
-            root,
-            "dynamic" | "void" | "Never" | "Null" | "bool" | "double" | "int" | "num" | "String"
-        )
-    {
-        return None;
-    }
-    Some(root.to_owned())
-}
-
-fn semantic_parameter_names(function: &RecoveredFunction) -> Vec<String> {
-    let signature = function.signature.as_ref();
-    let implicit = signature
-        .map(|signature| signature.implicit_parameter_count)
-        .or_else(|| {
-            function
-                .vm_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.implicit_parameter_count)
-        })
-        .unwrap_or_default();
-    let visible = signature
-        .map(|signature| {
-            signature
-                .fixed_parameter_count
-                .saturating_add(signature.optional_parameter_count)
-        })
-        .or(function.parameter_count)
-        .unwrap_or_default();
-    let mut names = Vec::with_capacity(implicit.saturating_add(visible));
-    for index in 0..implicit {
-        let name = if index == 0 && function.kind == Some(RecoveredFunctionKind::Closure) {
-            "closureContext".to_owned()
-        } else if index == 0
-            && function
-                .vm_evidence
-                .as_ref()
-                .is_none_or(|evidence| evidence.is_static != Some(true))
-        {
-            "this".to_owned()
-        } else {
-            format!("implicitArg{index}")
-        };
-        names.push(name);
-    }
-    let resolved = signature.and_then(|signature| signature.resolved.as_ref());
-    for index in 0..visible {
-        let name = resolved
-            .and_then(|resolved| resolved.parameters.get(index))
-            .and_then(|parameter| parameter.name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| format!("arg{index}"));
-        names.push(name);
-    }
-    names
 }
 
 fn apply_function_evidence(function: &mut RecoveredFunction, evidence: &VmFunctionEvidence) {
@@ -1971,6 +1962,16 @@ fn validate_metadata(metadata: &AnalyzerMetadata, snapshot: &SnapshotInfo, abi: 
             "Dart VM oracle snapshot hash {} does not match selected payload {}",
             metadata.snapshot_hash, snapshot.isolate_header.snapshot_hash
         )));
+    }
+    if metadata.analyzer_version >= 4 {
+        let commit = metadata.dart_commit.as_deref().ok_or_else(|| {
+            ClutterError::Analysis("Dart VM oracle schema 4 is missing its Dart commit".to_owned())
+        })?;
+        if commit.len() < 10 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ClutterError::Analysis(format!(
+                "Dart VM oracle Dart commit {commit:?} is not a hexadecimal revision"
+            )));
+        }
     }
     let expected_word_size = match abi {
         Abi::ArmeabiV7a => 4,
@@ -2274,10 +2275,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        assign_vm_candidates, promote_recovered_indirect_calls, recover_library_references,
-        replace_type_parameter_token, root_package, target_arch, vm_declaration_reference,
-        vm_function_kind,
+        assign_vm_candidates, recover_library_references, replace_type_parameter_token,
+        root_package, target_arch, vm_declaration_reference, vm_function_kind,
     };
+    use crate::analysis::promote_recovered_indirect_calls;
     use crate::model::{
         CallTargetScope, EvidenceConfidence, MachineCodeEvidence, PseudoStatement,
         RecoveredFunction, RecoveredFunctionKind, RecoveredNameSource, RecoveredParameter,
@@ -2298,6 +2299,7 @@ mod tests {
             source_location: None,
             inlined_functions: Vec::new(),
             kind: Some(RecoveredFunctionKind::Closure),
+            is_static: None,
             signature: Some(RecoveredSignature {
                 fixed_parameter_count: 1,
                 optional_parameter_count: 0,
@@ -2331,6 +2333,7 @@ mod tests {
             }),
             signature_source: Some(RecoveredSignatureSource::SnapshotFunction),
             parameter_count: Some(1),
+            lexical_parent: None,
             vm_evidence: None,
             address: "0x1000".to_owned(),
             size: 4,
@@ -2391,6 +2394,145 @@ mod tests {
             Some(RecoveredFunctionKind::ImplicitClosure)
         );
         assert_eq!(vm_function_kind("future-kind"), None);
+    }
+
+    #[test]
+    fn parses_schema5_top_level_static_call_dispatch_and_class_rows() {
+        let json = r#"{
+            \"objects\": [{\"id\": 7, \"type\": \"Library\", \"url\": \"dart:core\"}],
+            \"metadata\": {\"analyzer_version\": 5, \"snapshot_hash\": \"abc\"},
+            \"static_calls\": {
+                \"type\": \"StaticCalls\",
+                \"targets\": [
+                    {\"pool_index\": 12, \"target_offset\": 4919, \"size\": 208,
+                     \"owner_id\": 91, \"owner_name\": \"+\",
+                     \"owner_is_static\": false, \"owner_parameter_count\": 2},
+                    {\"pool_index\": 15, \"target_offset\": 8192}
+                ],
+                \"entry_count\": 2
+            },
+            \"dispatch_metadata\": {
+                \"type\": \"Dispatch\",
+                \"code_entry_count\": 4096,
+                \"targets\": [
+                    {\"selector_index\": 42, \"target_offset\": 20480,
+                     \"size\": 144, \"owner_id\": 55, \"owner_name\": \"get:isEmpty\"}
+                ]
+            },
+            \"class_ranges\": {
+                \"type\": \"ClassRanges\",
+                \"num_cids\": 1200,
+                \"num_top_level_cids\": 24,
+                \"populated_runs\": [[1, 900], [902, 1199]]
+            }
+        }"#;
+        let json = json.replace("\\\"", "\"");
+        let envelope: super::AnalyzerEnvelope = serde_json::from_str(&json).expect("valid json");
+        let static_calls = envelope.static_calls.expect("schema 5 static_calls");
+        assert_eq!(static_calls.targets.len(), 2);
+        let first = &static_calls.targets[0];
+        assert_eq!(first.pool_index, 12);
+        assert_eq!(first.target_offset, 4919);
+        assert_eq!(first.owner_id, Some(91));
+        assert_eq!(first.owner_name.as_deref(), Some("+"));
+        assert_eq!(first.owner_is_static, Some(false));
+        assert_eq!(first.owner_parameter_count, Some(2));
+
+        let dispatch = envelope
+            .dispatch_metadata
+            .expect("schema 5 dispatch_metadata");
+        assert_eq!(dispatch.code_entry_count, Some(4096));
+        assert_eq!(dispatch.targets.len(), 1);
+        assert_eq!(dispatch.targets[0].selector_index, 42);
+        assert_eq!(dispatch.targets[0].owner_name.as_deref(), Some("get:isEmpty"));
+
+        let ranges = envelope.class_ranges.expect("schema 5 class_ranges");
+        assert_eq!(ranges.populated_runs, vec![(1, 900), (902, 1199)]);
+    }
+
+    #[test]
+    fn labels_unnamed_pool_entries_from_schema5_static_call_rows() {
+        let rows = vec![
+            super::AnalyzerStaticCall {
+                pool_index: 12,
+                target_offset: 4919,
+                size: None,
+                owner_id: Some(91),
+                owner_name: Some("+".to_owned()),
+                owner_is_static: Some(false),
+                owner_parameter_count: Some(2),
+            },
+            super::AnalyzerStaticCall {
+                pool_index: 15,
+                target_offset: 8192,
+                size: None,
+                owner_id: None,
+                owner_name: None,
+                owner_is_static: None,
+                owner_parameter_count: None,
+            },
+        ];
+        let mut labels = BTreeMap::new();
+        labels.insert(9usize, "existingLabel".to_owned());
+        super::overlay_static_call_labels(&mut labels, &rows);
+        assert_eq!(labels.get(&12).map(String::as_str), Some("+"));
+        // Rows without a resolvable owner never fabricate labels.
+        assert!(!labels.contains_key(&15));
+        // Existing labels win over the coarse static-call identity.
+        assert_eq!(labels.get(&9).map(String::as_str), Some("existingLabel"));
+    }
+
+    #[test]
+    fn applies_oracle_selector_names_to_dispatch_table_calls() {
+        let mut function = recovered_closure("int");
+        function.machine_code.dispatch_table_calls = 2;
+        function.statements = vec![
+            PseudoStatement::DispatchTableCall {
+                address: "0x1008".to_owned(),
+                expression: "dispatch[42 + class_id]".to_owned(),
+                selector_offset: 42,
+                selector_name: None,
+                candidate_targets: Vec::new(),
+                candidate_count: 0,
+                raw_slot_target_count: 0,
+            },
+            PseudoStatement::DispatchTableCall {
+                address: "0x1010".to_owned(),
+                expression: "dispatch[43 + class_id]".to_owned(),
+                selector_offset: 43,
+                selector_name: Some("sub_1965".to_owned()),
+                candidate_targets: vec!["sub_1965".to_owned()],
+                candidate_count: 1,
+                raw_slot_target_count: 1,
+            },
+            PseudoStatement::Comment {
+                text: "unrelated".to_owned(),
+            },
+        ];
+        let mut selectors = BTreeMap::new();
+        selectors.insert(42usize, "get:isEmpty".to_owned());
+        selectors.insert(43usize, "+".to_owned());
+
+        let mut functions = vec![function];
+        let resolved =
+            super::apply_dispatch_selector_evidence(&mut functions, &selectors);
+        assert_eq!(resolved, 2);
+        let statements = &functions[0].statements;
+        let PseudoStatement::DispatchTableCall { selector_name, .. } = &statements[0] else {
+            panic!("expected dispatch call");
+        };
+        assert_eq!(selector_name.as_deref(), Some("get:isEmpty"));
+        // An oracle-proven name overrides a heuristic synthetic one.
+        let PseudoStatement::DispatchTableCall {
+            selector_name,
+            candidate_targets,
+            ..
+        } = &statements[1]
+        else {
+            panic!("expected dispatch call");
+        };
+        assert_eq!(selector_name.as_deref(), Some("+"));
+        assert!(candidate_targets.iter().all(|target| target != "sub_1965"));
     }
 
     #[test]

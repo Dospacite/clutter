@@ -25,6 +25,7 @@ use crate::model::{
 use crate::snapshot::CodeImage;
 
 pub struct Recovery {
+    pub application_package: Option<String>,
     pub functions: Vec<RecoveredFunction>,
     pub declarations: Vec<RecoveredDeclaration>,
     pub ownership_obfuscated: bool,

@@ -183,8 +183,28 @@ pub struct RecoveredProgram {
     pub snapshot_evidence: Option<SnapshotEvidence>,
     pub dispatch_table: Option<RecoveredDispatchTable>,
     pub cross_abi: Option<CrossAbiReport>,
+    /// Physical-body / logical-occurrence resolution summary: shared bodies,
+    /// extent conflicts, and unbound oracle occurrences.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_graph_report: Option<crate::evidence::body::BodyGraphReport>,
+    /// ABI-neutral consensus over aligned occurrences; facts promoted to
+    /// `CrossAbiCorroborated` live here, disputes are retained verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_abi_consensus: Option<crate::evidence::consensus::ConsensusReport>,
+    /// Solved parameter-shape outcomes per logical function, tiered by the
+    /// strength of their supporting evidence. Erased signatures stay Unknown.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::evidence::signature_solver::serialize_solutions"
+    )]
+    pub signature_solutions: Option<crate::evidence::signature_solver::SignatureSolutions>,
     pub deferred_units: Vec<DeferredUnitEvidence>,
     pub warnings: Vec<Warning>,
+    /// Declaration evidence from every scope, used for call-site signature
+    /// joins (named arguments, receiver detection) even when --scope limits
+    /// which libraries are rendered. Not serialized.
+    #[serde(skip)]
+    pub declaration_evidence: Vec<RecoveredDeclaration>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +213,7 @@ pub struct VmOracleEvidence {
     pub source_size: u64,
     pub source_sha256: String,
     pub dart_version: Option<String>,
+    pub dart_commit: Option<String>,
     pub snapshot_hash: String,
     pub analyzer_version: u64,
     pub target_arch: Option<String>,
@@ -216,6 +237,18 @@ pub struct VmOracleEvidence {
     pub fields_with_offsets: usize,
     pub class_instance_slots: usize,
     pub object_pool_references: usize,
+    /// Schema 5: total entries in the AOT global object pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_object_pool_length: Option<u64>,
+    /// Schema 5: dispatch-table origin element (architecture dependent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_table_origin_element: Option<u64>,
+    /// Schema 5: number of static-call targets reachable from the pool.
+    #[serde(default)]
+    pub static_call_targets: usize,
+    /// Schema 5: populated [start, end] class-id runs from the live table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_id_ranges: Vec<(u64, u64)>,
     pub library_import_edges: usize,
     pub library_reference_edges: usize,
     pub enriched_object_pool_entries: usize,
@@ -565,6 +598,12 @@ pub struct RecoveredFunction {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inlined_functions: Vec<RecoveredInlineFunction>,
     pub kind: Option<RecoveredFunctionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_static: Option<bool>,
+    /// Name of the lexically enclosing member for closures, recovered from
+    /// the snapshot's `ClosureData.parent_function` edge without debug info.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_parent: Option<String>,
     pub signature: Option<RecoveredSignature>,
     pub signature_source: Option<RecoveredSignatureSource>,
     pub parameter_count: Option<usize>,
@@ -653,6 +692,12 @@ pub enum RecoveredNameSource {
     SplitDebugInfo,
     ObfuscationMap,
     Synthetic,
+    /// Assigned by an LLM or any other heuristic guesser. Such names are
+    /// speculative by definition: they must be rendered with an explicit
+    /// caveat and can never be promoted into proven evidence. Constructed by
+    /// external naming pipelines, not by Clutter's own parsers.
+    #[allow(dead_code)]
+    LlmAssisted,
 }
 
 impl RecoveredNameSource {
@@ -663,6 +708,7 @@ impl RecoveredNameSource {
             Self::SplitDebugInfo => "split_debug_info",
             Self::ObfuscationMap => "obfuscation_map",
             Self::Synthetic => "synthetic",
+            Self::LlmAssisted => "llm_assisted",
         }
     }
 }
@@ -921,6 +967,42 @@ pub enum SemanticStatement {
         confidence: EvidenceConfidence,
         address: String,
     },
+    /// A string literal rebuilt from the AOT allocation + `_interpolate`
+    /// lowering. `parts` currently holds one fully rendered literal.
+    StringInterpolation {
+        parts: Vec<String>,
+        confidence: EvidenceConfidence,
+        address: String,
+    },
+}
+
+impl SemanticStatement {
+    pub fn address(&self) -> &str {
+        match self {
+            Self::Return { address, .. }
+            | Self::ResolvedCall { address, .. }
+            | Self::FieldRead { address, .. }
+            | Self::FieldWrite { address, .. }
+            | Self::Condition { address, .. }
+            | Self::StringInterpolation { address, .. } => address,
+        }
+    }
+
+    pub fn is_return(&self) -> bool {
+        matches!(self, Self::Return { .. })
+    }
+
+    #[allow(dead_code)]
+    pub fn confidence(&self) -> EvidenceConfidence {
+        match self {
+            Self::Return { confidence, .. }
+            | Self::ResolvedCall { confidence, .. }
+            | Self::FieldRead { confidence, .. }
+            | Self::FieldWrite { confidence, .. }
+            | Self::Condition { confidence, .. }
+            | Self::StringInterpolation { confidence, .. } => *confidence,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

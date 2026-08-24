@@ -509,6 +509,9 @@ pub fn recover(
                 .as_ref()
                 .and_then(|function| function.kind)
                 .or(inferred_kind),
+            is_static: snapshot_match
+                .as_ref()
+                .and_then(|function| function.is_static),
             signature: snapshot_match
                 .as_ref()
                 .and_then(|function| function.signature.clone()),
@@ -518,6 +521,9 @@ pub fn recover(
             parameter_count: snapshot_match
                 .as_ref()
                 .and_then(|function| function.parameter_count),
+            lexical_parent: snapshot_match
+                .as_ref()
+                .and_then(|function| function.lexical_parent.clone()),
             vm_evidence: snapshot_match
                 .as_ref()
                 .and_then(|function| function.vm_evidence.clone()),
@@ -634,7 +640,8 @@ fn semantic_address(statement: &crate::model::SemanticStatement) -> &str {
         | crate::model::SemanticStatement::ResolvedCall { address, .. }
         | crate::model::SemanticStatement::FieldRead { address, .. }
         | crate::model::SemanticStatement::FieldWrite { address, .. }
-        | crate::model::SemanticStatement::Condition { address, .. } => address,
+        | crate::model::SemanticStatement::Condition { address, .. }
+        | crate::model::SemanticStatement::StringInterpolation { address, .. } => address,
     }
 }
 

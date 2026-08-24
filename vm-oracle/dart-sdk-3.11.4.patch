@@ -39,7 +39,6 @@ index a246292a..2bbd31a6 100644
  
  if (is_fuchsia) {
 diff --git a/runtime/vm/analyze_snapshot_api_impl.cc b/runtime/vm/analyze_snapshot_api_impl.cc
-index 9c2ee447..e904d594 100644
 --- a/runtime/vm/analyze_snapshot_api_impl.cc
 +++ b/runtime/vm/analyze_snapshot_api_impl.cc
 @@ -18,11 +18,12 @@
@@ -52,11 +51,19 @@ index 9c2ee447..e904d594 100644
  namespace snapshot_analyzer {
  
 -constexpr intptr_t kSnapshotAnalyzerVersion = 2;
-+constexpr intptr_t kSnapshotAnalyzerVersion = 3;
++constexpr intptr_t kSnapshotAnalyzerVersion = 5;
  constexpr intptr_t kStartIndex = 1;
  
  class FieldVisitor : public ObjectPointerVisitor {
-@@ -75,7 +76,7 @@ class SnapshotAnalyzer {
+@@ -70,12 +71,15 @@
+   void DumpClassInstanceSlots(const Class& klass,
+                               const std::vector<const Field*>& fields);
+   void DumpFunction(const Function& function);
++  void DumpStaticCallTargets();
++  void DumpDispatchMetadata();
++  void DumpClassIdRanges();
+   void DumpCode(const Code& code);
+   void DumpCode(uword start_pc, uword end_pc, const char* name);
    void DumpField(const Field& field);
    void DumpString(const String& string);
    void DumpInstance(const Object& object);
@@ -65,7 +72,7 @@ index 9c2ee447..e904d594 100644
    void DumpObjectPool(const ObjectPool& pool);
  
    void DumpInterestingObjects();
-@@ -87,6 +88,7 @@ class SnapshotAnalyzer {
+@@ -87,6 +91,7 @@
    std::vector<std::vector<const Field*>> class_fields_;
    std::vector<std::vector<const Field*>> top_level_class_fields_;
    std::unordered_map<uword, const char*> stub_names_;
@@ -73,7 +80,7 @@ index 9c2ee447..e904d594 100644
  
    JSONWriter js_;
    Thread* thread_;
-@@ -99,6 +101,15 @@ void SnapshotAnalyzer::DumpLibrary(const Library& library) {
+@@ -99,6 +104,15 @@
  
    js_.PrintProperty("toplevel_class",
                      GetObjectId(Object::RawCast(library.toplevel_class())));
@@ -89,7 +96,7 @@ index 9c2ee447..e904d594 100644
  }
  
  void SnapshotAnalyzer::DumpArray(const Array& array, const char* name) {
-@@ -121,10 +132,42 @@ void SnapshotAnalyzer::DumpClass(const Class& klass) {
+@@ -121,10 +135,42 @@
  
    js_.PrintProperty("class_id", klass.id());
    js_.PrintProperty("name", String::Handle(klass.Name()).ToCString());
@@ -132,7 +139,19 @@ index 9c2ee447..e904d594 100644
  
    // We use [fields] instead of [Class.fields()] as a [Field] object may not
    // appear in [Class.fields()] but may still be available (e.g. for
-@@ -253,11 +296,95 @@ void SnapshotAnalyzer::DumpClassInstanceSlots(
+@@ -171,6 +217,11 @@
+   auto class_table = thread_->isolate_group()->class_table();
+ 
+   const auto bitmap = class_table->GetUnboxedFieldsMapAt(klass.id());
++  // Raw unboxed-field bitmap for this class: bit i set means the word slot at
++  // start_offset + i * kCompressedWordSize holds an unboxed value. Clutter
++  // uses this as authoritative unboxed-field evidence per receiver CID.
++  js_.PrintProperty64("unboxed_field_bitmap",
++                      static_cast<int64_t>(bitmap.Value()));
+ 
+   const intptr_t start_offset = super_class.IsNull()
+                                     ? Instance::NextFieldOffset()
+@@ -253,16 +304,308 @@
  void SnapshotAnalyzer::DumpFunction(const Function& function) {
    js_.PrintProperty("type", "Function");
    js_.PrintProperty("name", function.QualifiedScrubbedNameCString());
@@ -229,7 +248,220 @@ index 9c2ee447..e904d594 100644
    js_.PrintProperty("owner_class", GetObjectId(function.Owner()));
    if (function.IsClosureFunction()) {
      js_.PrintProperty("parent_function",
-@@ -309,16 +436,21 @@ void SnapshotAnalyzer::DumpCode(const Code& code) {
+                       GetObjectId(function.parent_function()));
+   }
++
++  // Argument descriptor: exact parameter shape plus every surviving
++  // positional/named name. Obfuscation may erase the names; counts and
++  // named-ness always survive inside the signature.
++  const FunctionType& sig_for_args = FunctionType::Handle(function.signature());
++  if (!sig_for_args.IsNull()) {
++    const intptr_t num_params = function.NumParameters();
++    js_.OpenObject("argument_descriptor");
++    js_.PrintProperty64("parameter_count", num_params);
++    js_.PrintProperty64("fixed_parameter_count",
++                        function.num_fixed_parameters());
++    js_.PrintProperty64("optional_parameter_count",
++                        function.NumOptionalParameters());
++    js_.PrintProperty64("optional_positional_parameter_count",
++                        function.NumOptionalPositionalParameters());
++    js_.PrintProperty64("optional_named_parameter_count",
++                        function.NumOptionalNamedParameters());
++    js_.PrintProperty64("implicit_parameter_count",
++                        function.NumImplicitParameters());
++    js_.PrintPropertyBool("has_optional_named_parameters",
++                          function.HasOptionalNamedParameters());
++    js_.OpenArray("names");
++    for (intptr_t i = 0; i < num_params; ++i) {
++      const String& name = String::Handle(function.ParameterNameAt(i));
++      if (name.IsNull()) {
++        js_.PrintValue("");
++      } else {
++        js_.PrintValue(name.ToCString());
++      }
++    }
++    js_.CloseArray();
++    js_.CloseObject();
++  }
++
++  // Per-code PC-descriptor summary: kind histogram proves where calls,
++  // deopts, and OSR entries live in the body without parsing raw bytes.
++  const Object& current_code_object = Object::Handle(function.CurrentCode());
++  if (current_code_object.IsCode()) {
++    const auto& code_for_desc = Code::Cast(current_code_object);
++    const PcDescriptors& descriptors =
++        PcDescriptors::Handle(code_for_desc.pc_descriptors());
++    if (!descriptors.IsNull() && descriptors.Length() > 0) {
++      js_.OpenObject("pc_descriptors");
++      int64_t kinds[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++      int64_t count = 0;
++      PcDescriptors::Iterator iter(descriptors,
++                                   UntaggedPcDescriptors::kAnyKind);
++      while (iter.MoveNext()) {
++        ++count;
++        switch (iter.Kind()) {
++          case UntaggedPcDescriptors::kDeopt: ++kinds[0]; break;
++          case UntaggedPcDescriptors::kIcCall: ++kinds[1]; break;
++          case UntaggedPcDescriptors::kUnoptStaticCall: ++kinds[2]; break;
++          case UntaggedPcDescriptors::kRuntimeCall: ++kinds[3]; break;
++          case UntaggedPcDescriptors::kOsrEntry: ++kinds[4]; break;
++          case UntaggedPcDescriptors::kRewind: ++kinds[5]; break;
++          case UntaggedPcDescriptors::kOther: ++kinds[6]; break;
++          default: ++kinds[7]; break;
++        }
++      }
++      js_.PrintProperty64("entry_count", count);
++      js_.OpenArray("kinds");
++      static const char* kind_names[] = {"deopt", "ic_call", "unopt_static_call",
++                                         "runtime_call", "osr_entry", "rewind",
++                                         "other"};
++      for (intptr_t k = 0; k < 7; ++k) {
++        js_.PrintValue64(kinds[k]);
++        (void)kind_names;
++      }
++      js_.CloseArray();
++      js_.CloseObject();
++    }
++  }
++}
++
++// Static-call targets: every Code object referenced by the global object
++// pool. In precompiled snapshots per-Code static_calls_target_table arrays
++// are dropped (NOT_IN_PRECOMPILED), but call targets remain reachable as
++// pool entries, so the pool is the authoritative static-call evidence.
++void SnapshotAnalyzer::DumpStaticCallTargets() {
++  js_.OpenObject("static_calls");
++  js_.PrintProperty("type", "StaticCalls");
++  const ObjectPool& pool =
++      ObjectPool::Handle(thread_->isolate_group()->object_store()
++                             ->global_object_pool());
++  int64_t entry_count = 0;
++  if (!pool.IsNull()) {
++    const uint64_t instruction_base =
++        reinterpret_cast<uint64_t>(info_.snapshot_text);
++    js_.OpenArray("targets");
++    Zone* zone = thread_->zone();
++    Object& entry = Object::Handle(zone);
++    for (intptr_t i = 0; i < pool.Length(); ++i) {
++      if (pool.TypeAt(i) != ObjectPool::EntryType::kTaggedObject) continue;
++      entry = pool.ObjectAt(i);
++      if (!entry.IsCode()) continue;
++      const auto& target_code = Code::Cast(entry);
++      if (target_code.IsUnknownDartCode()) continue;
++      ++entry_count;
++      js_.OpenObject();
++      js_.PrintProperty64("pool_index", i);
++      js_.PrintProperty64(
++          "target_offset",
++          static_cast<int64_t>(static_cast<uint64_t>(target_code.PayloadStart()) -
++                               instruction_base));
++      js_.PrintProperty64("size",
++                          static_cast<int64_t>(target_code.Size()));
++      const auto& owner = Object::Handle(zone, target_code.owner());
++      if (!owner.IsNull()) {
++        js_.PrintProperty64("owner_id", GetObjectId(owner.ptr()));
++        if (owner.IsFunction()) {
++          const auto& owner_function = Function::Cast(owner);
++          js_.PrintProperty(
++              "owner_name",
++              String::Handle(zone, owner_function.name()).ToCString());
++          js_.PrintPropertyBool("owner_is_static", owner_function.is_static());
++          js_.PrintProperty64("owner_parameter_count",
++                              owner_function.NumParameters());
++        }
++      }
++      js_.CloseObject();
++    }
++    js_.CloseArray();
++  }
++  js_.PrintProperty64("entry_count", entry_count);
++  js_.CloseObject();
++}
++
++// Dispatch metadata: selector index -> Code entry array. The analyzer runs in
++// a precompiled runtime, where the dispatch table is materialized from this
++// array at snapshot load; emitting it preserves receiver-CID dispatch facts.
++void SnapshotAnalyzer::DumpDispatchMetadata() {
++  js_.OpenObject("dispatch_metadata");
++  js_.PrintProperty("type", "Dispatch");
++  const Array& entries =
++      Array::Handle(thread_->isolate_group()->object_store()
++                        ->dispatch_table_code_entries());
++  if (!entries.IsNull()) {
++    js_.PrintProperty64("code_entry_count", entries.Length());
++    const uint64_t instruction_base =
++        reinterpret_cast<uint64_t>(info_.snapshot_text);
++    js_.OpenArray("targets");
++    Zone* zone = thread_->zone();
++    Code& code = Code::Handle(zone);
++    for (intptr_t i = 0; i < entries.Length(); ++i) {
++      code ^= entries.At(i);
++      if (code.IsNull()) continue;
++      if (code.IsUnknownDartCode()) continue;
++      js_.OpenObject();
++      js_.PrintProperty64("selector_index", i);
++      js_.PrintProperty64(
++          "target_offset",
++          static_cast<int64_t>(static_cast<uint64_t>(code.PayloadStart()) -
++                               instruction_base));
++      js_.PrintProperty64("size", static_cast<int64_t>(code.Size()));
++      const auto& owner = Object::Handle(zone, code.owner());
++      if (!owner.IsNull()) {
++        js_.PrintProperty64("owner_id", GetObjectId(owner.ptr()));
++        if (owner.IsFunction()) {
++          js_.PrintProperty(
++              "owner_name",
++              String::Handle(zone, Function::Cast(owner).name()).ToCString());
++        }
++      }
++      js_.CloseObject();
++    }
++    js_.CloseArray();
++  } else {
++    js_.PrintProperty64("code_entry_count", 0);
++  }
++  js_.CloseObject();
++}
++
++// Populated CID runs from the live class table. Obfuscation renames classes
++// but cannot compact CIDs, so [start, end] runs are stable identity evidence.
++void SnapshotAnalyzer::DumpClassIdRanges() {
++  js_.OpenObject("class_ranges");
++  js_.PrintProperty("type", "ClassRanges");
++  auto class_table = thread_->isolate_group()->class_table();
++  const intptr_t num_cids = class_table->NumCids();
++  const intptr_t num_top_level = class_table->NumTopLevelCids();
++  js_.PrintProperty64("num_cids", num_cids);
++  js_.PrintProperty64("num_top_level_cids", num_top_level);
++  // Top-level CIDs start at ClassTable::kTopLevelCidOffset; walking the full
++  // [0, NumCids + NumTopLevelCids) space keeps runs contiguous across both.
++  js_.OpenArray("populated_runs");
++  bool open_run = false;
++  intptr_t run_start = -1;
++  const intptr_t total_cids =
++      num_cids + (num_top_level > 0 ? num_top_level : 0);
++  for (intptr_t cid = 0; cid < total_cids; ++cid) {
++    const bool valid = class_table->IsValidIndex(cid) &&
++                       class_table->HasValidClassAt(cid);
++    if (valid && !open_run) {
++      run_start = cid;
++      open_run = true;
++    } else if (!valid && open_run) {
++      js_.PrintValue64(run_start);
++      js_.PrintValue64(cid - 1);
++      open_run = false;
++    }
++  }
++  if (open_run) {
++    js_.PrintValue64(run_start);
++    js_.PrintValue64(total_cids - 1);
++  }
++  js_.CloseArray();
++  js_.CloseObject();
+ }
+ 
+ namespace {
+@@ -296,16 +639,21 @@
  
    if (code.owner() != Object::null()) {
      const auto& owner = Object::Handle(code.owner());
@@ -252,7 +484,7 @@ index 9c2ee447..e904d594 100644
        js_.PrintProperty("name", Function::Cast(owner).UserVisibleNameCString());
      } else if (owner.IsSmi()) {
        // This is a class id of the class which owned the function.
-@@ -329,9 +461,13 @@ void SnapshotAnalyzer::DumpCode(const Code& code) {
+@@ -316,9 +664,13 @@
            class_table->At(cid) != Class::null()) {
          const auto& cls = Class::Handle(class_table->At(cid));
          js_.PrintProperty("owner", GetObjectId(cls.ptr()));
@@ -266,7 +498,7 @@ index 9c2ee447..e904d594 100644
          js_.PrintfProperty("name", "unknown function of class #%" Pd "", cid);
        }
      } else {
-@@ -373,6 +509,7 @@ void SnapshotAnalyzer::DumpField(const Field& field) {
+@@ -359,6 +711,7 @@
  
    js_.PrintProperty("type", "Field");
    js_.PrintProperty("name", name.ToCString());
@@ -274,7 +506,7 @@ index 9c2ee447..e904d594 100644
    js_.PrintProperty64("type_class", GetObjectId(field.type()));
    js_.PrintProperty("owner_class", GetObjectId(field.Owner()));
    if (field.is_static()) {
-@@ -384,6 +521,9 @@ void SnapshotAnalyzer::DumpField(const Field& field) {
+@@ -370,6 +723,9 @@
      js_.PrintProperty("initializer_function",
                        GetObjectId(field.InitializerFunction()));
    }
@@ -284,7 +516,7 @@ index 9c2ee447..e904d594 100644
  
    js_.PrintPropertyBool("is_reference", !field.is_unboxed());
    if (field.is_unboxed()) {
-@@ -404,13 +544,12 @@ void SnapshotAnalyzer::DumpField(const Field& field) {
+@@ -390,13 +746,12 @@
  
    js_.OpenArray("flags");
    if (field.is_final()) js_.PrintValue("final");
@@ -300,7 +532,7 @@ index 9c2ee447..e904d594 100644
    js_.CloseArray();
  }
  
-@@ -439,12 +578,29 @@ void SnapshotAnalyzer::DumpInstance(const Object& object) {
+@@ -425,12 +780,29 @@
    js_.CloseArray();
  }
  
@@ -319,22 +551,21 @@ index 9c2ee447..e904d594 100644
 +  js_.PrintProperty("user_visible_name", type.UserVisibleNameCString());
 +  js_.PrintProperty("nullability_suffix",
 +                    type.NullabilitySuffix(PassiveObject::kUserVisibleName));
-+
+ 
+-  js_.PrintProperty("type_class", GetObjectId(type.type_class()));
 +  if (!type.IsType()) {
 +    return;
 +  }
 +  const Type& concrete_type = Type::Cast(type);
 +  js_.PrintProperty("type_class", GetObjectId(concrete_type.type_class()));
  
--  js_.PrintProperty("type_class", GetObjectId(type.type_class()));
--
 -  const TypeArguments& arguments = TypeArguments::Handle(type.arguments());
 +  const TypeArguments& arguments =
 +      TypeArguments::Handle(concrete_type.arguments());
    js_.OpenArray("type_arguments");
    for (intptr_t i = 0; i < arguments.Length(); ++i) {
      js_.PrintValue64(GetObjectId(arguments.TypeAt(i)));
-@@ -559,6 +715,14 @@ void SnapshotAnalyzer::DumpInterestingObjects() {
+@@ -545,6 +917,14 @@
                                   ? ClassTable::IndexFromTopLevelCid(owner.id())
                                   : owner.id();
        array[index].push_back(&field);
@@ -349,7 +580,7 @@ index 9c2ee447..e904d594 100644
      }
    }
  
-@@ -598,8 +762,8 @@ void SnapshotAnalyzer::DumpInterestingObjects() {
+@@ -584,8 +964,8 @@
        js_.PrintProperty("type", "Array");
        const Array& array = Array::Handle(Array::RawCast(object->ptr()));
        DumpArray(array, "elements");
@@ -360,11 +591,21 @@ index 9c2ee447..e904d594 100644
      } else if (object->IsInstance()) {
        DumpInstance(*object);
      }
-@@ -630,6 +794,13 @@ void SnapshotAnalyzer::DumpInterestingObjects() {
+@@ -612,10 +992,23 @@
+   }
+ 
+   js_.CloseArray();
++
++  // Payload-wide semantic evidence beyond the per-object graph.
++  DumpStaticCallTargets();
++  DumpDispatchMetadata();
++  DumpClassIdRanges();
+ }
  
  void SnapshotAnalyzer::DumpMetadata() {
    js_.OpenObject("metadata");
 +  js_.PrintProperty("dart_version", Version::String());
++  js_.PrintProperty("dart_commit", Version::SdkHash());
 +  js_.PrintProperty("snapshot_hash", Version::SnapshotString());
 +  const Library& root_library = Library::Handle(
 +      thread_->isolate_group()->object_store()->root_library());
@@ -374,3 +615,42 @@ index 9c2ee447..e904d594 100644
    js_.OpenObject("offsets");
    js_.OpenObject("thread");
    // TODO(balid): Use `dart::compiler::target::` versions.
+@@ -631,6 +1024,23 @@
+   js_.PrintProperty("object_store_offset", IsolateGroup::object_store_offset());
+   js_.CloseObject();
+   js_.CloseObject();
++  js_.PrintProperty64("dispatch_table_origin_element",
++#if defined(TARGET_ARCH_X64)
++                      DispatchTable::kOriginElement
++#elif defined(TARGET_ARCH_ARM)
++                      DispatchTable::kOriginElement
++#elif defined(TARGET_ARCH_ARM64)
++                      DispatchTable::kOriginElement
++#else
++                      DispatchTable::kOriginElement
++#endif
++  );
++  const auto& global_pool =
++      ObjectPool::Handle(thread_->isolate_group()->object_store()
++                             ->global_object_pool());
++  js_.PrintProperty64(
++      "global_object_pool_length",
++      global_pool.IsNull() ? 0 : static_cast<int64_t>(global_pool.Length()));
+   js_.PrintProperty64("word_size", dart::compiler::target::kWordSize);
+   js_.PrintProperty64("compressed_word_size",
+                       dart::compiler::target::kCompressedWordSize);
+@@ -646,14 +1056,6 @@
+ 
+   // Open empty object so output is valid/parsable JSON.
+   js_.OpenObject();
+-  js_.OpenObject("snapshot_data");
+-  // Base addresses of the snapshot data, useful to calculate relative offsets.
+-  js_.PrintfProperty("vm_data", "%p", nullptr);
+-  js_.PrintfProperty("vm_instructions", "%p", nullptr);
+-  js_.PrintfProperty("isolate_data", "%p", info_.snapshot_data);
+-  js_.PrintfProperty("isolate_instructions", "%p", info_.snapshot_text);
+-  js_.CloseObject();
+-
+   {
+     // Debug builds assert that our thread has a lock before accessing
+     // vm internal fields.
