@@ -134,7 +134,41 @@ governing rules in `ACCURACY_ARCHITECTURE.md` (loaders append facts, tiers
 never upgrade, projection may discard).
 
 ### P1 — Join schema-5 StaticCalls + Dispatch metadata into call resolution
-*(highest gain per unit risk; pure data plumbing)*
+
+*Status 2026-08-24 (evening): the exact-revision schema-5 analyzers now build for
+all three ABIs (`vm-oracle/build-exact-analyzers.sh` at d684a576a6; the patch's
+hunk 18 needed 3.12.2 field renames — `info_.snapshot_text` →
+`info_.vm_isolate_instructions` — and the `snapshot_data` block context). The
+full oracle path works end-to-end through `clutter vm-oracle --adb <serial>` on
+an x86_64 emulator, including the cryptographic binding.
+
+Measured effect of `--vm-oracle` on the obfuscated simple_app corpus (arm64):
+
+| Metric | static-only | + schema-5 oracle |
+| --- | ---: | ---: |
+| resolved_direct_call_sites | 6,630 | **27,563** |
+| functions_with_signatures | 2,269 | **2,746** |
+| recovered_parameter_types | 2,079 | **2,646** |
+| typed_field_declarations | 484 | **629** |
+| classes_with_recovered_metadata | 2,526 | **3,311** |
+| functions_linked_by_vm_oracle | 0 | **12,038** |
+
+Two analyzer limitations discovered by measurement (they bound what P1 can
+still deliver):
+
+1. `static_calls` only captures pool entries whose payload is a *tagged Code*
+   object — in fully-AOT x64/arm64 pools that is exactly the 133 VM-stub
+   entries; application call targets use other encodings, so the section adds
+   no app-level call names yet. The per-object graph (Code.owner → Function)
+   is what actually delivers the resolution gains above.
+2. `dispatch_metadata.code_entry_count` is always 0: the deserializer decodes
+   the dispatch table into the raw `DispatchTable` (entry-point words), never
+   into `object_store()->dispatch_table_code_entries()` (that array exists only
+   during precompilation). Selector→Code naming therefore needs to mine the
+   serialized table stream (which Clutter already locates independently in
+   `cluster/dispatch.rs`) plus the code-index map, not the object store.
+
+*(original proposal below)*
 
 - Parse the per-row payload of `StaticCalls` and `Dispatch` into typed maps:
   `pool_index → (target_offset, size, owner_id, owner_name?, is_static?,
