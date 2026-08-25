@@ -1148,35 +1148,110 @@ fn dispatch_call_evidence(
     }
 }
 
+/// Infers a dispatch-call selector from the table slots a call site can reach
+/// (`selector_offset + class_id` for every known populated CID).
+///
+/// Slot multiplicity is misleading: a selector implemented by one class fills
+/// exactly one slot, while a shared helper can occupy hundreds of identical
+/// displaced rows. Grouping by raw slot count therefore lets one widely-shared
+/// implementation outvote the true selector. Every slot resolving to the same
+/// Code label is collapsed first; inference then works over *distinct
+/// implementations*:
+///
+/// - exactly one implementation → its member name is the selector, proven;
+/// - otherwise a member name wins only when it names a strict majority
+///   (>= 2:1) of the distinct implementations and at least three survive
+///   with readable (non-synthetic) names.
 fn infer_dispatch_selector(raw_targets: &[String]) -> (Option<String>, Vec<String>, usize) {
-    let mut groups = BTreeMap::<String, (usize, std::collections::BTreeSet<String>)>::new();
+    let mut implementations = BTreeSet::<String>::new();
     for target in raw_targets {
+        if !target.is_empty() {
+            implementations.insert(target.clone());
+        }
+    }
+    if implementations.is_empty() {
+        return (None, Vec::new(), 0);
+    }
+    if implementations.len() == 1 {
+        let target = implementations.into_iter().next().expect("one entry");
+        let selector = target
+            .rsplit_once('.')
+            .map_or(target.as_str(), |(_, name)| name)
+            .to_owned();
+        return (Some(selector), vec![target], 1);
+    }
+    let mut groups = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for target in &implementations {
         let selector = target
             .rsplit_once('.')
             .map_or(target.as_str(), |(_, name)| name);
-        let group = groups.entry(selector.to_owned()).or_default();
-        group.0 += 1;
-        group.1.insert(target.clone());
+        groups
+            .entry(selector.to_owned())
+            .or_default()
+            .insert(target.clone());
     }
     let mut ranked = groups.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
-    let Some((selector, (frequency, targets))) = ranked.first() else {
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let Some((selector, targets)) = ranked.first() else {
         return (None, Vec::new(), 0);
     };
-    let runner_up = ranked.get(1).map_or(0, |(_, group)| group.0);
-    // A heavily obfuscated table can contain thousands of synthetic `sub_*`
-    // labels plus a handful of surviving operators. Winning 5-to-1 among
-    // individually unique synthetic names is not meaningful dominance. Keep
-    // the small-table exact case, but require a broader quorum otherwise.
-    let dominant = (*frequency == raw_targets.len() && !raw_targets.is_empty())
-        || (targets.len() >= 8 && *frequency >= runner_up.saturating_mul(2));
+    // Unanimous member name across every distinct implementation: the classic
+    // polymorphic shape (every class names its override identically).
+    if ranked.len() == 1 {
+        let readable = !selector.starts_with("sub_")
+            && !selector.starts_with("_iso_stub_")
+            && !selector.starts_with("stub_")
+            && !selector.is_empty();
+        if readable {
+            return (
+                Some(selector.clone()),
+                targets.iter().take(16).cloned().collect(),
+                implementations.len(),
+            );
+        }
+        return (None, Vec::new(), implementations.len());
+    }
+    let runner_up = ranked.get(1).map_or(0, |group| group.1.len());
+    let readable = !selector.starts_with("sub_")
+        && !selector.starts_with("_iso_stub_")
+        && !selector.starts_with("stub_")
+        && !selector.is_empty();
+    // Disputed names need a strict 2:1 majority over the runner-up, at least
+    // three implementations carrying the winning name, and enough coverage
+    // that the sweep did not just graze unrelated selectors sharing the
+    // offset window (a 5-of-105 win is noise from an obfuscated table).
+    let dominant = readable
+        && targets.len() >= 3
+        && targets.len() >= runner_up.saturating_mul(2)
+        && targets.len().saturating_mul(4) >= implementations.len();
     if !dominant {
-        return (None, Vec::new(), 0);
+        // No provable selector name. Distinct non-synthetic implementations
+        // remain bounded evidence; purely opaque sweeps stay silent instead of
+        // dressing synthetic labels up as candidates.
+        let readable_impls = implementations
+            .iter()
+            .filter(|target| {
+                let member = target.rsplit_once('.').map_or(target.as_str(), |(_, name)| name);
+                !member.starts_with("sub_")
+                    && !member.starts_with("_iso_stub_")
+                    && !member.starts_with("stub_")
+                    && !member.is_empty()
+            })
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>();
+        return (None, readable_impls, implementations.len());
     }
     (
         Some(selector.clone()),
         targets.iter().take(16).cloned().collect(),
-        targets.len(),
+        implementations.len(),
     )
 }
 
@@ -5939,10 +6014,17 @@ mod tests {
             .collect::<Vec<_>>();
         targets.extend((0..100).map(|index| format!("Class{}.==", index % 5)));
 
+        // A 5-of-105 implementation win is grazing unrelated selectors that
+        // share the offset window: no proven name, but the five readable
+        // implementations stay as bounded evidence while the 100 synthetic
+        // `sub_*` labels are filtered out of the candidate list.
         let (selector, candidates, count) = infer_dispatch_selector(&targets);
         assert_eq!(selector, None);
-        assert!(candidates.is_empty());
-        assert_eq!(count, 0);
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|candidate| !candidate.starts_with("sub_")));
+        assert_eq!(count, 105);
     }
 
     #[test]

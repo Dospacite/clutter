@@ -642,6 +642,48 @@ pub struct RecoveredCodeMetadata {
     pub handled_types_reference: Option<i32>,
     pub has_async_exception_handler: bool,
     pub exception_handlers: Vec<RecoveredExceptionHandler>,
+    /// Protected pc ranges derived from pc-descriptor `try_index` rows joined
+    /// with their handler-table rows; empty when the body has no try blocks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub try_regions: Vec<RecoveredTryRegion>,
+}
+
+impl RecoveredCodeMetadata {
+    /// Joins each real (non-generated) handler row with the pc-descriptor
+    /// rows carrying its try index. The descriptor rows are the only surviving
+    /// record of *which instructions* the try block protected — the handler
+    /// table itself stores just the catch entry.
+    pub fn try_regions(&self) -> Vec<RecoveredTryRegion> {
+        let mut regions = Vec::new();
+        for handler in &self.exception_handlers {
+            if handler.is_generated {
+                continue;
+            }
+            let inside: Vec<u32> = self
+                .pc_descriptors
+                .iter()
+                .filter(|row| row.try_index == handler.try_index as i32)
+                .map(|row| row.pc_offset)
+                .collect();
+            let Some(start) = inside.iter().min() else {
+                continue;
+            };
+            // The range ends where the next descriptor outside the try begins;
+            // using the max in-range offset plus one instruction slot keeps the
+            // bracket honest without decoding instruction lengths here.
+            let end = inside.iter().max().expect("non-empty").saturating_add(1);
+            regions.push(RecoveredTryRegion {
+                try_index: handler.try_index,
+                start_pc_offset: *start,
+                end_pc_offset: end,
+                handler_pc_offset: handler.handler_pc_offset,
+                needs_stack_trace: handler.needs_stack_trace,
+                has_catch_all: handler.has_catch_all,
+            });
+        }
+        regions.sort_by_key(|region| region.start_pc_offset);
+        regions
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -677,11 +719,28 @@ pub enum CodeSourceMapOperation {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RecoveredExceptionHandler {
+    /// This row's own try index (its position in the handler table); the
+    /// `try_index` recorded in pc-descriptor rows refers to it.
+    #[serde(default)]
+    pub try_index: usize,
     pub handler_pc_offset: u32,
     pub outer_try_index: i16,
     pub needs_stack_trace: bool,
     pub has_catch_all: bool,
     pub is_generated: bool,
+}
+
+/// One protected region: pc-descriptor rows with `try_index == index` span
+/// `[start_pc, end_pc)` inside this body, dispatched by the VM into the
+/// handler at `handler_pc_offset`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RecoveredTryRegion {
+    pub try_index: usize,
+    pub start_pc_offset: u32,
+    pub end_pc_offset: u32,
+    pub handler_pc_offset: u32,
+    pub needs_stack_trace: bool,
+    pub has_catch_all: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

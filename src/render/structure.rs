@@ -33,9 +33,10 @@ pub(crate) enum StructureNode {
     /// statement. Rendered as a comment, never as an `if` (the renderer
     /// demotes such branches after structuring; see `dart.rs`).
     UnresolvedPredicate(String),
-    /// Marker for an exception-handler region: everything after it in the
-    /// enclosing block is catch-handler evidence, not sequential control flow.
-    CatchHandler,
+    /// An exception-handler region: the VM dispatches into `body` on throw
+    /// from the protected range. Rendered as a `catch` clause once try
+    /// bracketing is available, otherwise as an explicit banner.
+    CatchHandler(Box<StructureNode>),
     /// Ordered mixed region (the top-level sequence).
     Block(Vec<StructureNode>),
 }
@@ -227,10 +228,7 @@ pub(crate) fn structure_body(
             let after_claims = state.claimed.iter().filter(|claim| **claim).count();
             state.visited.insert(*handler);
             if after_claims > before_claims {
-                root_pieces.push(StructureNode::Block(vec![
-                    StructureNode::CatchHandler,
-                    piece,
-                ]));
+                root_pieces.push(StructureNode::CatchHandler(Box::new(piece)));
             }
         }
     }
@@ -779,10 +777,10 @@ fn demote_empty_low_confidence_branch(
         match node {
             StructureNode::Linear(indices) => !indices.is_empty(),
             StructureNode::Return(_) => true,
-            StructureNode::If { .. }
-            | StructureNode::While { .. }
-            | StructureNode::UnresolvedPredicate(_)
-            | StructureNode::CatchHandler => true,
+            StructureNode::If { .. } | StructureNode::While { .. } | StructureNode::UnresolvedPredicate(_) => {
+                true
+            }
+            StructureNode::CatchHandler(body) => has_content(body),
             StructureNode::Block(children) => children.iter().any(has_content),
         }
     }

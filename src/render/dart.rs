@@ -1662,6 +1662,35 @@ fn render_function(
             &function.semantic_statements,
             &handler_blocks,
         );
+        // Protected ranges come from pc-descriptor try_index rows joined with
+        // the handler table. Only ranges whose handler block actually decoded
+        // into statements become renderable try/catch pairs.
+        let mut try_regions = Vec::new();
+        if let Some(metadata) = function.code_metadata.as_ref() {
+            for region in metadata.try_regions() {
+                let handler = base + u64::from(region.handler_pc_offset);
+                if std::env::var("CLUTTER_DEBUG_TRY").is_ok() {
+                    eprintln!(
+                        "TRY region idx={} pc 0x{:x}..0x{:x} handler 0x{:x} in_handler_set={}",
+                        region.try_index,
+                        base + u64::from(region.start_pc_offset),
+                        base + u64::from(region.end_pc_offset),
+                        handler,
+                        handler_blocks.contains(&handler)
+                    );
+                }
+                if !handler_blocks.contains(&handler) {
+                    continue;
+                }
+                try_regions.push(TryRegionView {
+                    start: base + u64::from(region.start_pc_offset),
+                    end: base + u64::from(region.end_pc_offset),
+                    handler,
+                    needs_stack_trace: region.needs_stack_trace,
+                    has_catch_all: region.has_catch_all,
+                });
+            }
+        }
         let mut emitter = BodyEmitter {
             index,
             aliases: initial_aliases,
@@ -1678,6 +1707,9 @@ fn render_function(
                 async_style,
                 Some(AsyncStyle::Async | AsyncStyle::AsyncStar)
             ),
+            try_regions,
+            open_try: None,
+            structure_depth: 0,
         };
         if std::env::var("CLUTTER_DEBUG_STRUCTURE").is_ok() {
             eprintln!(
@@ -1690,6 +1722,22 @@ unstructured={} branches={} loops={}",
             );
         }
         emitter.emit_node(output, function, &structured.root, &body_indent);
+        // A protected range whose handler never decoded still needs a closed
+        // clause; keep the guard explicit instead of emitting invalid Dart.
+        if let Some(region_index) = emitter.open_try.take() {
+            let region = emitter.try_regions[region_index];
+            if region.has_catch_all || !region.needs_stack_trace {
+                writeln!(output, "{body_indent}}} catch (e) {{").unwrap();
+            } else {
+                writeln!(output, "{body_indent}}} catch (e, stackTrace) {{").unwrap();
+            }
+            writeln!(
+                output,
+                "{body_indent}  aot.unresolvedRegion('catch body not recovered', <dynamic>[]);"
+            )
+            .unwrap();
+            writeln!(output, "{body_indent}}}").unwrap();
+        }
         // Statements stranded in machine regions the structurer could not reach
         // (async state dispatch, table jumps) still surface, in address order.
         let missed: Vec<usize> = function
@@ -2009,7 +2057,7 @@ fn contains_return(
                     .is_some_and(|body| contains_return(body, statements))
         }
         StructureNode::While { body, .. } => contains_return(body, statements),
-        StructureNode::UnresolvedPredicate(_) | StructureNode::CatchHandler => false,
+        StructureNode::UnresolvedPredicate(_) | StructureNode::CatchHandler(_) => false,
         StructureNode::Block(children) => children
             .iter()
             .any(|child| contains_return(child, statements)),
@@ -2060,12 +2108,27 @@ fn node_ends_in_terminal_return(
         }
         // A loop may run zero iterations, so control flow can fall through.
         StructureNode::While { .. } => false,
-        StructureNode::UnresolvedPredicate(_) | StructureNode::CatchHandler => false,
+        StructureNode::UnresolvedPredicate(_) | StructureNode::CatchHandler(_) => false,
         StructureNode::Block(children) => children
             .iter()
             .next_back()
             .is_some_and(|child| node_ends_in_terminal_return(child, function)),
     }
+}
+
+/// One protected try range in body coordinates (absolute addresses), with the
+/// catch handler entry the VM dispatches into.
+#[derive(Clone, Copy)]
+struct TryRegionView {
+    start: u64,
+    end: u64,
+    /// Handler entry address; kept for cross-checking against the structurer's
+    /// handler-block set (regions whose handler produced no statements are
+    /// filtered out before rendering).
+    #[allow(dead_code)]
+    handler: u64,
+    needs_stack_trace: bool,
+    has_catch_all: bool,
 }
 
 struct BodyEmitter<'a> {
@@ -2078,6 +2141,62 @@ struct BodyEmitter<'a> {
     /// Body belongs to an `async`/`async*` member: unpredicated loops are
     /// async-machine dispatch cycles, not source `while` loops.
     is_async_machine: bool,
+    /// Protected ranges recovered from pc-descriptor try_index rows; empty
+    /// when the body compiled without try blocks.
+    try_regions: Vec<TryRegionView>,
+    /// Index into `try_regions` of the currently open `try {`, if any. It
+    /// closes at its handler (`CatchHandler`) or, unreachable-guard, at body end.
+    open_try: Option<usize>,
+    /// Structural nesting depth while emitting; try brackets are opened only
+    /// at depth 0 so a `catch` can never close across an `if`/`while` brace
+    /// boundary and produce invalid Dart.
+    structure_depth: usize,
+}
+
+/// First and last statement address of any renderable node, for try-range
+/// membership checks. Returns `None` for nodes carrying no statements.
+fn node_statement_span(
+    function: &RecoveredFunction,
+    node: &super::structure::StructureNode,
+) -> Option<(u64, u64)> {
+    use super::structure::StructureNode;
+    let parse = |index: usize| -> Option<u64> {
+        Some(parse_hex(function.semantic_statements.get(index)?.address()).unwrap_or_default())
+    };
+    match node {
+        StructureNode::Linear(indices) => {
+            let first = indices.first()?;
+            let last = indices.last()?;
+            Some((parse(*first)?, parse(*last)?))
+        }
+        StructureNode::Return(index) => {
+            let address = parse(*index)?;
+            Some((address, address))
+        }
+        StructureNode::If { then_body, else_body, .. } => {
+            let mut spans = vec![node_statement_span(function, then_body)];
+            if let Some(else_body) = else_body {
+                spans.push(node_statement_span(function, else_body));
+            }
+            let mut spans = spans.into_iter().flatten().collect::<Vec<_>>();
+            if spans.is_empty() {
+                return None;
+            }
+            spans.sort();
+            Some((spans[0].0, spans[spans.len() - 1].1))
+        }
+        StructureNode::While { body, .. } => node_statement_span(function, body),
+        StructureNode::Block(children) => {
+            let spans = children
+                .iter()
+                .filter_map(|child| node_statement_span(function, child))
+                .collect::<Vec<_>>();
+            let first = spans.iter().map(|span| span.0).min()?;
+            let last = spans.iter().map(|span| span.1).max()?;
+            Some((first, last))
+        }
+        StructureNode::UnresolvedPredicate(_) | StructureNode::CatchHandler(_) => None,
+    }
 }
 
 fn sanitize_semantic_key(target: &str) -> String {
@@ -2094,6 +2213,38 @@ fn sanitize_semantic_key(target: &str) -> String {
 }
 
 impl<'a> BodyEmitter<'a> {
+    /// Wraps a root-level child whose whole statement span lies inside an
+    /// unopened protected range. Bracketing at this level is safe: the
+    /// matching `CatchHandler` is always a sibling at the same depth, so the
+    /// `catch` clause can never close across an `if`/`while` brace boundary.
+    fn try_wrap_root_child(
+        &mut self,
+        output: &mut String,
+        function: &RecoveredFunction,
+        node: &super::structure::StructureNode,
+        indent: &str,
+    ) -> bool {
+        let Some((first, _last)) = node_statement_span(function, node) else {
+            return false;
+        };
+        let Some(region_index) = self.try_regions.iter().position(|region| {
+            self.open_try.is_none() && region.start <= first && first < region.end
+        }) else {
+            return false;
+        };
+        self.open_try = Some(region_index);
+        let region = self.try_regions[region_index];
+        writeln!(
+            output,
+            "{indent}try {{ // protected range 0x{:x}..0x{:x}",
+            region.start,
+            region.end
+        )
+        .unwrap();
+        self.emit_node(output, function, node, indent);
+        false
+    }
+
     fn emit_node(
         &mut self,
         output: &mut String,
@@ -2104,7 +2255,16 @@ impl<'a> BodyEmitter<'a> {
         use super::structure::StructureNode;
         match node {
             StructureNode::Block(children) => {
+                self.structure_depth += 1;
                 for child in children {
+                    // Root-level children (depth becomes 1 inside) are the one
+                    // place a try bracket is guaranteed to pair with its
+                    // handler sibling without crossing structured braces.
+                    if self.structure_depth == 1
+                        && self.try_wrap_root_child(output, function, child, indent)
+                    {
+                        continue;
+                    }
                     self.emit_node(output, function, child, indent);
                     // A child whose every path ends in a machine return makes
                     // its following siblings unreachable; rendering them as
@@ -2113,6 +2273,7 @@ impl<'a> BodyEmitter<'a> {
                         break;
                     }
                 }
+                self.structure_depth -= 1;
             }
             StructureNode::Linear(statements) => {
                 let mut position = 0usize;
@@ -2216,17 +2377,40 @@ impl<'a> BodyEmitter<'a> {
                 )
                 .unwrap();
             }
-            StructureNode::CatchHandler => {
-                writeln!(
-                    output,
-                    "{indent}// catch handler (type unresolved): the VM dispatches here on throw;"
-                )
-                .unwrap();
-                writeln!(
-                    output,
-                    "{indent}// try/catch structure is not reconstructed in this snapshot."
-                )
-                .unwrap();
+            StructureNode::CatchHandler(body) => {
+                match self.open_try.take() {
+                    Some(region_index) => {
+                        let region = &self.try_regions[region_index];
+                        let catch_head = if region.has_catch_all || !region.needs_stack_trace {
+                            format!("{indent}}} catch (e) {{")
+                        } else {
+                            format!("{indent}}} catch (e, stackTrace) {{")
+                        };
+                        writeln!(output, "{catch_head}").unwrap();
+                    }
+                    None => {
+                        // The handler decoded without a renderable protected
+                        // range: keep the explicit banner rather than invent
+                        // a try block.
+                        writeln!(
+                            output,
+                            "{indent}// catch handler (type unresolved): the VM dispatches here on throw;"
+                        )
+                        .unwrap();
+                        writeln!(
+                            output,
+                            "{indent}// try/catch structure is not reconstructed in this snapshot."
+                        )
+                        .unwrap();
+                    }
+                }
+                self.emit_node(output, function, body, indent);
+                if self.open_try.is_none() {
+                    // Close the catch clause opened above. A nested try opened
+                    // *inside* the handler stays open and closes at its own
+                    // handler or at function end.
+                    writeln!(output, "{indent}}}" ).unwrap();
+                }
             }
             StructureNode::While {
                 condition,

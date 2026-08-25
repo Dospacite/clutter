@@ -970,7 +970,7 @@ fn code_metadata(
         .exception_handlers_ref
         .and_then(|reference| isolate.exception_handlers.get(&reference));
     let stack_map = table.stack_maps.get(&range.stack_map_offset);
-    Some(RecoveredCodeMetadata {
+    let metadata = RecoveredCodeMetadata {
         stack_map_offset: stack_map.map_or(range.stack_map_offset, |map| map.offset),
         stack_map_payload_bytes: stack_map.map_or(0, |map| map.payload.len()),
         stack_map_entries: stack_map.map_or(0, |map| map.entry_count),
@@ -990,10 +990,15 @@ fn code_metadata(
         has_async_exception_handler: handlers.is_some_and(|handlers| handlers.has_async_handler),
         exception_handlers: handlers
             .map(|handlers| {
+                // The row's position in the handler table IS its try index
+                // (runtime/vm/exceptions.h: "The index into the
+                // ExceptionHandlers table corresponds to the try_index").
                 handlers
                     .entries
                     .iter()
-                    .map(|handler| RecoveredExceptionHandler {
+                    .enumerate()
+                    .map(|(try_index, handler)| RecoveredExceptionHandler {
+                        try_index,
                         handler_pc_offset: handler.handler_pc_offset,
                         outer_try_index: handler.outer_try_index,
                         needs_stack_trace: handler.needs_stack_trace,
@@ -1003,7 +1008,13 @@ fn code_metadata(
                     .collect()
             })
             .unwrap_or_default(),
-    })
+        try_regions: Vec::new(),
+    };
+    // Derive protected ranges from descriptor try_index rows joined with the
+    // handler table (see `RecoveredCodeMetadata::try_regions`).
+    let mut metadata = metadata;
+    metadata.try_regions = metadata.try_regions();
+    Some(metadata)
 }
 
 /// Mirrors Dart's `Function::DropImplicitCallPrefix`: the implicit dynamic
@@ -1314,8 +1325,14 @@ fn decode_pc_descriptors(
         .map(|object| isolate.bytes_of(object))
         .filter(|bytes| !bytes.is_empty())
     else {
+        #[cfg(debug_assertions)]
+        if code.pc_descriptors_ref.is_some() {
+            // eprintln!("DEBUG pcd empty for ref {:?}", code.pc_descriptors_ref);
+        }
         return Vec::new();
     };
+    #[cfg(debug_assertions)]
+    eprintln!("DEBUG pcd bytes={} ref={:?}", bytes.len(), code.pc_descriptors_ref);
     let mut cursor = 0usize;
     let mut pc_offset = 0i64;
     let mut entries = Vec::new();

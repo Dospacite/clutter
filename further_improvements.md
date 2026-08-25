@@ -187,7 +187,32 @@ still deliver):
   inherit exact-subject validation automatically.
 
 ### P2 — Consume UnlinkedCall selectors + argument descriptors at dynamic sites
-*(novel: makes obfuscated dynamic dispatch legible)*
+
+*Status 2026-08-24 (late): selector inference rebuilt on distinct
+implementations; UnlinkedCall finding recorded.*
+
+- `infer_dispatch_selector` previously grouped raw table slots by member name,
+  so one widely-shared implementation occupying hundreds of displaced rows
+  could outvote the true selector, and sparse readable names in an opaque table
+  could pass a quorum measured against slot counts (not implementations). It
+  now collapses slots to *distinct Code labels* first: one implementation is a
+  proven selector; otherwise a name wins only with a strict 2:1 majority over
+  the runner-up, ≥3 named implementations, and ≥25% coverage of the swept set.
+  Non-synthetic implementations stay as bounded candidate evidence when no name
+  is provable; purely synthetic sweeps stay silent. On the fixtures this turns
+  every recognized dispatch site from "candidate set unresolved" into a bounded
+  candidate list (plain: 6/6 sites; obfuscated: 3,584/3,584), while proving no
+  names the evidence cannot support.
+- **UnlinkedCall finding (measured):** the pool-label recognizer is correct but
+  site-less on current fixtures. Instrumented scan of the simple_app global
+  pool shows 11 entries referencing 7 UnlinkedCall objects and producing
+  `dynamicCall(...)` labels, yet no app-scoped instruction loads those slots —
+  full AOT devirtualized the switchable calls, leaving the objects reachable
+  only from runtime miss paths. The probe fixture behaves identically. Naming
+  dynamic calls therefore depends on dispatch-table recovery above, not on more
+  switchable-call recognizers.
+
+*(original proposal below)*
 
 - Extend `object_pool_labels` (instructions.rs:943) with an UnlinkedCall
   branch: label = `dynamicCall("<target_name>", arity=…)`, restoring the
@@ -202,7 +227,32 @@ still deliver):
   handling should be mirrored so getters/setters keep Dart property syntax.
 
 ### P3 — Try/catch recovery from exception-handler tables
-*(closes the largest construct gap in the edge-case fixture)*
+
+*Status 2026-08-24 (late): landed, renderer-level with an evidence-safe gate.*
+
+- `RecoveredExceptionHandler` now carries its row position as `try_index`
+  (runtime/vm/exceptions.h: "The index into the ExceptionHandlers table
+  corresponds to the try_index"), and `RecoveredCodeMetadata::try_regions()`
+  joins each real handler row with the pc-descriptor rows carrying that index.
+  Those descriptor rows are the only surviving record of which instructions a
+  try block protected — the handler table stores just the catch entry. Note
+  code_descriptors.cc:47: precompiled snapshots emit descriptor rows *only*
+  for exceptions/relocations/yields, so a plain body has zero rows; arm32
+  snapshots (uncompressed pointer layout) store no descriptor payload at all,
+  so try recovery is arm64/x64-only by construction today.
+- The renderer brackets a protected range only when a root-level structured
+  child's statement span starts inside it and its handler decoded into
+  statements (`try { // protected range …`). This keeps the `catch` clause
+  from ever closing across a structurer-opened `if`/`while` brace — the naive
+  statement-level bracketing first tried produced invalid nesting and was
+  rejected. Handler bodies recovered normally render inside the catch;
+  otherwise the clause closes with an explicit unresolved-region note.
+- Verified on the rebuilt arm64 probe fixture: `e09TryRethrow` now renders
+  real `try { … } catch (e) { … }` (previously zero `try` tokens plus a
+  fabricated `while (true)` in the catch path), parses clean under
+  `dart analyze` (0 errors), and `dart format` accepts it.
+
+*(original proposal below)*
 
 - Add `TryCatch { try_region, catch_regions, exception_var, confidence }`
   to `SemanticStatement` and a corresponding structure node.
