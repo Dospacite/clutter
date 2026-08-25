@@ -252,6 +252,19 @@ implementations; UnlinkedCall finding recorded.*
   fabricated `while (true)` in the catch path), parses clean under
   `dart analyze` (0 errors), and `dart format` accepts it.
 
+*Status 2026-08-25: the remaining catch-path `while (true)` fabrication is
+fixed at the root. The generated handler row's target block
+(`is_generated == true`, finally/async dispatch cleanup) was reachable only
+through exception dispatch whose incoming edges are not decoded, so it kept
+a full dominator set that poisoned every successor's set — its branch back
+into the body then looked like a loop latch. `structure_body` now computes
+entry reachability and requires a predecessor to be reachable before its
+edge can vote in the loop-header test, in addition to the existing handler
+exclusion; only real handlers render catch banners (`catch_banners`
+parameter). Probe `e09TryRethrow`: both fabricated loops gone, statements
+render as straight-line code; e24Knot's genuine do-while knot still
+structures. Regression: `poisoned_dominator_edge_does_not_fabricate_loop`.*
+
 *(original proposal below)*
 
 - Add `TryCatch { try_region, catch_regions, exception_var, confidence }`
@@ -298,6 +311,16 @@ stub symbols qualify. Edge-probe fabricated-loop sites dropped 3 → 1; the
 residual (a FutureBuilder closure whose async machinery stayed unnamed)
 needs the oracle `is_async` seed or split-debug stub names. `await expr;`
 rendering at suspension points remains open.*
+
+*Status 2026-08-25 (N3c of `novel_directions_2026-08-25.md`): the yield-index
+fallback in `detected_async_style` no longer demands a resolved
+Iterable-shaped return type. Precompiled snapshots emit pc-descriptor rows
+only for exceptions, relocations, and yields (`code_descriptors.cc`), so any
+body with a `yield_index >= 0` row is a suspension machine; bodies with named
+async collaborators or VM flags are claimed earlier, so what reaches this
+fallback is a generator whose flavor evidence was erased. The probe's
+`e11SyncGen` (no surviving signature) now renders the generator banner and
+its dispatch cycle is suppressed from loop structuring.*
 
 ### P5 — Closure→Function signature walk
 *(cheap, bounded)*

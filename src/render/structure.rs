@@ -63,6 +63,11 @@ struct Cfg {
     /// handler table. Control never falls into them sequentially (the VM
     /// dispatches there), so they must not seed or extend source loops.
     handler_blocks: BTreeSet<u64>,
+    /// Blocks reachable from the entry through decoded edges. Blocks outside
+    /// this set (handler-dispatch regions whose incoming edges are not in the
+    /// CFG) keep full dominator sets that poison every successor's set, so
+    /// their outgoing edges must never vote in the loop-header test.
+    reachable: BTreeSet<u64>,
 }
 
 pub(crate) fn structure_body(
@@ -70,6 +75,7 @@ pub(crate) fn structure_body(
     edges: &[crate::model::ControlFlowEdge],
     statements: &[SemanticStatement],
     handler_blocks: &BTreeSet<u64>,
+    catch_banners: &BTreeSet<u64>,
 ) -> StructuredBody {
     let mut starts: BTreeSet<u64> = BTreeSet::from([entry]);
     for edge in edges {
@@ -162,6 +168,19 @@ pub(crate) fn structure_body(
 
     let dominators = compute_dominators(entry, &starts, &succs, &preds);
     let ipdom = compute_post_dominators(&starts, &succs);
+    let mut reachable_set = BTreeSet::from([entry]);
+    let mut queue: Vec<u64> = succs
+        .get(&entry)
+        .map(|successors| successors.to_vec())
+        .unwrap_or_default();
+    while let Some(node) = queue.pop() {
+        if reachable_set.insert(node)
+            && let Some(successors) = succs.get(&node)
+        {
+            queue.extend(successors.iter().copied());
+        }
+    }
+    let reachable = reachable_set;
     let cfg = Cfg {
         succs,
         preds,
@@ -170,6 +189,7 @@ pub(crate) fn structure_body(
         dominators,
         ipdom,
         handler_blocks: handler_blocks.iter().copied().collect(),
+        reachable,
     };
 
     let total_blocks = starts.len();
@@ -216,7 +236,10 @@ pub(crate) fn structure_body(
     // Handler entry blocks the walk never reached sequentially keep their
     // recovered statements: surface them under an explicit banner instead of
     // letting a later resume-walk fold them into invented control flow.
-    for handler in handler_blocks {
+    // Only *real* handlers (non-generated rows) get the catch banner; the
+    // generated finally/dispatch-cleanup entries stay excluded from loop
+    // detection above but never render as `catch` clauses.
+    for handler in catch_banners {
         if !state.visited.contains(handler)
             && cfg
                 .statements_by_block
@@ -278,6 +301,7 @@ fn walk(
             .map(|predecessors| {
                 predecessors.iter().any(|predecessor| {
                     !cfg.handler_blocks.contains(predecessor)
+                        && cfg.reachable.contains(predecessor)
                         && cfg
                             .dominators
                             .get(predecessor)
@@ -643,6 +667,7 @@ fn walk_clamped(
             .map(|predecessors| {
                 predecessors.iter().any(|predecessor| {
                     !cfg.handler_blocks.contains(predecessor)
+                        && cfg.reachable.contains(predecessor)
                         && cfg
                             .dominators
                             .get(predecessor)
@@ -1001,8 +1026,9 @@ fn compute_dominators(
 
 #[cfg(test)]
 mod tests {
-    use super::{StructureNode, negate_condition, promote_exit_test, whole_wrapped_negation};
-    use crate::model::EvidenceConfidence;
+    use super::{StructureNode, negate_condition, promote_exit_test, structure_body, whole_wrapped_negation};
+    use crate::model::{ControlFlowEdge, ControlFlowEdgeKind, EvidenceConfidence, SemanticStatement};
+    use std::collections::BTreeSet;
 
     #[test]
     fn unwraps_whole_wrapped_negations_only() {
@@ -1074,5 +1100,68 @@ mod tests {
             matches!(&nodes[0], StructureNode::If { .. }),
             "the branch must stay intact"
         );
+    }
+
+    /// Regression (probe EC-2 / generated finally handler): a block reachable
+    /// only through an exception-dispatch region carries a full dominator set
+    /// (its unreachable predecessor keeps one), which used to make its
+    /// outgoing edge look like a back edge and fabricate `while (true)` in
+    /// catch paths. The structurer must ignore predecessors that are not
+    /// reachable from the entry.
+    #[test]
+    fn poisoned_dominator_edge_does_not_fabricate_loop() {
+        // entry -> a; a -> exit (conditional). The dispatch block `d` has no
+        // incoming decoded edge (VM throws into it); d -> b, b -> a. With the
+        // poisoned full set on d, b's dominators swallowed everything and the
+        // b -> a edge looked like a loop latch at `a`.
+        let edges = [
+            ("0x100", "0x110"),
+            ("0x110", "0x140"),
+            ("0x120", "0x130"),
+            ("0x130", "0x110"),
+        ];
+        let control_flow = edges
+            .iter()
+            .map(|(from, to)| ControlFlowEdge {
+                from: from.to_string(),
+                to: to.to_string(),
+                kind: ControlFlowEdgeKind::Fallthrough,
+            })
+            .collect::<Vec<_>>();
+        // One statement per block so every block carries evidence.
+        let statements = ["0x102", "0x112", "0x132", "0x122"]
+            .iter()
+            .map(|address| SemanticStatement::ResolvedCall {
+                target: format!("sub_{address}"),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: address.to_string(),
+            })
+            .collect::<Vec<_>>();
+        // 0x120 is the exception-dispatch region: a handler block.
+        let handlers = BTreeSet::from([0x120]);
+        let structured = structure_body(
+            0x100,
+            &control_flow,
+            &statements,
+            &handlers,
+            &BTreeSet::new(),
+        );
+        fn count_loops(node: &StructureNode) -> usize {
+            match node {
+                StructureNode::While { .. } => 1,
+                StructureNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    count_loops(then_body)
+                        + else_body.as_ref().map(|body| count_loops(body)).unwrap_or(0)
+                }
+                StructureNode::Block(children) => children.iter().map(count_loops).sum(),
+                _ => 0,
+            }
+        }
+        assert_eq!(count_loops(&structured.root), 0);
     }
 }

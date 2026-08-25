@@ -1643,17 +1643,35 @@ fn render_function(
         // `handler_pc_offset` names blocks the VM dispatches into on throw.
         // Those blocks must never seed or extend a source loop (EC-2), and
         // any statements stranded in them render under an explicit banner.
+        // Generated rows (finally cleanup, async dispatch) are dispatch
+        // targets too — the probe's e09 catch path fabricated a `while
+        // (true)` from a generated handler's branch back into the body — so
+        // loop exclusion covers every row, while only real handlers may
+        // render a catch banner.
         let base = entry;
-        let handler_blocks: BTreeSet<u64> = function
+        let (handler_blocks, catch_banners): (BTreeSet<u64>, BTreeSet<u64>) = function
             .code_metadata
             .as_ref()
             .map(|metadata| {
                 metadata
                     .exception_handlers
                     .iter()
-                    .filter(|handler| !handler.is_generated)
-                    .map(|handler| base + u64::from(handler.handler_pc_offset))
-                    .collect()
+                    .map(|handler| {
+                        (
+                            base + u64::from(handler.handler_pc_offset),
+                            !handler.is_generated,
+                        )
+                    })
+                    .fold(
+                        (BTreeSet::new(), BTreeSet::new()),
+                        |(mut all, mut real), (address, is_real)| {
+                            all.insert(address);
+                            if is_real {
+                                real.insert(address);
+                            }
+                            (all, real)
+                        },
+                    )
             })
             .unwrap_or_default();
         let structured = super::structure::structure_body(
@@ -1661,6 +1679,7 @@ fn render_function(
             &function.control_flow,
             &function.semantic_statements,
             &handler_blocks,
+            &catch_banners,
         );
         // Protected ranges come from pc-descriptor try_index rows joined with
         // the handler table. Only ranges whose handler block actually decoded
@@ -2975,12 +2994,16 @@ fn detected_async_style(function: &RecoveredFunction) -> Option<AsyncStyle> {
     // Generator fallback for bodies whose collaborators all stayed unnamed:
     // both `sync*` and async machines record suspension points as
     // non-negative `yield_index` rows in the pc descriptors (probe EC-3:
-    // e11 `yield*` at indices 12/36/44), so a descriptor hit proves *some*
-    // machine, but only the return type separates the flavors. Claim
-    // `sync*` solely when the recovered return type is Iterable-shaped;
-    // Future/Stream shapes stay unclaimed here because misreading a plain
-    // counted loop in such a body as dispatch would erase real control flow.
-    // VM evidence above already proves real generators where it survives.
+    // e11 `yield*` at indices 12/36/44). Precompiled snapshots emit rows
+    // only for exceptions, relocations, and yields
+    // (`code_descriptors.cc`), so a descriptor hit proves *some* suspension
+    // machine even when every collaborator name was erased. Claim `sync*`
+    // when the return type is Iterable-shaped; claim it for the remaining
+    // yield-row bodies too — an `async` body always carries a named async
+    // collaborator or VM flag by the time it reaches this fallback (the
+    // collaborator scan above runs first), so what is left here is a
+    // generator whose flavor evidence was erased. The modifier renders as a
+    // comment either way; the load-bearing effect is machine suppression.
     if style.is_none()
         && function
             .code_metadata
@@ -2991,16 +3014,6 @@ fn detected_async_style(function: &RecoveredFunction) -> Option<AsyncStyle> {
                     .iter()
                     .any(|descriptor| descriptor.yield_index >= 0)
             })
-        && function
-            .signature
-            .as_ref()
-            .and_then(|signature| signature.resolved.as_ref())
-            .and_then(|resolved| resolved.return_type.as_ref())
-            .map(|return_type| {
-                let root = return_type.display_name.split('<').next().unwrap_or("");
-                matches!(root.trim(), "Iterable" | "Iterator" | "_Iterable")
-            })
-            .unwrap_or(false)
     {
         style = Some(AsyncStyle::SyncStar);
     }
