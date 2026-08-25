@@ -1324,6 +1324,7 @@ pub(crate) fn load_unbound(
         matched_code_offsets: 0,
         strongly_matched_functions: 0,
         unmatched_recovered_functions: 0,
+    relabeled_dispatch_candidates: 0,
     };
     Ok(LoadedVmOracle {
         evidence,
@@ -1576,6 +1577,17 @@ pub(crate) fn attach(
     } else {
         apply_dispatch_selector_evidence(&mut program.functions, &oracle.dispatch_selectors)
     };
+    // Dispatch-table candidate labels were derived from static snapshot names
+    // before the oracle attached. Under obfuscation those labels are synthetic
+    // (`sub_<addr>`), but the oracle knows which Function owns each code
+    // offset — relabel candidates so bounded candidate lists carry real
+    // identities instead of addresses.
+    let relabeled_candidates = relabel_dispatch_candidates(
+        &mut program.functions,
+        &oracle.functions,
+        image_base,
+    );
+    oracle.evidence.relabeled_dispatch_candidates = relabeled_candidates;
     enrich_semantics(program, abi);
 
     oracle.evidence.matched_functions = matched;
@@ -1596,6 +1608,69 @@ pub(crate) fn attach(
     });
     program.vm_oracle = Some(oracle.evidence);
     Ok(())
+}
+
+/// Rewrites synthetic dispatch-candidate labels (`sub_<addr>`) to the oracle
+/// Function identity owning that code offset. The static analysis could only
+/// label table slots from snapshot symbols, which obfuscation erases; the
+/// oracle's per-offset Function graph restores real identities. Returns how
+/// many candidate labels were relabeled.
+fn relabel_dispatch_candidates(
+    functions: &mut [RecoveredFunction],
+    oracle_functions: &[VmFunctionEvidence],
+    image_base: u64,
+) -> usize {
+    let mut label_by_offset = HashMap::<u64, String>::new();
+    for evidence in oracle_functions {
+        let Some(offset) = evidence.code_offset else {
+            continue;
+        };
+        let Some(name) = evidence
+            .user_visible_name
+            .as_deref()
+            .or(Some(evidence.name.as_str()))
+            .filter(|name| !name.is_empty() && !name.starts_with("sub_"))
+        else {
+            continue;
+        };
+        let owner = evidence.owner.as_deref().unwrap_or_default();
+        let qualified = if matches!(owner, "" | "::" | "top_level") {
+            name.to_owned()
+        } else {
+            format!("{owner}.{name}")
+        };
+        label_by_offset.insert(offset, qualified);
+    }
+    if label_by_offset.is_empty() {
+        return 0;
+    }
+    let mut relabeled = 0usize;
+    for function in functions {
+        for statement in &mut function.statements {
+            let PseudoStatement::DispatchTableCall {
+                candidate_targets, ..
+            } = statement
+            else {
+                continue;
+            };
+            for target in candidate_targets.iter_mut() {
+                let Some(hex) = target.strip_prefix("sub_") else {
+                    continue;
+                };
+                let Ok(address) = u64::from_str_radix(hex, 16) else {
+                    continue;
+                };
+                let Some(offset) = address.checked_sub(image_base) else {
+                    continue;
+                };
+                if let Some(qualified) = label_by_offset.get(&offset) {
+                    *target = qualified.clone();
+                    relabeled += 1;
+                }
+            }
+        }
+    }
+    relabeled
 }
 
 fn enrich_object_pool_evidence(

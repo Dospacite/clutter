@@ -1508,6 +1508,14 @@ fn render_function(
         ""
     };
     let async_style = detected_async_style(function);
+
+    let forwarder_selector = function
+        .vm_evidence
+        .as_ref()
+        .filter(|evidence| evidence.kind.as_deref() == Some("DynamicInvocationForwarder"))
+        .and_then(|evidence| evidence.raw_name.as_deref())
+        .and_then(|raw| raw.strip_prefix("dyn:"))
+        .map(str::to_owned);
     // Generator modifiers stay comments: recovered bodies render `return`,
     // not `yield`, and `sync*`/`async*` would make that invalid Dart.
     if let Some(style @ (AsyncStyle::AsyncStar | AsyncStyle::SyncStar)) = async_style {
@@ -1519,6 +1527,14 @@ fn render_function(
         writeln!(
             output,
             "{indent}/// Snapshot evidence identifies this member as a `{label}` generator; yield structure was not reconstructed."
+        )
+        .unwrap();
+    }
+    if let Some(selector) = &forwarder_selector {
+        writeln!(
+            output,
+            "{indent}/// Dynamic-invocation forwarder: the VM proves selector `{}` is invoked dynamically on this class; its body forwards to the real member.",
+            safe_comment(selector),
         )
         .unwrap();
     }
@@ -1561,7 +1577,11 @@ fn render_function(
     let source_operator = if collision_count > 1 {
         None
     } else {
-        source_operator_syntax(&function.name)
+        source_operator_syntax(
+            forwarder_selector
+                .as_deref()
+                .unwrap_or(&function.name),
+        )
     };
     let accessor_name: &str = if is_accessor {
         function

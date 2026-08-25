@@ -256,6 +256,10 @@ pub struct VmOracleEvidence {
     pub matched_code_offsets: usize,
     pub strongly_matched_functions: usize,
     pub unmatched_recovered_functions: usize,
+    /// Dispatch-table candidate labels rewritten from synthetic `sub_<addr>`
+    /// to oracle Function identities.
+    #[serde(default)]
+    pub relabeled_dispatch_candidates: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
