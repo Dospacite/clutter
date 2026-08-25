@@ -505,6 +505,9 @@ pub fn recover(
             library_uri: debug_function.library_uri.clone(),
             source_location: debug_function.source_location.clone(),
             inlined_functions,
+            inline_regions: snapshot_match
+                .as_ref()
+                .map_or_else(Vec::new, |function| function.inline_regions.clone()),
             kind: snapshot_match
                 .as_ref()
                 .and_then(|function| function.kind)

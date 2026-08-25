@@ -2330,6 +2330,7 @@ mod tests {
             library_uri: Some("package:app/request.dart".to_owned()),
             source_location: None,
             inlined_functions: Vec::new(),
+            inline_regions: Vec::new(),
             kind: Some(RecoveredFunctionKind::Closure),
             is_static: None,
             signature: Some(RecoveredSignature {

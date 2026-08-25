@@ -1329,6 +1329,7 @@ mod tests {
             library_uri: Some("package:app/example.dart".to_owned()),
             source_location: None,
             inlined_functions: Vec::new(),
+            inline_regions: Vec::new(),
             kind: Some(RecoveredFunctionKind::Regular),
             is_static: Some(true),
             signature: None,

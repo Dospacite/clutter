@@ -654,44 +654,84 @@ fn recover_range(
     // Inline stack transitions carry the snapshot reference of each inlined
     // Function; resolve them to named callees for reporting and rendering.
     let mut inlined_callees: Vec<crate::model::RecoveredInlineFunction> = Vec::new();
+    // push_function..pop_function pairs delimit the pc range of each inlinee's
+    // folded statements (probe EC-1). Nested pushes track per-depth identity.
+    let mut inline_regions: Vec<crate::model::RecoveredInlineRegion> = Vec::new();
     if let Some(metadata) = code_metadata.as_ref() {
+        let mut open_pushes: Vec<(u32, i32, String, Option<String>)> = Vec::new();
         for entry in &metadata.code_source_map {
-            if entry.operation != crate::model::CodeSourceMapOperation::PushFunction {
-                continue;
-            }
-            let Some(reference) = entry.function_reference else {
-                continue;
-            };
-            let raw = context.names.name(reference);
-            if raw.is_empty() {
-                continue;
-            }
-            let name = restore_snapshot_name(&raw, context.obfuscation_map);
-            let already_listed = inlined_callees
-                .iter()
-                .any(|callee| callee.name == name && callee.source_location.is_none());
-            if already_listed || inlined_callees.len() >= 64 {
-                continue;
-            }
-            inlined_callees.push(crate::model::RecoveredInlineFunction {
-                name,
-                library_uri: restore_library_uri(
-                    context.names.library_uri(reference),
-                    context.obfuscation_map,
-                ),
-                source_location: entry.source_line.map(|line| {
-                    crate::model::RecoveredSourceLocation {
-                        path: "snapshot:inline".to_owned(),
-                        line: u64::try_from(line).ok(),
-                        column: None,
-                        end_line: None,
-                        end_column: None,
+            match entry.operation {
+                crate::model::CodeSourceMapOperation::PushFunction => {
+                    let Some(reference) = entry.function_reference else {
+                        continue;
+                    };
+                    let raw = context.names.name(reference);
+                    if raw.is_empty() {
+                        continue;
                     }
-                }),
-                call_location: None,
-                address: String::new(),
-                size: 0,
-            });
+                    let name = restore_snapshot_name(&raw, context.obfuscation_map);
+                    let library_uri = restore_library_uri(
+                        context.names.library_uri(reference),
+                        context.obfuscation_map,
+                    );
+                    let already_listed = inlined_callees
+                        .iter()
+                        .any(|callee| callee.name == name && callee.source_location.is_none());
+                    if !already_listed && inlined_callees.len() < 64 {
+                        inlined_callees.push(crate::model::RecoveredInlineFunction {
+                            name: name.clone(),
+                            library_uri: library_uri.clone(),
+                            source_location: entry.source_line.map(|line| {
+                                crate::model::RecoveredSourceLocation {
+                                    path: "snapshot:inline".to_owned(),
+                                    line: u64::try_from(line).ok(),
+                                    column: None,
+                                    end_line: None,
+                                    end_column: None,
+                                }
+                            }),
+                            call_location: None,
+                            address: String::new(),
+                            size: 0,
+                        });
+                    }
+                    open_pushes.push((entry.pc_offset, reference, name, library_uri));
+                }
+                crate::model::CodeSourceMapOperation::PopFunction => {
+                    // Pop the innermost push at or before this pc; unmatched
+                    // pops (trailing cleanup) are ignored.
+                    if let Some((start, reference, name, library_uri)) = open_pushes.pop() {
+                        if entry.pc_offset > start {
+                            inline_regions.push(crate::model::RecoveredInlineRegion {
+                                function_reference: reference,
+                                name,
+                                library_uri,
+                                start_pc_offset: start,
+                                end_pc_offset: entry.pc_offset,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A push without its pop still owns everything up to the body end.
+        if let Some(metadata_last_pc) = metadata
+            .code_source_map
+            .last()
+            .map(|entry| entry.pc_offset)
+        {
+            for (start, reference, name, library_uri) in open_pushes.into_iter().rev() {
+                if metadata_last_pc > start {
+                    inline_regions.push(crate::model::RecoveredInlineRegion {
+                        function_reference: reference,
+                        name,
+                        library_uri,
+                        start_pc_offset: start,
+                        end_pc_offset: metadata_last_pc,
+                    });
+                }
+            }
         }
     }
     let internal_source_line = code_metadata.as_ref().and_then(|metadata| {
@@ -740,6 +780,7 @@ fn recover_range(
         library_uri,
         source_location,
         inlined_functions: inlined_callees,
+        inline_regions,
         kind,
         is_static,
         signature,

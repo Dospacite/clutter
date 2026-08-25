@@ -1792,6 +1792,48 @@ unstructured={} branches={} loops={}",
                 );
             }
         }
+        // Attribute folded inlinee bodies to their owners (probe EC-1): each
+        // `push_function`..`pop_function` pc range in the code source map is
+        // another function's statements living inside this body. Emitting them
+        // under a named banner restores bodies whose standalone Code vanished.
+        if !function.inline_regions.is_empty() {
+            let base = entry;
+            for region in function.inline_regions.iter().take(16) {
+                let members: Vec<usize> = function
+                    .semantic_statements
+                    .iter()
+                    .enumerate()
+                    .filter(|(statement_index, statement)| {
+                        matches!(statement, SemanticStatement::ResolvedCall { .. } | SemanticStatement::Return { .. } | SemanticStatement::FieldWrite { .. } | SemanticStatement::FieldRead { .. } | SemanticStatement::Condition { .. } | SemanticStatement::StringInterpolation { .. })
+                            && (0..structured.claimed.len())
+                                .contains(statement_index)
+                            && parse_hex(statement.address()).is_some_and(|address| {
+                                let pc = u32::try_from(address.saturating_sub(base)).unwrap_or(u32::MAX);
+                                region.start_pc_offset <= pc && pc < region.end_pc_offset
+                            })
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                if members.is_empty() {
+                    continue;
+                }
+                writeln!(output).unwrap();
+                writeln!(
+                    output,
+                    "{body_indent}// Statements of {} (inlined by the optimizer into this body):",
+                    safe_comment(&region.name)
+                )
+                .unwrap();
+                for statement_index in &members {
+                    emitter.emit_statement(
+                        output,
+                        function,
+                        &function.semantic_statements[*statement_index],
+                        &body_indent,
+                    );
+                }
+            }
+        }
         if !nested
             && matches!(async_style, Some(AsyncStyle::Async))
             && emitter.awaits_rendered == 0
@@ -5129,6 +5171,7 @@ while (true) {
             library_uri: Some("package:app/vector.dart".to_owned()),
             source_location: None,
             inlined_functions: Vec::new(),
+            inline_regions: Vec::new(),
             kind: Some(RecoveredFunctionKind::Regular),
             is_static: None,
             signature: Some(RecoveredSignature {

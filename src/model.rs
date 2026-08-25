@@ -597,6 +597,11 @@ pub struct RecoveredFunction {
     pub source_location: Option<RecoveredSourceLocation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inlined_functions: Vec<RecoveredInlineFunction>,
+    /// Pc ranges the optimizer folded from other functions into this body,
+    /// paired with each inlinee's identity. Statements inside a region belong
+    /// to the inlinee, not to this host (probe EC-1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inline_regions: Vec<RecoveredInlineRegion>,
     pub kind: Option<RecoveredFunctionKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_static: Option<bool>,
@@ -792,6 +797,22 @@ pub struct RecoveredInlineFunction {
     pub call_location: Option<RecoveredSourceLocation>,
     pub address: String,
     pub size: u64,
+}
+
+/// A pc range inside a host body that the optimizer folded from another
+/// function (`push_function` .. `pop_function` in the code source map). The
+/// statements in this range are the inlinee's source logic, not the host's —
+/// attributing them lets a vanished callee's body survive inside the host's
+/// output (probe EC-1).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveredInlineRegion {
+    /// Snapshot object reference of the inlined Function (-1 when unresolved).
+    pub function_reference: i32,
+    pub name: String,
+    pub library_uri: Option<String>,
+    /// Inclusive start / exclusive end pc offsets relative to the code entry.
+    pub start_pc_offset: u32,
+    pub end_pc_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
