@@ -2616,22 +2616,17 @@ impl<'a> BodyEmitter<'a> {
                 // Async state machines surface each `await` as an
                 // `AwaitStub` call carrying the suspended future.
                 if is_await_boundary(target) {
-                    let awaited = arguments.first().map(|value| self.render_expression(value));
-                    let known_local = awaited.as_deref().is_some_and(|value| {
-                        value != "null"
-                            && !value.is_empty()
-                            && self.aliases.values().any(|alias| alias == value)
-                    });
-                    match (known_local, awaited.as_deref()) {
-                        (true, Some(value)) => {
-                            writeln!(output, "{indent}await {value};").unwrap();
-                        }
-                        _ => writeln!(
-                            output,
-                            "{indent}await aot.unresolvedValue('awaited future');"
-                        )
-                        .unwrap(),
-                    }
+                    self.render_await(output, indent, arguments);
+                    self.awaits_rendered += 1;
+                    return;
+                }
+                // When the await stub itself stayed unnamed, the suspension
+                // still surfaces as `_Future._asyncComplete(future, …)`: the
+                // completer of the awaited future (sdk future_impl.dart).
+                // Proven-async bodies only — the same call appears in
+                // non-await completers elsewhere.
+                if self.is_async_machine && target.contains("_asyncComplete") {
+                    self.render_await(output, indent, arguments);
                     self.awaits_rendered += 1;
                     return;
                 }
@@ -3957,6 +3952,31 @@ fn operator_member_name(member: &str) -> Option<&'static str> {
         "<=" => Some("<="),
         ">=" => Some(">="),
         _ => None,
+    }
+}
+
+impl BodyEmitter<'_> {
+    /// Renders one await boundary. The suspended future is the boundary's
+    /// first argument; when it resolves to a named local the statement reads
+    /// `await local;`, otherwise an explicit unresolved placeholder keeps
+    /// the suspension visible without inventing a receiver.
+    fn render_await(&mut self, output: &mut String, indent: &str, arguments: &[String]) {
+        let awaited = arguments.first().map(|value| self.render_expression(value));
+        let known_local = awaited.as_deref().is_some_and(|value| {
+            value != "null"
+                && !value.is_empty()
+                && self.aliases.values().any(|alias| alias == value)
+        });
+        match (known_local, awaited.as_deref()) {
+            (true, Some(value)) => {
+                writeln!(output, "{indent}await {value};").unwrap();
+            }
+            _ => writeln!(
+                output,
+                "{indent}await aot.unresolvedValue('awaited future');"
+            )
+            .unwrap(),
+        }
     }
 }
 
