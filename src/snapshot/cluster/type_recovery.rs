@@ -732,7 +732,7 @@ impl<'a> TypeRecovery<'a> {
             .to_vec()
     }
 
-    fn array_elements(&self, reference: i32) -> Vec<i32> {
+    pub(crate) fn array_elements(&self, reference: i32) -> Vec<i32> {
         if reference == EMPTY_ARRAY_REFERENCE || reference == NULL_REFERENCE {
             return Vec::new();
         }

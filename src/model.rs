@@ -649,6 +649,11 @@ pub struct RecoveredCodeMetadata {
     pub code_source_map: Vec<CodeSourceMapEntry>,
     pub exception_handlers_reference: Option<i32>,
     pub handled_types_reference: Option<i32>,
+    /// Per-handler-row proven guard types (`on X catch`), resolved from the
+    /// snapshot's `ExceptionHandlers.handled_types_data` array-of-arrays.
+    /// Empty inner lists mean the row catches everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handled_types: Vec<Vec<String>>,
     pub has_async_exception_handler: bool,
     pub exception_handlers: Vec<RecoveredExceptionHandler>,
     /// Protected pc ranges derived from pc-descriptor `try_index` rows joined

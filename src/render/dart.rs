@@ -1721,12 +1721,18 @@ fn render_function(
                 if !handler_blocks.contains(&handler) {
                     continue;
                 }
+                let guard_types = metadata
+                    .handled_types
+                    .get(region.try_index)
+                    .cloned()
+                    .unwrap_or_default();
                 try_regions.push(TryRegionView {
                     start: base + u64::from(region.start_pc_offset),
                     end: base + u64::from(region.end_pc_offset),
                     handler,
                     needs_stack_trace: region.needs_stack_trace,
                     has_catch_all: region.has_catch_all,
+                    guard_types,
                 });
             }
         }
@@ -1764,12 +1770,8 @@ unstructured={} branches={} loops={}",
         // A protected range whose handler never decoded still needs a closed
         // clause; keep the guard explicit instead of emitting invalid Dart.
         if let Some(region_index) = emitter.open_try.take() {
-            let region = emitter.try_regions[region_index];
-            if region.has_catch_all || !region.needs_stack_trace {
-                writeln!(output, "{body_indent}}} catch (e) {{").unwrap();
-            } else {
-                writeln!(output, "{body_indent}}} catch (e, stackTrace) {{").unwrap();
-            }
+            let region = &emitter.try_regions[region_index];
+            writeln!(output, "{}", catch_clause_head(&body_indent, region)).unwrap();
             writeln!(
                 output,
                 "{body_indent}  aot.unresolvedRegion('catch body not recovered', <dynamic>[]);"
@@ -2198,8 +2200,7 @@ fn node_ends_in_terminal_return(
 }
 
 /// One protected try range in body coordinates (absolute addresses), with the
-/// catch handler entry the VM dispatches into.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TryRegionView {
     start: u64,
     end: u64,
@@ -2210,6 +2211,9 @@ struct TryRegionView {
     handler: u64,
     needs_stack_trace: bool,
     has_catch_all: bool,
+    /// Snapshot-proven `on X` guard types for this handler row (empty when
+    /// the row catches everything or the compiler emptied its type list).
+    guard_types: Vec<String>,
 }
 
 struct BodyEmitter<'a> {
@@ -2314,7 +2318,7 @@ impl<'a> BodyEmitter<'a> {
             return false;
         };
         self.open_try = Some(region_index);
-        let region = self.try_regions[region_index];
+        let region = &self.try_regions[region_index];
         writeln!(
             output,
             "{indent}try {{ // protected range 0x{:x}..0x{:x}",
@@ -2462,12 +2466,7 @@ impl<'a> BodyEmitter<'a> {
                 match self.open_try.take() {
                     Some(region_index) => {
                         let region = &self.try_regions[region_index];
-                        let catch_head = if region.has_catch_all || !region.needs_stack_trace {
-                            format!("{indent}}} catch (e) {{")
-                        } else {
-                            format!("{indent}}} catch (e, stackTrace) {{")
-                        };
-                        writeln!(output, "{catch_head}").unwrap();
+                        writeln!(output, "{}", catch_clause_head(indent, region)).unwrap();
                     }
                     None => {
                         // The handler decoded without a renderable protected
@@ -3958,6 +3957,33 @@ fn operator_member_name(member: &str) -> Option<&'static str> {
         "<=" => Some("<="),
         ">=" => Some(">="),
         _ => None,
+    }
+}
+
+/// Formats a catch clause head. When the snapshot's handler row carries
+/// proven guard types (`on X catch`), the first type renders as the `on`
+/// clause; multiple guards stay honest with a comment listing them.
+fn catch_clause_head(
+    indent: &str,
+    region: &TryRegionView,
+) -> String {
+    let stack = if region.needs_stack_trace && !region.has_catch_all {
+        ", stackTrace"
+    } else {
+        ""
+    };
+    match region.guard_types.first() {
+        Some(guard) if !region.has_catch_all => {
+            if region.guard_types.len() == 1 {
+                format!("{indent}}} on {guard} catch (e{stack}) {{")
+            } else {
+                let others = region.guard_types[1..].join(" | ");
+                format!(
+                    "{indent}}} on {guard} catch (e{stack}) {{ // also catches: {others}"
+                )
+            }
+        }
+        _ => format!("{indent}}} catch (e{stack}) {{"),
     }
 }
 

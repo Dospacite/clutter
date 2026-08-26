@@ -650,7 +650,7 @@ fn recover_range(
     let unmapped_owner = restore_snapshot_name(&raw_owner, None);
     let map_restored = context.obfuscation_map.is_some()
         && (unmapped_function != function || unmapped_owner != owner);
-    let code_metadata = code_metadata(context.isolate, context.table, &range);
+    let code_metadata = code_metadata(context.isolate, context.table, &range, context.types);
     // Inline stack transitions carry the snapshot reference of each inlined
     // Function; resolve them to named callees for reporting and rendering.
     let mut inlined_callees: Vec<crate::model::RecoveredInlineFunction> = Vec::new();
@@ -1005,6 +1005,7 @@ fn code_metadata(
     isolate: &ParseResult,
     table: &InstructionTable,
     range: &Range,
+    types: &TypeRecovery<'_>,
 ) -> Option<RecoveredCodeMetadata> {
     let code = range_code(isolate, range)?;
     let handlers = code
@@ -1028,6 +1029,9 @@ fn code_metadata(
         code_source_map: decode_code_source_map(isolate, code),
         exception_handlers_reference: code.exception_handlers_ref,
         handled_types_reference: handlers.map(|handlers| handlers.handled_types_ref),
+        handled_types: handlers
+            .map(|handlers| decode_handled_types(types, handlers))
+            .unwrap_or_default(),
         has_async_exception_handler: handlers.is_some_and(|handlers| handlers.has_async_handler),
         exception_handlers: handlers
             .map(|handlers| {
@@ -1354,6 +1358,35 @@ fn abbreviated_pool_string(value: &str) -> String {
     } else {
         format!("{prefix:?}")
     }
+}
+
+/// Resolves `ExceptionHandlers.handled_types_data`: an outer array with one
+/// entry per handler row, each an array of the Type objects that row catches
+/// (an empty inner array means catch-all). These are the snapshot's own
+/// record of `on X catch` guards — no heuristics involved.
+fn decode_handled_types(
+    types: &TypeRecovery<'_>,
+    handlers: &super::types::ExceptionHandlers,
+) -> Vec<Vec<String>> {
+    let mut rows = Vec::with_capacity(handlers.entries.len());
+    for row in types.array_elements(handlers.handled_types_ref) {
+        // Each row is itself an array of Type objects; a direct Type element
+        // (single-guard rows may flatten) still resolves through recover_type.
+        let mut names = types
+            .array_elements(row)
+            .iter()
+            .filter_map(|type_ref| {
+                types.recover_type(*type_ref).map(|recovered| recovered.display_name)
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            if let Some(recovered) = types.recover_type(row) {
+                names.push(recovered.display_name);
+            }
+        }
+        rows.push(names);
+    }
+    rows
 }
 
 fn decode_pc_descriptors(
