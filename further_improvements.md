@@ -398,6 +398,39 @@ rather than aspirational.
 
 ---
 
+
+*Status 2026-08-25 (evening wave): four more renderer/evidence items landed,
+each gated on the nine-variant evaluator (exit 0) — see commits
+`baa1584` (EC-1), `a90a560` (forwarders), `0bd266f` (EC-4/P7), `21b7bc8`
+(P4 remainder), plus the snapshot half of guard types in `c32a6b2`:
+
+- EC-1: code-source-map push_function/pop_function ranges decode into
+  `RecoveredInlineRegion`; statements inside render under named banners in
+  the host body ("Statements of e03StringSwitch …"), restoring bodies whose
+  standalone Code vanished. Probe: 16 attributed regions.
+- Dynamic-invocation forwarders (`dyn:<sel>` raw names) declare as real
+  `operator <sym>` members with a proven-selector evidence comment.
+  `relabel_dispatch_candidates` rewrites synthetic sub_* candidate labels
+  through the oracle offset->Function graph (zero hits on current fixtures:
+  every table slot already carries a snapshot label).
+- EC-4/P7: subtype-test-cache compare towers (low-confidence register vs
+  cid-constant chains whose leaves are empty or sub_* throw tails) collapse
+  to one explicit comment naming compared constants. Probe e17: five dead
+  branches -> one comment; genuine branches preserved.
+- P4 remainder: `_Future._asyncComplete(future, …)` calls in proven-async
+  bodies render as `await <future>;`. Probe e10: fabricated completer call
+  replaced by three await statements at suspension points.
+- Guard types: ExceptionHandlers.handled_types_data resolves into
+  `handled_types` per row and renders `on X catch` when populated.
+  Measured on the probe: both rows are emptied by the compiler (guards
+  proven, folded to catch_all) so bare catch remains correct there.
+
+Probe scoreboard deltas (arm64): while(true) fabrications 3 -> 1 (the
+survivor is e24Knot's genuinely unprovable do-while), await statements
+1 -> 3, attributed inlinee sections 0 -> 16, cid-tower comments 0 -> 2,
+generator banner 0 -> 1. An exact-bound schema-5 oracle document for the
+probe APK now exists at target/oracle-arm64/probe-v5.vm.json.
+
 ## 4. Explicitly rejected directions (with reasons)
 
 - **LLM-assisted naming as anything other than speculative** — already pinned
