@@ -255,7 +255,7 @@ pub(crate) fn structure_body(
             }
         }
     }
-    let root = StructureNode::Block(root_pieces);
+    let root = demote_cid_compare_towers(StructureNode::Block(root_pieces), statements);
     let _ = total_blocks;
     StructuredBody {
         root,
@@ -826,6 +826,117 @@ fn demote_empty_low_confidence_branch(
     StructureNode::UnresolvedPredicate(condition)
 }
 
+
+/// Subtype-test cache dispatch compiles to towers of low-confidence register
+/// compares against class-id integers (`x4 <= 55`, `x4 == 2046`, …) whose only
+/// descendants are more such compares (probe EC-4 / E17). No source control
+/// flow exists there; a tower whose every leaf is empty collapses into a
+/// single explicit comment naming the compared constants.
+fn demote_cid_compare_towers(
+    node: StructureNode,
+    statements: &[SemanticStatement],
+) -> StructureNode {
+    fn cid_constants(condition: &str, confidence: EvidenceConfidence) -> Option<String> {
+        if confidence != EvidenceConfidence::Low {
+            return None;
+        }
+        let compact = condition.replace(' ', "");
+        // Shape gate: `<register-token><compare><integer>` — the register
+        // token leads, an operator follows, and the trailing digit run is the
+        // compared constant. Anything else (masks, field offsets) stays.
+        let digits_start = compact.rfind(|c: char| !c.is_ascii_digit())? + 1;
+        let digits = &compact[digits_start..];
+        if digits.is_empty() {
+            return None;
+        }
+        let head = &compact[..compact.len() - digits.len()];
+        (head.contains('=') || head.contains('<') || head.contains('>'))
+            .then(|| {
+                let register = head.trim_end_matches(|c: char| !c.is_ascii_alphabetic());
+                format!("{} {}", register, digits)
+            })
+            .filter(|label| label.split(' ').next().is_some_and(|token| !token.is_empty()))
+    }
+
+    fn tower_collapsed(
+        node: &StructureNode,
+        collected: &mut Vec<String>,
+        statements: &[SemanticStatement],
+    ) -> bool {
+        match node {
+            StructureNode::UnresolvedPredicate(text) => {
+                if let Some(inner) = text
+                    .strip_prefix("subtype-test cache dispatch (compared cid constants: ")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                {
+                    collected.push(inner.to_owned());
+                    true
+                } else {
+                    false
+                }
+            }
+            // A linear run whose every statement is an unresolved synthetic
+            // call is the runtime throw/unreachable tail of a failed cache
+            // probe — machine semantics, not source content.
+            StructureNode::Linear(indices) => indices.iter().all(|index| {
+                match statements.get(*index) {
+                    None => true,
+                    Some(SemanticStatement::ResolvedCall { target, .. }) => {
+                        target.starts_with("sub_")
+                    }
+                    _ => false,
+                }
+            }),
+            StructureNode::Block(children) => children
+                .iter()
+                .all(|child| tower_collapsed(child, collected, statements)),
+            _ => false,
+        }
+    }
+
+    match node {
+        StructureNode::If {
+            condition,
+            confidence,
+            then_body,
+            else_body,
+        } => {
+            let demoted_then =
+                demote_cid_compare_towers(*then_body, statements);
+            let demoted_else = else_body
+                .map(|body| Box::new(demote_cid_compare_towers(*body, statements)));
+            if let Some(constants) = cid_constants(&condition, confidence) {
+                let mut collected = vec![constants];
+                let then_collapsed =
+                    tower_collapsed(&demoted_then, &mut collected, statements);
+                let else_collapsed = demoted_else
+                    .as_deref()
+                    .map(|body| tower_collapsed(body, &mut collected, statements))
+                    .unwrap_or(true);
+                if then_collapsed && else_collapsed {
+                    return StructureNode::UnresolvedPredicate(format!(
+                        "subtype-test cache dispatch (compared cid constants: {})",
+                        collected.join(", ")
+                    ));
+                }
+            }
+            StructureNode::If {
+                condition,
+                confidence,
+                then_body: Box::new(demoted_then),
+                else_body: demoted_else,
+            }
+        }
+        StructureNode::Block(children) => StructureNode::Block(
+            children.into_iter().map(|child| demote_cid_compare_towers(child, statements)).collect(),
+        ),
+        StructureNode::CatchHandler(body) => {
+            StructureNode::CatchHandler(Box::new(demote_cid_compare_towers(*body, statements)))
+        }
+        other => other,
+    }
+}
+
 fn dominates(cfg: &Cfg, dominator: u64, candidate: u64) -> bool {
     cfg.dominators
         .get(&candidate)
@@ -1163,5 +1274,50 @@ mod tests {
             }
         }
         assert_eq!(count_loops(&structured.root), 0);
+    }
+
+    #[test]
+    fn demotes_cid_compare_towers_to_single_comment() {
+        use super::demote_cid_compare_towers;
+        let shell = |condition: &str, then_body: StructureNode, else_body: Option<StructureNode>| {
+            StructureNode::If {
+                condition: condition.to_owned(),
+                confidence: EvidenceConfidence::Low,
+                then_body: Box::new(then_body),
+                else_body: else_body.map(Box::new),
+            }
+        };
+        let tower = shell(
+            "x4 <= 55",
+            StructureNode::Block(Vec::new()),
+            Some(shell(
+                "x4 == 2046",
+                StructureNode::Block(Vec::new()),
+                Some(shell(
+                    "x4 == 2105",
+                    StructureNode::Block(Vec::new()),
+                    Some(StructureNode::Block(Vec::new())),
+                )),
+            )),
+        );
+        let statements: Vec<SemanticStatement> = Vec::new();
+        let demoted = demote_cid_compare_towers(tower, &statements);
+        match &demoted {
+            StructureNode::UnresolvedPredicate(text) => {
+                assert!(text.contains("2046"), "missing 2046: {text}");
+                assert!(text.contains("2105"), "missing 2105: {text}");
+            }
+            other => panic!("tower not collapsed: {other:?}"),
+        }
+        // A tower whose arm carries real statements stays an `if`.
+        let with_content = shell(
+            "x4 <= 55",
+            StructureNode::Block(vec![StructureNode::Return(0)]),
+            None,
+        );
+        assert!(matches!(
+            demote_cid_compare_towers(with_content, &statements),
+            StructureNode::If { .. }
+        ));
     }
 }
