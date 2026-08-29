@@ -355,19 +355,9 @@ pub fn resolve(
         .iter()
         .map(|range| range.owner_ref)
         .collect::<std::collections::BTreeSet<_>>();
-    let object_pool_labels = isolate
-        .object_pools
-        .first()
-        .map(|pool| {
-            object_pool_labels(
-                isolate,
-                &names,
-                &types,
-                pool,
-                options.obfuscation_map,
-                cids,
-            )
-        });
+    let object_pool_labels = isolate.object_pools.first().map(|pool| {
+        object_pool_labels(isolate, &names, &types, pool, options.obfuscation_map, cids)
+    });
     let dispatch_target_labels = isolate
         .dispatch_table_code_indices
         .iter()
@@ -380,6 +370,13 @@ pub fn resolve(
     let dispatch_class_ids = class_ids(isolate);
     let dispatch_table = recover_dispatch_table(options.abi, isolate, table, image, &symbols);
     let closure_parents = recover_closure_parents(isolate, cids);
+    let (dispatch_cid_to_name, dispatch_name_to_cids, dispatch_qualified_to_cids, dispatch_super_cids) =
+        build_dispatch_class_maps(
+            isolate,
+            &names,
+            cids,
+            options.obfuscation_map,
+        );
     let context = FunctionRecoveryContext {
         abi: options.abi,
         isolate,
@@ -393,6 +390,10 @@ pub fn resolve(
         object_pool_labels: object_pool_labels.as_deref(),
         dispatch_target_labels: &dispatch_target_labels,
         dispatch_class_ids: &dispatch_class_ids,
+        dispatch_cid_to_name: &dispatch_cid_to_name,
+        dispatch_name_to_cids: &dispatch_name_to_cids,
+        dispatch_qualified_to_cids: &dispatch_qualified_to_cids,
+        dispatch_super_cids: &dispatch_super_cids,
         initializer_fields: &initializer_fields,
         table,
         static_bit: calibrate_static_bit(&names, isolate, cids),
@@ -453,6 +454,10 @@ struct FunctionRecoveryContext<'a> {
     object_pool_labels: Option<&'a [String]>,
     dispatch_target_labels: &'a [Option<String>],
     dispatch_class_ids: &'a [usize],
+    dispatch_cid_to_name: &'a BTreeMap<usize, String>,
+    dispatch_name_to_cids: &'a BTreeMap<String, Vec<usize>>,
+    dispatch_qualified_to_cids: &'a BTreeMap<(Option<String>, String), Vec<usize>>,
+    dispatch_super_cids: &'a BTreeMap<usize, usize>,
     initializer_fields: &'a BTreeMap<i32, i32>,
     table: &'a InstructionTable,
     static_bit: Option<u32>,
@@ -576,6 +581,139 @@ fn calibrate_static_bit(_names: &Names<'_>, isolate: &ParseResult, cids: &Cids) 
     Some(valid[0])
 }
 
+/// Builds dispatch-table class-id maps for receiver-proven virtual-call
+/// narrowing.
+///
+/// `cid -> name` is one-to-one (class id unique).  `name -> cids` is
+/// one-to-many because obfuscation reuses single-letter names across
+/// libraries, as does the `qualified -> cids` map which distinguishes those
+/// collisions when the proven receiver carries a library URI.  `super_cids`
+/// is the direct super-class edge `child -> super` read from the Class
+/// object's reference payload at snapshot position 2 when it decodes to a
+/// class id (Dart version tagging pushes the slot but the super slot stays
+/// the second reference in every isolate we support: Dart 3.4 through 3.12).
+fn build_dispatch_class_maps(
+    isolate: &ParseResult,
+    names: &Names<'_>,
+    cids: &Cids,
+    obfuscation_map: Option<&crate::analysis::LoadedObfuscationMap>,
+) -> (
+    BTreeMap<usize, String>,
+    BTreeMap<String, Vec<usize>>,
+    BTreeMap<(Option<String>, String), Vec<usize>>,
+    BTreeMap<usize, usize>,
+) {
+    let mut cid_to_name: BTreeMap<usize, String> = BTreeMap::new();
+    let mut cid_to_library: BTreeMap<usize, Option<String>> = BTreeMap::new();
+    let mut super_cids: BTreeMap<usize, usize> = BTreeMap::new();
+
+    for snapshot in [isolate] {
+        for (reference, named) in &snapshot.named {
+            if named.cid != cids.class {
+                continue;
+            }
+            let Some(object) = snapshot.object(*reference) else {
+                continue;
+            };
+            let Some(crate::snapshot::cluster::types::SnapshotScalar::Tagged32(raw_cid)) =
+                snapshot.scalars_of(object).first()
+            else {
+                continue;
+            };
+            let Ok(class_id) = usize::try_from(*raw_cid) else {
+                continue;
+            };
+            let raw_name = names.name(*reference);
+            if raw_name.is_empty() {
+                continue;
+            }
+            let name = restore_snapshot_name(&raw_name, obfuscation_map);
+            if name.is_empty() {
+                continue;
+            }
+            cid_to_name.entry(class_id).or_insert_with(|| name.clone());
+            let raw_lib = names.library_uri(*reference);
+            let lib = restore_library_uri(raw_lib, obfuscation_map);
+            cid_to_library
+                .entry(class_id)
+                .or_insert_with(|| lib.clone());
+
+            // Try to read super class link: Class object keeps super_type
+            // ClassId in its second reference slot; when that reference points
+            // at a Class, that class's own class_id is the super's id.
+            // This heuristic matches the layout validated on the
+            // obf-raw-arm32 matrix (Dart 3.9).
+            let refs = snapshot.references_of(object);
+            if refs.len() >= 3 {
+                let super_ref = refs[1];
+                if super_ref >= 0 {
+                    if let Some(super_named) = snapshot.named.get(&super_ref) {
+                        if super_named.cid == cids.class {
+                            if let Some(super_object) = snapshot.object(super_ref) {
+                                if let Some(crate::snapshot::cluster::types::SnapshotScalar::Tagged32(sid)) =
+                                    snapshot.scalars_of(super_object).first()
+                                {
+                                    if let Ok(super_id) = usize::try_from(*sid) {
+                                        if super_id != class_id {
+                                            super_cids.entry(class_id).or_insert(super_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(type_object) = snapshot.object(super_ref) {
+                        // Super is encoded as a Type at reference 1 when the
+                        // class is generic: follow one indirection to the
+                        // underlying class reference held in the Type's first
+                        // ref.  Best-effort: only record when we can prove a
+                        // single destination class.
+                        let trefs = snapshot.references_of(type_object);
+                        if let Some(&class_ref) = trefs.first() {
+                            if class_ref >= 0 {
+                                if let Some(cnamed) = snapshot.named.get(&class_ref) {
+                                    if cnamed.cid == cids.class {
+                                        if let Some(cobject) = snapshot.object(class_ref) {
+                                            if let Some(crate::snapshot::cluster::types::SnapshotScalar::Tagged32(sid)) =
+                                                snapshot.scalars_of(cobject).first()
+                                            {
+                                                if let Ok(super_id) = usize::try_from(*sid) {
+                                                    super_cids.entry(class_id).or_insert(super_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut name_to_cids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut qualified_to_cids: BTreeMap<(Option<String>, String), Vec<usize>> =
+        BTreeMap::new();
+    for (&cid, name) in &cid_to_name {
+        name_to_cids.entry(name.clone()).or_default().push(cid);
+        let lib = cid_to_library.get(&cid).cloned().unwrap_or(None);
+        qualified_to_cids
+            .entry((lib, name.clone()))
+            .or_default()
+            .push(cid);
+    }
+    for vec in name_to_cids.values_mut() {
+        vec.sort_unstable();
+        vec.dedup();
+    }
+    for vec in qualified_to_cids.values_mut() {
+        vec.sort_unstable();
+        vec.dedup();
+    }
+
+    (cid_to_name, name_to_cids, qualified_to_cids, super_cids)
+}
+
 fn recover_range(
     range: Range,
     context: &FunctionRecoveryContext<'_>,
@@ -629,6 +767,12 @@ fn recover_range(
     else {
         return Ok(None);
     };
+    let (receiver_class, receiver_library_uri): (Option<&str>, Option<&str>) =
+        if !is_static.unwrap_or(false) && !owner.is_empty() {
+            (Some(owner.as_str()), library_uri.as_deref())
+        } else {
+            (None, None)
+        };
     let disassembly = disassembler.analyze(
         address,
         bytes,
@@ -639,8 +783,14 @@ fn recover_range(
             origin_element: dispatch_origin(context.abi),
             targets: context.dispatch_target_labels,
             class_ids: context.dispatch_class_ids,
+            cid_to_name: Some(context.dispatch_cid_to_name),
+            name_to_cids: Some(context.dispatch_name_to_cids),
+            qualified_to_cids: Some(context.dispatch_qualified_to_cids),
+            super_cids: Some(context.dispatch_super_cids),
         })
         .filter(|analysis| !analysis.targets.is_empty() && !analysis.class_ids.is_empty()),
+        receiver_class,
+        receiver_library_uri,
     )?;
     let fallback = format!("sub_{:x}", range.pc_offset);
     let is_synthetic = function.is_empty();
@@ -716,10 +866,7 @@ fn recover_range(
             }
         }
         // A push without its pop still owns everything up to the body end.
-        if let Some(metadata_last_pc) = metadata
-            .code_source_map
-            .last()
-            .map(|entry| entry.pc_offset)
+        if let Some(metadata_last_pc) = metadata.code_source_map.last().map(|entry| entry.pc_offset)
         {
             for (start, reference, name, library_uri) in open_pushes.into_iter().rev() {
                 if metadata_last_pc > start {
@@ -797,13 +944,106 @@ fn recover_range(
         vm_evidence: None,
         address: format!("0x{address:x}"),
         size: range.size.into(),
-        code_metadata,
+        code_metadata: code_metadata.clone(),
+        source_bands: source_bands_from_metadata(
+            code_metadata.as_ref(),
+            address,
+            &disassembly.semantic_statements,
+        ),
         machine_code: disassembly.evidence,
         instructions: disassembly.instructions,
         control_flow: disassembly.control_flow,
         semantic_statements: disassembly.semantic_statements,
         statements: disassembly.statements,
     }))
+}
+
+/// Builds the statement-address → source-line band map from the body's
+/// decoded CodeSourceMap. Only root-depth (inline_depth == 0) position rows
+/// define bands for this body's own statements; inlinee ranges belong to the
+/// inlinee and are surfaced separately (EC-1). Statements before the first
+/// positioned range carry no band.
+pub(crate) fn source_bands_from_metadata(
+    metadata: Option<&crate::model::RecoveredCodeMetadata>,
+    function_address: u64,
+    statements: &[crate::model::SemanticStatement],
+) -> BTreeMap<String, i64> {
+    let Some(metadata) = metadata else {
+        return BTreeMap::new();
+    };
+    let mut bands = BTreeMap::new();
+    // Root-depth bands plus inlinee exclusion ranges. A `change_position` at
+    // depth > 0 starts an inlinee range; root banding resumes only at the
+    // next root-depth position row, so statements folded from an inlinee are
+    // never attributed to a host source line.
+    let mut positioned: Vec<(u32, i64)> = Vec::new();
+    let mut inline_ranges: Vec<(u32, u32)> = Vec::new();
+    let mut current_line = None;
+    let mut inline_start: Option<u32> = None;
+    for entry in &metadata.code_source_map {
+        if let Some(line) = entry.source_line {
+            if entry.inline_depth == 0 {
+                if let Some(start) = inline_start.take() {
+                    inline_ranges.push((start, entry.pc_offset));
+                }
+                current_line = Some(line);
+                // A root position row defines its own band start.
+                positioned.push((entry.pc_offset, line));
+            } else if inline_start.is_none() {
+                inline_start = Some(entry.pc_offset);
+            }
+            continue;
+        }
+        match entry.operation {
+            crate::model::CodeSourceMapOperation::PushFunction => {
+                if inline_start.is_none() && entry.inline_depth > 0 {
+                    inline_start = Some(entry.pc_offset);
+                }
+            }
+            crate::model::CodeSourceMapOperation::PopFunction => {
+                if let Some(start) = inline_start.take() {
+                    inline_ranges.push((start, entry.pc_offset));
+                }
+            }
+            _ => {}
+        }
+        if let Some(line) = current_line.filter(|_| inline_start.is_none()) {
+            positioned.push((entry.pc_offset, line));
+        }
+    }
+    if let Some(start) = inline_start.take() {
+        inline_ranges.push((start, u32::MAX));
+    }
+    if positioned.is_empty() {
+        return bands;
+    }
+    for statement in statements {
+        let Some(address) =
+            crate::analysis::disassembly::parse_immediate_public(statement.address())
+        else {
+            continue;
+        };
+        let Some(pc_offset) = address.checked_sub(function_address) else {
+            continue;
+        };
+        let pc_offset = u32::try_from(pc_offset).unwrap_or(u32::MAX);
+        let inside_inlinee = inline_ranges
+            .iter()
+            .any(|(start, end)| *start <= pc_offset && pc_offset < *end);
+        let line = (!inside_inlinee)
+            .then(|| {
+                positioned
+                    .iter()
+                    .filter(|(start, _)| *start <= pc_offset)
+                    .max_by_key(|(start, _)| *start)
+                    .map(|(_, line)| *line)
+            })
+            .flatten();
+        if let Some(line) = line {
+            bands.insert(statement.address().to_owned(), line);
+        }
+    }
+    bands
 }
 
 /// Links ownerless `init:<field>` functions back to their Field snapshot
@@ -1376,7 +1616,9 @@ fn decode_handled_types(
             .array_elements(row)
             .iter()
             .filter_map(|type_ref| {
-                types.recover_type(*type_ref).map(|recovered| recovered.display_name)
+                types
+                    .recover_type(*type_ref)
+                    .map(|recovered| recovered.display_name)
             })
             .collect::<Vec<_>>();
         if names.is_empty() {
@@ -1406,7 +1648,11 @@ fn decode_pc_descriptors(
         return Vec::new();
     };
     #[cfg(debug_assertions)]
-    eprintln!("DEBUG pcd bytes={} ref={:?}", bytes.len(), code.pc_descriptors_ref);
+    eprintln!(
+        "DEBUG pcd bytes={} ref={:?}",
+        bytes.len(),
+        code.pc_descriptors_ref
+    );
     let mut cursor = 0usize;
     let mut pc_offset = 0i64;
     let mut entries = Vec::new();
@@ -1834,7 +2080,7 @@ fn round_up(value: u64, alignment: u64) -> u64 {
 mod tests {
     use super::{
         Names, Range, assign_sizes, count_stack_map_entries, decode_code_source_map_bytes,
-        drop_implicit_call_prefix, library_ownership_is_obfuscated, lexical_parent,
+        drop_implicit_call_prefix, lexical_parent, library_ownership_is_obfuscated,
         nested_pool_strings, object_pool_labels, parse_table, recover_closure_parents,
         select_application_package,
     };
@@ -1902,8 +2148,20 @@ mod tests {
             scalars: Vec::new(),
             bytes: Vec::new(),
         };
-        snapshot.insert_object(22, cids.function, false, SnapshotObjectKind::Standard, function_payload(30));
-        snapshot.insert_object(24, cids.function, false, SnapshotObjectKind::Standard, function_payload(31));
+        snapshot.insert_object(
+            22,
+            cids.function,
+            false,
+            SnapshotObjectKind::Standard,
+            function_payload(30),
+        );
+        snapshot.insert_object(
+            24,
+            cids.function,
+            false,
+            SnapshotObjectKind::Standard,
+            function_payload(31),
+        );
 
         let parents = recover_closure_parents(&snapshot, &cids);
         assert_eq!(parents.get(&22), Some(&21));
@@ -2029,10 +2287,7 @@ mod tests {
 
     #[test]
     fn drops_implicit_dynamic_call_prefixes() {
-        assert_eq!(
-            drop_implicit_call_prefix("dyn:implicit:call"),
-            "dyn:call"
-        );
+        assert_eq!(drop_implicit_call_prefix("dyn:implicit:call"), "dyn:call");
         assert_eq!(drop_implicit_call_prefix("isEmpty"), "isEmpty");
     }
 
@@ -2231,5 +2486,120 @@ mod tests {
 
         let error = parse_table(&data, &header, 0, 8).unwrap_err();
         assert!(error.to_string().contains("2 retained entries"));
+    }
+
+    #[test]
+    fn source_bands_map_statement_addresses_to_root_depth_lines() {
+        fn empty_code_metadata() -> RecoveredCodeMetadata {
+            RecoveredCodeMetadata {
+                stack_map_offset: 0,
+                stack_map_payload_bytes: 0,
+                stack_map_entries: 0,
+                stack_map_uses_global_table: false,
+                stack_map_is_global_table: false,
+                payload_info: None,
+                unchecked_entry_offset: None,
+                has_monomorphic_entrypoint: false,
+                catch_entry_reference: None,
+                inlined_functions_reference: None,
+                pc_descriptors_reference: None,
+                pc_descriptors: Vec::new(),
+                code_source_map_reference: None,
+                code_source_map: Vec::new(),
+                exception_handlers_reference: None,
+                handled_types_reference: None,
+                handled_types: Vec::new(),
+                has_async_exception_handler: false,
+                exception_handlers: Vec::new(),
+                try_regions: Vec::new(),
+            }
+        }
+
+        use crate::model::{
+            CodeSourceMapEntry, CodeSourceMapOperation, EvidenceConfidence, RecoveredCodeMetadata,
+            SemanticStatement,
+        };
+        // CSM: line 10 from pc 8; inlinee (depth 1) rows must not define
+        // bands for the host body; line 12 from pc 40.
+        let mut metadata = empty_code_metadata();
+        metadata.code_source_map = vec![
+            CodeSourceMapEntry {
+                pc_offset: 0,
+                operation: CodeSourceMapOperation::ChangePosition,
+                argument: 0,
+                inline_depth: 0,
+                source_line: None,
+                function_reference: None,
+            },
+            CodeSourceMapEntry {
+                pc_offset: 8,
+                operation: CodeSourceMapOperation::ChangePosition,
+                argument: 10,
+                inline_depth: 0,
+                source_line: Some(10),
+                function_reference: None,
+            },
+            CodeSourceMapEntry {
+                pc_offset: 24,
+                operation: CodeSourceMapOperation::ChangePosition,
+                argument: 0,
+                inline_depth: 1,
+                source_line: Some(99),
+                function_reference: Some(7),
+            },
+            CodeSourceMapEntry {
+                pc_offset: 40,
+                operation: CodeSourceMapOperation::ChangePosition,
+                argument: 2,
+                inline_depth: 0,
+                source_line: Some(12),
+                function_reference: None,
+            },
+        ];
+        let base = 0x1000u64;
+        let statements = vec![
+            SemanticStatement::Return {
+                expression: "x".to_owned(),
+                confidence: EvidenceConfidence::Low,
+                address: format!("0x{:x}", base + 4),
+            },
+            SemanticStatement::ResolvedCall {
+                target: "h".to_owned(),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: format!("0x{:x}", base + 12),
+            },
+            SemanticStatement::ResolvedCall {
+                target: "f".to_owned(),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: format!("0x{:x}", base + 16), // inside inlinee range -> no root band
+            },
+            SemanticStatement::ResolvedCall {
+                target: "inlined".to_owned(),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: format!("0x{:x}", base + 28),
+            },
+            SemanticStatement::ResolvedCall {
+                target: "g".to_owned(),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: format!("0x{:x}", base + 44),
+            },
+        ];
+        let bands = super::source_bands_from_metadata(Some(&metadata), base, &statements);
+        assert_eq!(
+            bands.get(&format!("0x{:x}", base + 4)),
+            None,
+            "statements before the first positioned range carry no band"
+        );
+        assert_eq!(bands.get(&format!("0x{:x}", base + 12)), Some(&10));
+        assert_eq!(
+            bands.get(&format!("0x{:x}", base + 28)),
+            None,
+            "rows inside an inlinee range never band the host body"
+        );
+        assert_eq!(bands.get(&format!("0x{:x}", base + 44)), Some(&12));
     }
 }

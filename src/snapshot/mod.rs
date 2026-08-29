@@ -10,6 +10,7 @@ use crate::elf::ElfImage;
 use crate::model::{ProfileMatch, SnapshotInfo};
 
 pub use cluster::recover_functions;
+pub(crate) use cluster::source_bands_from_metadata;
 pub use image::CodeImage;
 
 pub fn inspect(elf: &ElfImage<'_>, libflutter: Option<&[u8]>) -> Result<SnapshotInfo> {

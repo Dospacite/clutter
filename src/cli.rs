@@ -33,6 +33,8 @@ enum Command {
     VmOracle(VmOracleArgs),
     /// Validate a runtime-trace document and print its refinement profile.
     Trace(TraceArgs),
+    /// Match functions to a known-framework reference by exact normalized bodies.
+    Match(MatchArgs),
     Version(VersionArgs),
 }
 
@@ -109,6 +111,19 @@ struct TraceArgs {
 }
 
 #[derive(Args)]
+struct MatchArgs {
+    /// Target decompilation's ir/program.json.
+    target: PathBuf,
+
+    /// Unobfuscated matching-build reference ir/program.json.
+    reference: PathBuf,
+
+    /// Write the JSON report here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct VmOracleArgs {
     input: PathBuf,
 
@@ -150,8 +165,20 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Decompile(arguments) => decompile(arguments),
         Command::VmOracle(arguments) => vm_oracle(arguments),
         Command::Trace(arguments) => trace(arguments),
+        Command::Match(arguments) => fingerprint_match(arguments),
         Command::Version(arguments) => version(arguments),
     }
+}
+
+fn fingerprint_match(arguments: MatchArgs) -> Result<()> {
+    let report = crate::fingerprint::match_programs(&arguments.target, &arguments.reference)?;
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = arguments.out {
+        fs::write(&path, format!("{json}\n")).at(&path)?;
+    } else {
+        println!("{json}");
+    }
+    Ok(())
 }
 
 fn inspect(arguments: InspectArgs) -> Result<()> {
@@ -487,8 +514,14 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
     let signature_results = crate::evidence::signature_solver::solve(&mut problems);
     program.signature_solutions = Some(signature_results);
 
+    let mut stub_cleanup = None;
     if let Some(oracle) = vm_oracle {
-        crate::vm_oracle::attach(&mut program, oracle, &snapshot, payload.abi)?;
+        stub_cleanup = Some(crate::vm_oracle::attach(
+            &mut program,
+            oracle,
+            &snapshot,
+            payload.abi,
+        )?);
     }
     analysis::relink_calls(&mut program);
     analysis::enrich_semantics(
@@ -497,6 +530,12 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         &full_declarations,
         &all_snapshot_functions,
     );
+    // Runs after the final relift: enrichment rebuilds semantic statements
+    // from machine code, so compiler-inserted stub calls must be classified
+    // against the statements that actually reach the renderer.
+    if let Some(cleanup) = stub_cleanup {
+        cleanup.apply(&mut program);
+    }
     if !vm_oracle_present {
         analysis::derive_import_graph(&mut program);
     }

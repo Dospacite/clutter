@@ -18,6 +18,15 @@ script_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 sdk_root="$work_root/sdk"
 depot_tools_root="$work_root/depot_tools"
 patch_path="$script_root/dart-sdk-3.11.4.patch"
+# The analyzer patch is revision-coupled: upstream moves the arch gates
+# between releases. `CLUTTER_ANALYZER_PATCH` forces a specific variant;
+# otherwise the correct one is probed against the checkout further below.
+if [[ -n "${CLUTTER_ANALYZER_PATCH:-}" ]]; then
+  patch_path=$(realpath "$CLUTTER_ANALYZER_PATCH")
+  patch_pinned=true
+else
+  patch_pinned=false
+fi
 
 if [[ ! -d "$dart_sdk_source/.git" ]]; then
   echo "not a Dart SDK git checkout: $dart_sdk_source" >&2
@@ -65,6 +74,28 @@ else
     git -C "$sdk_root" checkout --detach "$dart_commit"
   fi
 fi
+
+# Select the analyzer patch that matches this revision. Probing the actual
+# checkout is the only reliable test: the gates the patch edits move between
+# Dart releases, so a name-based guess silently produces reject files.
+if [[ "$patch_pinned" != true ]]; then
+  selected_patch=""
+  for candidate in "$script_root"/dart-sdk-*.patch; do
+    [[ -e "$candidate" ]] || continue
+    if git -C "$sdk_root" apply --check "$candidate" 2>/dev/null ||
+      git -C "$sdk_root" apply --check --reverse "$candidate" 2>/dev/null; then
+      selected_patch="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$selected_patch" ]]; then
+    echo "no analyzer patch in $script_root applies to commit $dart_commit" >&2
+    echo "re-cut a patch for this revision or set CLUTTER_ANALYZER_PATCH" >&2
+    exit 3
+  fi
+  patch_path="$selected_patch"
+fi
+echo "using analyzer patch: $(basename "$patch_path")"
 
 tools_ready=true
 for tool in \

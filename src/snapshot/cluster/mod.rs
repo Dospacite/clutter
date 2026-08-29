@@ -17,6 +17,8 @@ mod transduce;
 mod type_recovery;
 mod types;
 
+pub(crate) use instructions::source_bands_from_metadata;
+
 use crate::diagnostic::{ClutterError, Result};
 use crate::model::{
     Abi, RecoveredDeclaration, RecoveredFunction, RecoveredString, Scope, SnapshotEvidence,

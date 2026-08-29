@@ -77,6 +77,18 @@ pub struct DispatchTableAnalysis<'a> {
     pub origin_element: usize,
     pub targets: &'a [Option<String>],
     pub class_ids: &'a [usize],
+    pub cid_to_name: Option<&'a BTreeMap<usize, String>>,
+    pub name_to_cids: Option<&'a BTreeMap<String, Vec<usize>>>,
+    /// Qualified `(library_uri, class_name) -> cids` for library-sensitive
+    /// lookup. When an expression carries a library URI the qualified map is
+    /// consulted first; on miss the name-only map remains the fallback.
+    pub qualified_to_cids:
+        Option<&'a BTreeMap<(Option<String>, String), Vec<usize>>>,
+    /// Direct super-class link `child_cid -> super_cid` derived from
+    /// `TypeRecovery::class_metadata` super_type. Used to walk the chain
+    /// when a precise receiver is known but the selector has no direct slot
+    /// for that cid (rare synthetic gaps).
+    pub super_cids: Option<&'a BTreeMap<usize, usize>>,
 }
 
 pub struct Disassembly {
@@ -199,10 +211,7 @@ fn decode_arm32_vfp_fallback(bytes: &[u8]) -> Option<(String, String)> {
             _ => None,
         };
         if let Some(name) = name {
-            return Some((
-                conditional_mnemonic(name, condition),
-                format!("d{d}, d{m}"),
-            ));
+            return Some((conditional_mnemonic(name, condition), format!("d{d}, d{m}")));
         }
     }
     None
@@ -217,16 +226,18 @@ fn conditional_mnemonic(base: &str, condition: u32) -> String {
         base.to_owned()
     } else {
         static CONDITIONS: [&str; 15] = [
-            "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge",
-            "lt", "gt", "le", "al",
+            "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le",
+            "al",
         ];
-        match usize::try_from(condition).ok().and_then(|index| CONDITIONS.get(index)) {
+        match usize::try_from(condition)
+            .ok()
+            .and_then(|index| CONDITIONS.get(index))
+        {
             Some(suffix) => format!("{base}{suffix}"),
             None => base.to_owned(),
         }
     }
 }
-
 
 impl Disassembler {
     pub fn new(abi: Abi) -> Result<Self> {
@@ -262,6 +273,8 @@ impl Disassembler {
         parameter_count: Option<usize>,
         object_pool: Option<&[String]>,
         dispatch_table: Option<&DispatchTableAnalysis<'_>>,
+        receiver_class: Option<&str>,
+        receiver_library_uri: Option<&str>,
     ) -> Result<Disassembly> {
         let instructions = self
             .capstone
@@ -367,8 +380,7 @@ impl Disassembler {
                 });
             } else if is_call(mnemonic) {
                 evidence.indirect_calls += 1;
-                let called_entry =
-                    pool_registers.get(&normalize_register(operands)).cloned();
+                let called_entry = pool_registers.get(&normalize_register(operands)).cloned();
                 // Switchable-call shapes (SingleTarget/IC/megamorphic) load
                 // the stub entry into the call register while the paired
                 // UnlinkedCall selector — carrying the dynamic-call name —
@@ -380,9 +392,7 @@ impl Disassembler {
                     .find(|(_, label)| label.starts_with("dynamicCall(\""))
                     .cloned();
                 let resolved = match called_entry {
-                    Some((index, target)) if is_named_pool_target(&target) => {
-                        Some((index, target))
-                    }
+                    Some((index, target)) if is_named_pool_target(&target) => Some((index, target)),
                     // Stub entry missing or opaque: a live dynamicCall
                     // selector identifies the paired switchable-call site.
                     _ => selector_slot,
@@ -454,9 +464,14 @@ impl Disassembler {
         evidence.control_flow_edges = control_flow.len();
         evidence.reachable_basic_blocks =
             reachable_block_count(address, &control_flow, &block_starts);
-        if let Some(dispatch_table) = dispatch_table {
-            let dispatch_calls = recover_dispatch_calls(self.abi, &decoded, dispatch_table);
-            evidence.dispatch_table_calls = dispatch_calls.len();
+        let dispatch_cache = dispatch_table.map(|table| {
+            (
+                table,
+                recover_dispatch_calls(self.abi, &decoded, table),
+            )
+        });
+        if let Some((table, calls)) = dispatch_cache.as_ref() {
+            evidence.dispatch_table_calls = calls.len();
             // A selector family does not prove the receiver's runtime class.
             // Exact resolution stays zero until class-ID data flow identifies
             // one concrete table slot.
@@ -472,7 +487,7 @@ impl Disassembler {
                 let Some(call_address) = parse_immediate(address) else {
                     continue;
                 };
-                let Some(call) = dispatch_calls.get(&call_address) else {
+                let Some(call) = calls.get(&call_address) else {
                     continue;
                 };
                 *statement = PseudoStatement::DispatchTableCall {
@@ -485,16 +500,70 @@ impl Disassembler {
                     raw_slot_target_count: call.raw_slot_target_count,
                 };
             }
+        } else {
+            // Ensure dispatch counters are zero when table absent.
+            evidence.dispatch_table_calls = 0;
+            evidence.resolved_dispatch_table_calls = 0;
         }
-        let semantic_statements = lift_semantics(
-            self.abi,
-            parameter_count,
-            &decoded,
-            &block_starts,
-            symbols,
-            object_pool,
-        );
+        let semantic_statements = {
+            let parameter_hints = (0..parameter_count.unwrap_or_default())
+                .map(|index| {
+                    let is_this = index == 0 && receiver_class.is_some();
+                    ParameterHint {
+                        name: format!("arg{index}"),
+                        class_name: if is_this {
+                            receiver_class.map(|s| s.to_owned())
+                        } else {
+                            None
+                        },
+                        class_library_uri: if is_this {
+                            receiver_library_uri.map(|s| s.to_owned())
+                        } else {
+                            None
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let (dispatch_table_ref, dispatch_calls_ref) = match &dispatch_cache {
+                Some((table, calls)) => (Some(*table), Some(calls)),
+                None => (None, None),
+            };
+            lift_semantics_with_names(
+                self.abi,
+                &parameter_hints,
+                &decoded,
+                &block_starts,
+                symbols,
+                object_pool,
+                None,
+                None,
+                dispatch_table_ref,
+                dispatch_calls_ref,
+            )
+        };
         evidence.semantic_statements = semantic_statements.len();
+        // Update resolved dispatch counter from receiver-proven semantics
+        // (P1).  Before this pass `resolved_dispatch_table_calls` was always 0
+        // because no dispatch call was ever proven.
+        if let Some((_, calls)) = dispatch_cache.as_ref() {
+            let resolved = semantic_statements
+                .iter()
+                .filter(|stmt| match stmt {
+                    crate::model::SemanticStatement::ResolvedCall { address, .. } => {
+                        let addr = address
+                            .trim_start_matches("0x")
+                            .trim_start_matches("0X");
+                        if let Ok(v) = u64::from_str_radix(addr, 16) {
+                            calls.contains_key(&v)
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                })
+                .count();
+            evidence.resolved_dispatch_table_calls = resolved;
+        }
         if consumed < bytes.len() {
             statements.push(PseudoStatement::UnknownOperation {
                 address: format!("0x{:x}", address + consumed as u64),
@@ -575,6 +644,8 @@ pub(crate) fn relift_semantics(
         object_pool.as_deref(),
         field_layout,
         receiver_class,
+        None,
+        None,
     )
 }
 
@@ -1237,7 +1308,9 @@ fn infer_dispatch_selector(raw_targets: &[String]) -> (Option<String>, Vec<Strin
         let readable_impls = implementations
             .iter()
             .filter(|target| {
-                let member = target.rsplit_once('.').map_or(target.as_str(), |(_, name)| name);
+                let member = target
+                    .rsplit_once('.')
+                    .map_or(target.as_str(), |(_, name)| name);
                 !member.starts_with("sub_")
                     && !member.starts_with("_iso_stub_")
                     && !member.starts_with("stub_")
@@ -2603,6 +2676,8 @@ fn lift_semantics(
         object_pool,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -2616,6 +2691,8 @@ fn lift_semantics_with_names(
     object_pool: Option<&[String]>,
     field_layout: Option<&RecoveredFieldLayout>,
     receiver_class: Option<(&str, Option<&str>)>,
+    dispatch_table: Option<&DispatchTableAnalysis<'_>>,
+    dispatch_calls: Option<&std::collections::BTreeMap<u64, DispatchCallEvidence>>,
 ) -> Vec<SemanticStatement> {
     let fused = fuse_machine_idioms(abi, instructions, symbols);
     let pool_loads = recover_object_pool_loads(abi, &fused);
@@ -2689,6 +2766,8 @@ fn lift_semantics_with_names(
             &pool_loads,
             field_layout,
             Some(&mut statements),
+            dispatch_table,
+            dispatch_calls,
         );
     }
     statements
@@ -2946,6 +3025,8 @@ fn solve_block_states(
             pool_loads,
             field_layout,
             None,
+            None,
+            None,
         );
         let changed = outputs[index].as_ref() != Some(&working);
         inputs[index] = Some(input);
@@ -3024,6 +3105,8 @@ fn simulate_range(
     pool_loads: &BTreeMap<u64, usize>,
     field_layout: Option<&RecoveredFieldLayout>,
     mut emit: Option<&mut Vec<SemanticStatement>>,
+    dispatch_table: Option<&DispatchTableAnalysis<'_>>,
+    dispatch_calls: Option<&std::collections::BTreeMap<u64, DispatchCallEvidence>>,
 ) {
     let return_register = abi_return_register(abi);
     let begin = range.as_ref().map_or(0, |range| range.start);
@@ -4012,9 +4095,7 @@ fn simulate_range(
             // Both operands and the destination live in the same dN register
             // file, so this mirrors the integer binary-expression path with
             // `double` result provenance.
-            "vadd.f64" | "vsub.f64" | "vmul.f64" | "vdiv.f64"
-                if operands.len() >= 3 =>
-            {
+            "vadd.f64" | "vsub.f64" | "vmul.f64" | "vdiv.f64" if operands.len() >= 3 => {
                 let target = normalize_register(&operands[0]);
                 let operator = match instruction.mnemonic.as_str() {
                     "vadd.f64" => "+",
@@ -4332,39 +4413,124 @@ fn simulate_range(
                 );
             }
             mnemonic if is_call(mnemonic) => {
-                let target = operands
-                    .first()
-                    .and_then(|operand| resolve_expression(operand, registers, object_pool))
-                    .filter(|target| is_named_pool_target(&target.text));
-                let arguments = collect_call_arguments(
-                    abi,
-                    registers,
-                    &state.outgoing,
-                    state.written_argument_registers,
-                );
-                kill_caller_saved(abi, registers);
-                state.outgoing.clear();
-                buffers.retain(|key, _| key.starts_with("stk:"));
-                aliases.clear();
-                last_comparison = None;
-                if let Some(target) = target {
+                // --- P1 receiver-proven virtual dispatch (class-ID dataflow) ---
+                let dispatch_resolved: Option<String> =
+                    if let (Some(table), Some(calls)) = (dispatch_table, dispatch_calls) {
+                        if let Some(call) = calls.get(&instruction.address) {
+                            resolve_dispatch_via_receiver(
+                                table,
+                                call.selector_offset,
+                                registers,
+                                abi,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(target_text) = dispatch_resolved {
+                    let arguments = collect_call_arguments(
+                        abi,
+                        registers,
+                        &state.outgoing,
+                        state.written_argument_registers,
+                    );
+                    kill_caller_saved(abi, registers);
+                    state.outgoing.clear();
+                    buffers.retain(|key, _| key.starts_with("stk:"));
+                    aliases.clear();
+                    last_comparison = None;
                     push_statement!(SemanticStatement::ResolvedCall {
-                        target: target.text.clone(),
+                        target: target_text.clone(),
                         arguments,
-                        confidence: EvidenceConfidence::Medium,
+                        confidence: EvidenceConfidence::High,
                         address: format!("0x{:x}", instruction.address),
                     });
                     registers.insert(
                         return_register.to_owned(),
                         Expression {
-                            text: format!("{}_result", sanitize_semantic_name(&target.text)),
+                            text: format!("{}_result", sanitize_semantic_name(&target_text)),
                             confidence: EvidenceConfidence::Low,
                             complexity: 1,
-                            class_name: result_class_from_target(&target.text),
+                            class_name: result_class_from_target(&target_text),
                             class_library_uri: None,
                             raw: false,
                         },
                     );
+                } else {
+                    let target = operands
+                        .first()
+                        .and_then(|operand| resolve_expression(operand, registers, object_pool))
+                        .filter(|target| is_named_pool_target(&target.text));
+                    // IC / megamorphic fallback (P1): when the call used a
+                    // `dynamicCall("foo")` selector slot and the pool target is
+                    // opaque, try receiver-proven method lookup via the global
+                    // symbol table.  This narrows `call(dynamicCall)` sites that
+                    // dispatch through the IC stub.
+                    let ic_resolved: Option<String> = if target.is_none() {
+                        if let Some(selector) = find_ic_selector(registers) {
+                            resolve_ic_target_via_receiver(
+                                &selector,
+                                registers,
+                                abi,
+                                symbols,
+                                dispatch_table,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let arguments = collect_call_arguments(
+                        abi,
+                        registers,
+                        &state.outgoing,
+                        state.written_argument_registers,
+                    );
+                    kill_caller_saved(abi, registers);
+                    state.outgoing.clear();
+                    buffers.retain(|key, _| key.starts_with("stk:"));
+                    aliases.clear();
+                    last_comparison = None;
+                    if let Some(ic_target) = ic_resolved {
+                        push_statement!(SemanticStatement::ResolvedCall {
+                            target: ic_target.clone(),
+                            arguments: arguments.clone(),
+                            confidence: EvidenceConfidence::High,
+                            address: format!("0x{:x}", instruction.address),
+                        });
+                        registers.insert(
+                            return_register.to_owned(),
+                            Expression {
+                                text: format!("{}_result", sanitize_semantic_name(&ic_target)),
+                                confidence: EvidenceConfidence::Low,
+                                complexity: 1,
+                                class_name: result_class_from_target(&ic_target),
+                                class_library_uri: None,
+                                raw: false,
+                            },
+                        );
+                    } else if let Some(target) = target {
+                        push_statement!(SemanticStatement::ResolvedCall {
+                            target: target.text.clone(),
+                            arguments,
+                            confidence: EvidenceConfidence::Medium,
+                            address: format!("0x{:x}", instruction.address),
+                        });
+                        registers.insert(
+                            return_register.to_owned(),
+                            Expression {
+                                text: format!("{}_result", sanitize_semantic_name(&target.text)),
+                                confidence: EvidenceConfidence::Low,
+                                complexity: 1,
+                                class_name: result_class_from_target(&target.text),
+                                class_library_uri: None,
+                                raw: false,
+                            },
+                        );
+                    }
                 }
             }
             mnemonic if is_return(mnemonic, &instruction.operands) => {
@@ -5122,7 +5288,6 @@ fn recovered_field_or_slot(
     if let Some((offset, identity)) = recovered_field(field_layout, receiver, displacement) {
         return Some((offset, identity.clone()));
     }
-    let class_name = receiver.class_name.as_deref()?;
     // Machine operands address a tagged heap pointer, so the displacement is
     // one byte below the VM's object-layout offset. Keep matching in machine
     // coordinates, but expose the untagged offset in semantic IR and names.
@@ -5136,13 +5301,20 @@ fn recovered_field_or_slot(
     {
         return None;
     }
-    if matches!(
-        class_name,
-        "Array" | "_GrowableList" | "_ImmutableList" | "String" | "Map" | "Set" | "Context"
-    ) {
-        // Container internals have their own meaning; never placeholder them.
-        return None;
+    if let Some(class_name) = receiver.class_name.as_deref() {
+        if matches!(
+            class_name,
+            "Array" | "_GrowableList" | "_ImmutableList" | "String" | "Map" | "Set" | "Context"
+        ) {
+            // Container internals have their own meaning; never placeholder them.
+            return None;
+        }
     }
+    // P2: even when receiver class is not proven, a strided field-like
+    // displacement is still surfaced as a low-confidence `_slot_` instead of
+    // being dropped. This closes the 7:1 write/read asymmetry on obfuscated
+    // builds where `this` parameter type did not survive and also gives
+    // the lifter a stable receiver expression to propagate.
     let offset = displacement.checked_add(1)?;
     Some((
         offset,
@@ -5373,6 +5545,7 @@ fn is_named_pool_target(value: &str) -> bool {
         && !value.starts_with("snapshotLibrary(")
         && !value.starts_with("nativePoolEntry(")
         && !value.starts_with("resetPoolEntry(")
+        && !value.starts_with("dynamicCall(")
         && !value.starts_with('"')
         && value.parse::<i64>().is_err()
 }
@@ -5410,6 +5583,225 @@ fn direct_call_target(mnemonic: &str, operands: &str) -> Option<u64> {
 
 fn is_call(mnemonic: &str) -> bool {
     matches!(mnemonic, "bl" | "blx" | "blr" | "call" | "callq")
+}
+
+/// Receiver-proven dispatch narrowing (P1 high complexity).
+///
+/// A dispatch table entry at `selector_offset + class_id` contains the
+/// runtime target for exactly one class.  When a call-site register carries a
+/// class-proven expression (`Expression.class_name` plus optional
+/// `class_library_uri`) we map that class to its concrete cids via the
+/// snapshot's name maps (qualified first, then name-only) and look up the
+/// single table slot.  A single distinct target is emitted as a proven
+/// `ResolvedCall`; collisions (obfuscation name reuse) or missing slots stay
+/// unresolved to keep the pass sound.  A short walk up the `super_cids`
+/// chain covers synthetic selector gaps.
+fn resolve_dispatch_via_receiver(
+    table: &DispatchTableAnalysis<'_>,
+    selector_offset: usize,
+    registers: &BTreeMap<String, Expression>,
+    abi: Abi,
+) -> Option<String> {
+    let debug = std::env::var("CLUTTER_DEBUG_DISPATCH").is_ok();
+    if debug {
+        let reg_dbg: Vec<String> = registers
+            .iter()
+            .filter_map(|(k, v)| {
+                v.class_name
+                    .as_ref()
+                    .map(|cn| format!("{}:{}@{}", k, cn, v.class_library_uri.as_deref().unwrap_or("none")))
+            })
+            .collect();
+        eprintln!(
+            "[dispatch] selector={} abi={:?} regs_with_class={:?} table_targets_len={} class_ids_len={}",
+            selector_offset,
+            abi,
+            reg_dbg,
+            table.targets.len(),
+            table.class_ids.len()
+        );
+    }
+    let candidates = match abi {
+        Abi::ArmeabiV7a => &[
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
+        ][..],
+        Abi::Arm64V8a => &[
+            "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x19", "x20", "x21", "x22", "x23",
+            "x24", "x25", "x26", "x27", "x28",
+        ][..],
+        Abi::X86_64 => &["rdi", "rsi", "rdx", "rcx", "r8", "r9"][..],
+    };
+    for &reg in candidates {
+        let Some(expr) = registers.get(reg) else {
+            continue;
+        };
+        let Some(class_name) = expr.class_name.as_deref() else {
+            continue;
+        };
+        if class_name.is_empty() {
+            continue;
+        }
+        if expr.text.starts_with("arg") && expr.class_name.is_none() {
+            continue;
+        }
+        let mut cid_sets: Vec<Vec<usize>> = Vec::new();
+        if let (Some(qmap), Some(lib)) = (table.qualified_to_cids, expr.class_library_uri.as_deref()) {
+            if let Some(cids) = qmap.get(&(Some(lib.to_owned()), class_name.to_owned())) {
+                cid_sets.push(cids.clone());
+            }
+            if let Some(cids) = qmap.get(&(None, class_name.to_owned())) {
+                cid_sets.push(cids.clone());
+            }
+        } else if let Some(qmap) = table.qualified_to_cids {
+            if let Some(cids) = qmap.get(&(None, class_name.to_owned())) {
+                cid_sets.push(cids.clone());
+            }
+        }
+        if cid_sets.is_empty() {
+            if let Some(nmap) = table.name_to_cids {
+                if let Some(cids) = nmap.get(class_name) {
+                    cid_sets.push(cids.clone());
+                }
+            }
+        }
+        if cid_sets.is_empty() {
+            if debug {
+                eprintln!("  miss: no cid for {}@{}", class_name, expr.class_library_uri.as_deref().unwrap_or("none"));
+            }
+            continue;
+        }
+        let mut cids: Vec<usize> = cid_sets.into_iter().flatten().collect();
+        cids.sort_unstable();
+        cids.dedup();
+        if cids.len() > 4 {
+            if debug {
+                eprintln!("  skip {}@{} cids={:?} len>4", class_name, expr.class_library_uri.as_deref().unwrap_or("none"), cids);
+            }
+            continue;
+        }
+        let mut distinct = std::collections::BTreeSet::new();
+        for cid in cids.clone() {
+            let mut cur = Some(cid);
+            let mut steps = 0;
+            while let Some(cur_cid) = cur {
+                if steps > 8 {
+                    break;
+                }
+                if let Some(idx) = selector_offset.checked_add(cur_cid) {
+                    if let Some(Some(label)) = table.targets.get(idx) {
+                        distinct.insert(label.clone());
+                        break;
+                    }
+                }
+                cur = table.super_cids.and_then(|map| map.get(&cur_cid).copied());
+                steps += 1;
+            }
+        }
+        if debug {
+            eprintln!(
+                "  try {}@{} selector={} cids={:?} distinct={:?} super_walk={}",
+                class_name,
+                expr.class_library_uri.as_deref().unwrap_or("none"),
+                selector_offset,
+                cids,
+                distinct.iter().cloned().collect::<Vec<_>>(),
+                table.super_cids.is_some()
+            );
+        }
+        if distinct.len() == 1 {
+            return distinct.into_iter().next();
+        }
+    }
+    None
+}
+
+fn find_ic_selector(registers: &BTreeMap<String, Expression>) -> Option<String> {
+    for expr in registers.values() {
+        let t = &expr.text;
+        if let Some(start) = t.find("dynamicCall(\"") {
+            let after = &t[start + "dynamicCall(\"".len()..];
+            if let Some(end) = after.find('"') {
+                let sel = &after[..end];
+                if !sel.is_empty() && sel.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                    return Some(sel.to_owned());
+                }
+            }
+        } else if let Some(start) = t.find("dynamicCall('") {
+            let after = &t[start + "dynamicCall('".len()..];
+            if let Some(end) = after.find('\'') {
+                let sel = &after[..end];
+                if !sel.is_empty() {
+                    return Some(sel.to_owned());
+                }
+            }
+        }
+        if t.starts_with("dynamicCall(") {
+            if let Some(a) = t.find('"') {
+                if let Some(b) = t[a + 1..].find('"') {
+                    return Some(t[a + 1..a + 1 + b].to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_ic_target_via_receiver(
+    selector: &str,
+    registers: &BTreeMap<String, Expression>,
+    abi: Abi,
+    symbols: &BTreeMap<u64, Symbol>,
+    table: Option<&DispatchTableAnalysis<'_>>,
+) -> Option<String> {
+    let candidates: &[&str] = match abi {
+        Abi::ArmeabiV7a => &[
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
+        ],
+        Abi::Arm64V8a => &[
+            "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x19", "x20", "x21", "x22", "x23",
+            "x24", "x25", "x26", "x27", "x28",
+        ],
+        Abi::X86_64 => &["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+    };
+    for &reg in candidates {
+        let Some(expr) = registers.get(reg) else { continue };
+        let Some(class_name) = expr.class_name.as_deref() else { continue };
+        if class_name.is_empty() { continue };
+        let mut tried_libs: Vec<Option<String>> = Vec::new();
+        if let Some(lib) = expr.class_library_uri.as_deref() {
+            tried_libs.push(Some(lib.to_owned()));
+        }
+        tried_libs.push(None);
+        if tried_libs.len() == 1 {
+            if let Some(qmap) = table.and_then(|t| t.qualified_to_cids) {
+                for (key, _) in qmap.iter() {
+                    if key.1 == class_name {
+                        if let Some(l) = &key.0 {
+                            if !tried_libs.contains(&Some(l.clone())) {
+                                tried_libs.push(Some(l.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for _lib_opt in tried_libs {
+            let candidate_label = format!("{}.{}", class_name, selector);
+            for sym in symbols.values() {
+                if sym.label == candidate_label {
+                    return Some(sym.label.clone());
+                }
+            }
+            for sym in symbols.values() {
+                if sym.label.ends_with(&format!(".{}", selector))
+                    && sym.label.starts_with(&format!("{}.", class_name))
+                {
+                    return Some(sym.label.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_return(mnemonic: &str, operands: &str) -> bool {
@@ -5460,6 +5852,12 @@ fn parse_immediate(value: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(value, 16).ok()
+}
+
+/// Public wrapper for address-string parsing outside the disassembler
+/// (source-band attribution in the snapshot recovery layer).
+pub(crate) fn parse_immediate_public(value: &str) -> Option<u64> {
+    parse_immediate(value)
 }
 
 fn add_fallthrough_block(
@@ -5661,7 +6059,7 @@ mod tests {
         bytes.extend([0x00, 0x00, 0x00, 0x94]);
         let statements = Disassembler::new(Abi::Arm64V8a)
             .unwrap()
-            .analyze(0x1000, &bytes, &BTreeMap::new(), None, None, None)
+            .analyze(0x1000, &bytes, &BTreeMap::new(), None, None, None, None, None)
             .unwrap();
 
         assert!(
@@ -5678,7 +6076,7 @@ mod tests {
         let bytes = [0x00, 0x02, 0x3f, 0xd6, 0xc0, 0x03, 0x5f, 0xd6];
         let disassembly = Disassembler::new(Abi::Arm64V8a)
             .unwrap()
-            .analyze(0x1000, &bytes, &BTreeMap::new(), None, None, None)
+            .analyze(0x1000, &bytes, &BTreeMap::new(), None, None, None, None, None)
             .unwrap();
 
         assert_eq!(disassembly.evidence.indirect_calls, 1);
@@ -5698,8 +6096,7 @@ mod tests {
         // register x16 while the stub entry lands in the call register x17.
         // ldr x16,[x27,#16]; ldr x17,[x27,#24]; blr x17
         let bytes = [
-            0x70, 0x0b, 0x40, 0xf9, 0x71, 0x0f, 0x40, 0xf9, 0x20, 0x02, 0x3f,
-            0xd6,
+            0x70, 0x0b, 0x40, 0xf9, 0x71, 0x0f, 0x40, 0xf9, 0x20, 0x02, 0x3f, 0xd6,
         ];
         let pool = vec![
             "dynamicCall(\"isEmpty\", arity=2)".to_owned(),
@@ -5708,7 +6105,7 @@ mod tests {
         ];
         let disassembly = Disassembler::new(Abi::Arm64V8a)
             .unwrap()
-            .analyze(0x1000, &bytes, &BTreeMap::new(), None, Some(&pool), None)
+            .analyze(0x1000, &bytes, &BTreeMap::new(), None, Some(&pool), None, None, None)
             .unwrap();
 
         let selector_call = disassembly
@@ -5716,9 +6113,7 @@ mod tests {
             .iter()
             .find_map(|statement| match statement {
                 PseudoStatement::ObjectPoolCall {
-                    pool_index,
-                    target,
-                    ..
+                    pool_index, target, ..
                 } => (*pool_index == 0).then(|| target.clone()),
                 _ => None,
             });
@@ -5736,7 +6131,7 @@ mod tests {
         let bytes = [0x00, 0x0b, 0xb0, 0xee, 0x1e, 0xff, 0x2f, 0xe1];
         let disassembly = Disassembler::new(Abi::ArmeabiV7a)
             .unwrap()
-            .analyze(0x1000, &bytes, &BTreeMap::new(), None, None, None)
+            .analyze(0x1000, &bytes, &BTreeMap::new(), None, None, None, None, None)
             .unwrap();
 
         assert_eq!(disassembly.evidence.unknown_bytes, 0);
@@ -5891,6 +6286,8 @@ mod tests {
             None,
             Some(&layout),
             Some(("Profile", Some("package:app/model.dart"))),
+            None,
+            None,
         );
         assert!(statements.iter().any(|statement| matches!(
             statement,
@@ -5915,6 +6312,8 @@ mod tests {
             None,
             Some(&layout),
             Some(("Unrelated", Some("package:app/model.dart"))),
+            None,
+            None,
         );
         assert!(!unrelated.iter().any(|statement| matches!(
             statement,
@@ -5966,6 +6365,10 @@ mod tests {
             origin_element: 4096,
             targets: &targets,
             class_ids: &[1, 2],
+            cid_to_name: None,
+            name_to_cids: None,
+            qualified_to_cids: None,
+            super_cids: None,
         };
 
         let calls = recover_dispatch_calls(Abi::Arm64V8a, &instructions, &table);
@@ -5996,6 +6399,10 @@ mod tests {
             origin_element: 1023,
             targets: &targets,
             class_ids: &[1, 2],
+            cid_to_name: None,
+            name_to_cids: None,
+            qualified_to_cids: None,
+            super_cids: None,
         };
 
         let calls = recover_dispatch_calls(Abi::ArmeabiV7a, &instructions, &table);
@@ -6021,9 +6428,11 @@ mod tests {
         let (selector, candidates, count) = infer_dispatch_selector(&targets);
         assert_eq!(selector, None);
         assert!(!candidates.is_empty());
-        assert!(candidates
-            .iter()
-            .all(|candidate| !candidate.starts_with("sub_")));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.starts_with("sub_"))
+        );
         assert_eq!(count, 105);
     }
 
@@ -6300,6 +6709,8 @@ mod fusion_tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(
             statements.iter().any(|statement| matches!(
@@ -6341,6 +6752,8 @@ mod fusion_tests {
             &std::collections::BTreeSet::from([0x100, 0x118, 0x120, 0x124]),
             &BTreeMap::new(),
             Some(&pool),
+            None,
+            None,
             None,
             None,
         );
@@ -6428,6 +6841,8 @@ mod fusion_tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         assert!(
@@ -6469,6 +6884,8 @@ mod fusion_tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(
             statements.iter().any(|statement| matches!(
@@ -6480,7 +6897,7 @@ mod fusion_tests {
         );
     }
 
-#[test]
+    #[test]
     fn removes_boxed_double_allocation_control_flow() {
         let code = vec![
             insn(0x100, "fmov d0, #10.00000000"),

@@ -467,17 +467,9 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
                         resolved_indirect_call_sites += 1;
                         *call_target_scopes.entry(target_scope.label()).or_default() += 1;
                     }
-                    PseudoStatement::DispatchTableCall { selector_name, .. } => {
+                    PseudoStatement::DispatchTableCall { .. } => {
                         indirect_call_sites += 1;
-                        resolved_dispatch_table_call_sites +=
-                            usize::from(selector_name.is_some());
-                        *call_target_scopes
-                            .entry(if selector_name.is_some() {
-                                "dynamic-named"
-                            } else {
-                                "dynamic"
-                            })
-                            .or_default() += 1;
+                        *call_target_scopes.entry("dynamic").or_default() += 1;
                     }
                     _ => {}
                 }

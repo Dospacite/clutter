@@ -54,7 +54,12 @@ pub fn recover(libapp: &[u8], snapshot: &SnapshotInfo, scope: Scope) -> Recovere
         .into_iter()
         .filter_map(|uri| {
             let package = package_name(&uri).map(str::to_owned);
-            let is_application = package.as_deref() == application_package.as_deref();
+            // P3: dart SDK libraries (`dart:` URIs) have no package – they must not
+            // be marked as application when `application_package` is `None`
+            // (`None == None` was previously `true`).
+            let is_application = application_package
+                .as_deref()
+                .is_some_and(|pkg| Some(pkg) == package.as_deref());
             let include = match scope {
                 Scope::App => is_application,
                 Scope::Packages => package
@@ -228,7 +233,10 @@ pub(crate) fn reconcile_libraries(program: &mut RecoveredProgram, scope: Scope) 
             let package = package_name(&uri).map(str::to_owned);
             program.libraries.push(RecoveredLibrary {
                 output_path: library_output_path(&uri, program.application_package.as_deref()),
-                is_application: package.as_deref() == program.application_package.as_deref(),
+                is_application: program
+                    .application_package
+                    .as_deref()
+                    .is_some_and(|pkg| Some(pkg) == package.as_deref()),
                 package,
                 uri,
                 vm_object_id: None,
@@ -1299,7 +1307,7 @@ fn sanitize_relative(value: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::model::{
         Abi, CallTargetScope, MachineCodeEvidence, PseudoStatement, RecoveredDeclaration,
@@ -1349,6 +1357,7 @@ mod tests {
             instructions: Vec::new(),
             control_flow: Vec::new(),
             semantic_statements: Vec::new(),
+            source_bands: BTreeMap::new(),
             statements: vec![PseudoStatement::DirectCall {
                 address: "0x1000".to_owned(),
                 target_address: "0x2000".to_owned(),

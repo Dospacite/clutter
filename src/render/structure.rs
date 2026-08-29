@@ -347,10 +347,7 @@ fn walk(
                 None
             };
             pieces.push(demote_empty_low_confidence_branch(
-                expression,
-                confidence,
-                then_body,
-                else_body,
+                expression, confidence, then_body, else_body,
             ));
             current = Some(merge);
             continue;
@@ -718,10 +715,7 @@ fn walk_clamped(
                 None
             };
             pieces.push(demote_empty_low_confidence_branch(
-                expression,
-                confidence,
-                then_body,
-                else_body,
+                expression, confidence, then_body, else_body,
             ));
             current = merge_in_region.then_some(merge);
             continue;
@@ -802,9 +796,9 @@ fn demote_empty_low_confidence_branch(
         match node {
             StructureNode::Linear(indices) => !indices.is_empty(),
             StructureNode::Return(_) => true,
-            StructureNode::If { .. } | StructureNode::While { .. } | StructureNode::UnresolvedPredicate(_) => {
-                true
-            }
+            StructureNode::If { .. }
+            | StructureNode::While { .. }
+            | StructureNode::UnresolvedPredicate(_) => true,
             StructureNode::CatchHandler(body) => has_content(body),
             StructureNode::Block(children) => children.iter().any(has_content),
         }
@@ -825,7 +819,6 @@ fn demote_empty_low_confidence_branch(
     // evidence visible without inventing executable Dart.
     StructureNode::UnresolvedPredicate(condition)
 }
-
 
 /// Subtype-test cache dispatch compiles to towers of low-confidence register
 /// compares against class-id integers (`x4 <= 55`, `x4 == 2046`, …) whose only
@@ -855,7 +848,12 @@ fn demote_cid_compare_towers(
                 let register = head.trim_end_matches(|c: char| !c.is_ascii_alphabetic());
                 format!("{} {}", register, digits)
             })
-            .filter(|label| label.split(' ').next().is_some_and(|token| !token.is_empty()))
+            .filter(|label| {
+                label
+                    .split(' ')
+                    .next()
+                    .is_some_and(|token| !token.is_empty())
+            })
     }
 
     fn tower_collapsed(
@@ -878,15 +876,15 @@ fn demote_cid_compare_towers(
             // A linear run whose every statement is an unresolved synthetic
             // call is the runtime throw/unreachable tail of a failed cache
             // probe — machine semantics, not source content.
-            StructureNode::Linear(indices) => indices.iter().all(|index| {
-                match statements.get(*index) {
+            StructureNode::Linear(indices) => {
+                indices.iter().all(|index| match statements.get(*index) {
                     None => true,
                     Some(SemanticStatement::ResolvedCall { target, .. }) => {
                         target.starts_with("sub_")
                     }
                     _ => false,
-                }
-            }),
+                })
+            }
             StructureNode::Block(children) => children
                 .iter()
                 .all(|child| tower_collapsed(child, collected, statements)),
@@ -901,14 +899,12 @@ fn demote_cid_compare_towers(
             then_body,
             else_body,
         } => {
-            let demoted_then =
-                demote_cid_compare_towers(*then_body, statements);
-            let demoted_else = else_body
-                .map(|body| Box::new(demote_cid_compare_towers(*body, statements)));
+            let demoted_then = demote_cid_compare_towers(*then_body, statements);
+            let demoted_else =
+                else_body.map(|body| Box::new(demote_cid_compare_towers(*body, statements)));
             if let Some(constants) = cid_constants(&condition, confidence) {
                 let mut collected = vec![constants];
-                let then_collapsed =
-                    tower_collapsed(&demoted_then, &mut collected, statements);
+                let then_collapsed = tower_collapsed(&demoted_then, &mut collected, statements);
                 let else_collapsed = demoted_else
                     .as_deref()
                     .map(|body| tower_collapsed(body, &mut collected, statements))
@@ -928,7 +924,10 @@ fn demote_cid_compare_towers(
             }
         }
         StructureNode::Block(children) => StructureNode::Block(
-            children.into_iter().map(|child| demote_cid_compare_towers(child, statements)).collect(),
+            children
+                .into_iter()
+                .map(|child| demote_cid_compare_towers(child, statements))
+                .collect(),
         ),
         StructureNode::CatchHandler(body) => {
             StructureNode::CatchHandler(Box::new(demote_cid_compare_towers(*body, statements)))
@@ -1137,8 +1136,12 @@ fn compute_dominators(
 
 #[cfg(test)]
 mod tests {
-    use super::{StructureNode, negate_condition, promote_exit_test, structure_body, whole_wrapped_negation};
-    use crate::model::{ControlFlowEdge, ControlFlowEdgeKind, EvidenceConfidence, SemanticStatement};
+    use super::{
+        StructureNode, negate_condition, promote_exit_test, structure_body, whole_wrapped_negation,
+    };
+    use crate::model::{
+        ControlFlowEdge, ControlFlowEdgeKind, EvidenceConfidence, SemanticStatement,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -1267,7 +1270,10 @@ mod tests {
                     ..
                 } => {
                     count_loops(then_body)
-                        + else_body.as_ref().map(|body| count_loops(body)).unwrap_or(0)
+                        + else_body
+                            .as_ref()
+                            .map(|body| count_loops(body))
+                            .unwrap_or(0)
                 }
                 StructureNode::Block(children) => children.iter().map(count_loops).sum(),
                 _ => 0,
@@ -1279,14 +1285,15 @@ mod tests {
     #[test]
     fn demotes_cid_compare_towers_to_single_comment() {
         use super::demote_cid_compare_towers;
-        let shell = |condition: &str, then_body: StructureNode, else_body: Option<StructureNode>| {
-            StructureNode::If {
-                condition: condition.to_owned(),
-                confidence: EvidenceConfidence::Low,
-                then_body: Box::new(then_body),
-                else_body: else_body.map(Box::new),
-            }
-        };
+        let shell =
+            |condition: &str, then_body: StructureNode, else_body: Option<StructureNode>| {
+                StructureNode::If {
+                    condition: condition.to_owned(),
+                    confidence: EvidenceConfidence::Low,
+                    then_body: Box::new(then_body),
+                    else_body: else_body.map(Box::new),
+                }
+            };
         let tower = shell(
             "x4 <= 55",
             StructureNode::Block(Vec::new()),

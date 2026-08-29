@@ -260,6 +260,15 @@ pub struct VmOracleEvidence {
     /// to oracle Function identities.
     #[serde(default)]
     pub relabeled_dispatch_candidates: usize,
+    /// Synthetic `sub_<addr>` call statements whose target resolved to a VM
+    /// runtime stub and were rewritten to the stub's identity (CheckNull
+    /// slow paths and friends are compiler-inserted, never source calls).
+    #[serde(default)]
+    pub relabeled_stub_call_sites: usize,
+    /// Dispatch-table call sites whose selector was proven because every
+    /// distinct implementation resolved through the oracle to one member name.
+    #[serde(default)]
+    pub oracle_proven_dispatch_selectors: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -536,6 +545,12 @@ pub struct RecoveredClassMetadata {
     pub interfaces: Vec<RecoveredType>,
     pub is_abstract: bool,
     pub is_enum: bool,
+    /// Enum constant names recovered from the snapshot's const-instance
+    /// graph (`_Enum._name` Strings). Empty when every value was
+    /// tree-shaken; names are object-identity evidence, ordinals follow the
+    /// instance `index` field when its layout is proven.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<String>,
     pub is_sealed: bool,
     pub is_mixin_class: bool,
     pub is_base: bool,
@@ -628,6 +643,13 @@ pub struct RecoveredFunction {
     pub control_flow: Vec<ControlFlowEdge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_statements: Vec<SemanticStatement>,
+    /// Source-line bands from the body's retained CodeSourceMap, keyed by
+    /// statement address. A band is the source line the compiler recorded for
+    /// a pc range; statements sharing a band are lowering fragments of one
+    /// source statement. Empty when the snapshot shipped no CSM payloads
+    /// (`--split-debug-info` builds, arm32).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_bands: BTreeMap<String, i64>,
     pub statements: Vec<PseudoStatement>,
 }
 

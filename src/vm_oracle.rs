@@ -27,6 +27,12 @@ pub(crate) struct LoadedVmOracle {
     /// Schema 5 dispatch rows: selector index -> owner function name. Exact
     /// receiver-CID evidence for recovered indirect calls.
     dispatch_selectors: BTreeMap<usize, String>,
+    /// Every `is_stub` Code in the isolate instructions region, keyed by its
+    /// instruction offset. Built directly from the VM's own flag rather than
+    /// from the derived function list: instruction dedup lets a tree-shaken
+    /// Dart Function point at a shared stub Code, which would otherwise hide
+    /// that stub from the stub-call classifier.
+    stub_names_by_offset: BTreeMap<u64, String>,
 }
 
 impl LoadedVmOracle {
@@ -374,11 +380,7 @@ fn overlay_static_call_labels(labels: &mut BTreeMap<usize, String>, rows: &[Anal
         if labels.contains_key(&index) {
             continue;
         }
-        if let Some(name) = row
-            .owner_name
-            .as_deref()
-            .filter(|name| !name.is_empty())
-        {
+        if let Some(name) = row.owner_name.as_deref().filter(|name| !name.is_empty()) {
             labels.insert(index, name.to_owned());
         }
     }
@@ -675,6 +677,14 @@ pub(crate) fn load_unbound(
         })
         .collect::<HashMap<_, _>>();
     let object_pool_labels = recover_object_pool_labels(&document.objects, &classes, &libraries);
+    // Enum constant names live in the const-instance graph: every surviving
+    // enum value is a canonical Instance of the enum class whose `_Enum`
+    // layout carries a String `_name` (sdk core `enum.dart`). Names are
+    // object-identity evidence — they survive `--obfuscate` because string
+    // constants are never renamed. Ordinal order follows the instance's
+    // unboxed `index` field when its layout is proven; otherwise declaration
+    // order within the snapshot cluster.
+    let enum_values = recover_enum_values(&document.objects);
     // Schema 5 static-call rows identify pool entries whose Code target has a
     // Function owner even when the graph walk cannot reach the owner object.
     let mut object_pool_labels = object_pool_labels;
@@ -1069,6 +1079,7 @@ pub(crate) fn load_unbound(
                 interfaces,
                 is_abstract: object.is_abstract.unwrap_or(false),
                 is_enum: object.is_enum.unwrap_or(false),
+                enum_values: enum_values.get(&object_id).cloned().unwrap_or_default(),
                 is_sealed: object.is_sealed.unwrap_or(false),
                 is_mixin_class: object.is_mixin_class.unwrap_or(false),
                 is_base: object.is_base.unwrap_or(false),
@@ -1324,8 +1335,29 @@ pub(crate) fn load_unbound(
         matched_code_offsets: 0,
         strongly_matched_functions: 0,
         unmatched_recovered_functions: 0,
-    relabeled_dispatch_candidates: 0,
+        relabeled_dispatch_candidates: 0,
+        relabeled_stub_call_sites: 0,
+        oracle_proven_dispatch_selectors: 0,
     };
+    // Stub identity comes straight from the VM's `is_stub` flag on Code
+    // objects. Deriving it from the recovered function list instead would
+    // miss every stub whose (deduplicated) Code is also referenced by a
+    // tree-shaken Dart Function — including the shared CheckNull slow path,
+    // the single most frequent synthetic call target in obfuscated builds.
+    let stub_names_by_offset = document
+        .objects
+        .iter()
+        .filter(|object| {
+            object.object_type.as_deref() == Some("Code")
+                && object.is_stub == Some(true)
+                && object.section.as_deref() == Some("_kDartIsolateSnapshotInstructions")
+        })
+        .filter_map(|object| {
+            let offset = u64::try_from(object.offset?).ok()?;
+            let name = object.name.clone().filter(|name| !name.is_empty())?;
+            Some((offset, name))
+        })
+        .collect::<BTreeMap<u64, String>>();
     Ok(LoadedVmOracle {
         evidence,
         functions,
@@ -1346,6 +1378,7 @@ pub(crate) fn load_unbound(
                     .collect()
             })
             .unwrap_or_default(),
+        stub_names_by_offset,
     })
 }
 
@@ -1468,12 +1501,39 @@ pub(crate) fn apply_declarations(
     crate::analysis::reconcile_libraries(program, scope);
 }
 
+/// Stub-call cleanup deferred until after the final semantic relift.
+///
+/// `attach` runs its own enrichment, but the caller re-lifts every body once
+/// more with the full declaration set afterwards, which rebuilds
+/// `semantic_statements` from machine code and would discard any rewrite
+/// applied earlier. Carrying the proven stub identities out of `attach` lets
+/// the rewrite land on the statements that actually reach the renderer.
+pub(crate) struct StubCallCleanup {
+    stub_names_by_offset: BTreeMap<u64, String>,
+    image_base: u64,
+}
+
+impl StubCallCleanup {
+    /// Applies the stub rewrite and records the resulting count in the
+    /// program's oracle evidence.
+    pub(crate) fn apply(&self, program: &mut RecoveredProgram) {
+        let rewritten = relabel_stub_call_targets(
+            &mut program.functions,
+            &self.stub_names_by_offset,
+            self.image_base,
+        );
+        if let Some(evidence) = program.vm_oracle.as_mut() {
+            evidence.relabeled_stub_call_sites = rewritten;
+        }
+    }
+}
+
 pub(crate) fn attach(
     program: &mut RecoveredProgram,
     mut oracle: LoadedVmOracle,
     snapshot: &SnapshotInfo,
     abi: Abi,
-) -> Result<()> {
+) -> Result<StubCallCleanup> {
     let image_base = isolate_instructions_base(snapshot)?;
     let mut by_offset = HashMap::<u64, Vec<usize>>::new();
     for (index, function) in oracle.functions.iter().enumerate() {
@@ -1582,13 +1642,21 @@ pub(crate) fn attach(
     // (`sub_<addr>`), but the oracle knows which Function owns each code
     // offset — relabel candidates so bounded candidate lists carry real
     // identities instead of addresses.
-    let relabeled_candidates = relabel_dispatch_candidates(
-        &mut program.functions,
-        &oracle.functions,
-        image_base,
-    );
+    let (relabeled_candidates, oracle_proven_selectors) =
+        relabel_dispatch_candidates(&mut program.functions, &oracle.functions, image_base);
     oracle.evidence.relabeled_dispatch_candidates = relabeled_candidates;
+    oracle.evidence.oracle_proven_dispatch_selectors = oracle_proven_selectors;
     enrich_semantics(program, abi);
+    // Synthetic `sub_<addr>` call targets that resolve to VM runtime stubs
+    // are compiler-inserted checks (CheckNull slow paths and friends), not
+    // source calls. Rewriting them to their stub identity lets the renderer's
+    // existing runtime-helper suppression drop them; CheckNull-family calls
+    // are removed outright because they only exist to throw. The rewrite is
+    // handed back to the caller because a further relift follows this call.
+    let cleanup = StubCallCleanup {
+        stub_names_by_offset: oracle.stub_names_by_offset.clone(),
+        image_base,
+    };
 
     oracle.evidence.matched_functions = matched;
     oracle.evidence.matched_code_offsets = matched_code_offsets.len();
@@ -1607,19 +1675,28 @@ pub(crate) fn attach(
         ),
     });
     program.vm_oracle = Some(oracle.evidence);
-    Ok(())
+    Ok(cleanup)
+}
+
+fn member_name(target: &str) -> &str {
+    target.rsplit_once('.').map_or(target, |(_, name)| name)
 }
 
 /// Rewrites synthetic dispatch-candidate labels (`sub_<addr>`) to the oracle
 /// Function identity owning that code offset. The static analysis could only
 /// label table slots from snapshot symbols, which obfuscation erases; the
-/// oracle's per-offset Function graph restores real identities. Returns how
-/// many candidate labels were relabeled.
+/// oracle's per-offset Function graph restores real identities. When every
+/// distinct implementation of one call site resolves to the same member name,
+/// that name is proven for the site and installed as its `selector_name` —
+/// the oracle channel the frequency-quorum inference could never reach.
+///
+/// Returns how many candidate labels were relabeled and how many call sites
+/// gained a proven selector.
 fn relabel_dispatch_candidates(
     functions: &mut [RecoveredFunction],
     oracle_functions: &[VmFunctionEvidence],
     image_base: u64,
-) -> usize {
+) -> (usize, usize) {
     let mut label_by_offset = HashMap::<u64, String>::new();
     for evidence in oracle_functions {
         let Some(offset) = evidence.code_offset else {
@@ -1642,13 +1719,16 @@ fn relabel_dispatch_candidates(
         label_by_offset.insert(offset, qualified);
     }
     if label_by_offset.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let mut relabeled = 0usize;
+    let mut proven_selectors = 0usize;
     for function in functions {
         for statement in &mut function.statements {
             let PseudoStatement::DispatchTableCall {
-                candidate_targets, ..
+                selector_name,
+                candidate_targets,
+                ..
             } = statement
             else {
                 continue;
@@ -1668,9 +1748,175 @@ fn relabel_dispatch_candidates(
                     relabeled += 1;
                 }
             }
+            // Oracle-proven selector: all distinct relabeled implementations
+            // share one member name. Distinctness keeps a single widely-shared
+            // body from outvoting genuinely different implementations.
+            if selector_name.is_none() && !candidate_targets.is_empty() {
+                let distinct: std::collections::BTreeSet<&String> =
+                    candidate_targets.iter().collect();
+                if distinct.len() > 1 {
+                    let first = member_name(distinct.iter().next().expect("non-empty"));
+                    if distinct.iter().all(|target| member_name(target) == first)
+                        && !first.starts_with("sub_")
+                        && !first.starts_with("_iso_stub_")
+                        && !first.is_empty()
+                    {
+                        *selector_name = Some(first.to_owned());
+                        proven_selectors += 1;
+                    }
+                }
+            }
         }
     }
-    relabeled
+    (relabeled, proven_selectors)
+}
+
+/// Rewrites synthetic `sub_<addr>` call targets that the oracle resolves to a
+/// VM runtime stub. A direct call into a stub is compiler-inserted control
+/// flow — the CheckNull slow path behind every `!`/parameter null-check, stack
+/// overflow guards, and similar — never a source-level invocation, so:
+///
+/// - CheckNull-family stubs (`NullError`/`NullCastError`/`NullArgError`) are
+///   removed outright: the statement exists only to throw;
+/// - every other stub call is retargeted to the stub's symbolic name, which
+///   the renderer already suppresses as a runtime helper.
+///
+/// Returns how many statements were rewritten or removed.
+fn relabel_stub_call_targets(
+    functions: &mut [RecoveredFunction],
+    stub_names_by_offset: &BTreeMap<u64, String>,
+    image_base: u64,
+) -> usize {
+    // Offset -> (stub name, throws-unconditionally). Only exact identities
+    // enter the map; near matches would risk misclassifying real calls.
+    let mut stub_by_offset = HashMap::<u64, (&str, bool)>::new();
+    for (offset, name) in stub_names_by_offset {
+        let throws = name.contains("NullError")
+            || name.contains("NullCastError")
+            || name.contains("NullArgError");
+        stub_by_offset.insert(*offset, (name.as_str(), throws));
+    }
+    if stub_by_offset.is_empty() {
+        return 0;
+    }
+
+    /// Parses `sub_<hex>` targets produced by the lifter for unnamed code.
+    fn sub_target_offset(target: &str, image_base: u64) -> Option<u64> {
+        let hex = target.strip_prefix("sub_")?;
+        u64::from_str_radix(hex, 16).ok()?.checked_sub(image_base)
+    }
+
+    let mut rewritten = 0usize;
+    for function in functions {
+        // CheckNull-family stub calls throw unconditionally — their "result"
+        // can never feed live computation, so removing the statement is sound.
+        function.semantic_statements.retain(|statement| {
+            let crate::model::SemanticStatement::ResolvedCall { target, .. } = statement else {
+                return true;
+            };
+            let Some(offset) = sub_target_offset(target, image_base) else {
+                return true;
+            };
+            match stub_by_offset.get(&offset) {
+                Some((_, true)) => {
+                    rewritten += 1;
+                    false
+                }
+                _ => true,
+            }
+        });
+        // Every remaining stub call keeps its statement but gains the stub's
+        // symbolic name; the renderer already suppresses runtime helpers.
+        for statement in &mut function.semantic_statements {
+            let crate::model::SemanticStatement::ResolvedCall { target, .. } = statement else {
+                continue;
+            };
+            let Some(offset) = sub_target_offset(target, image_base) else {
+                continue;
+            };
+            if let Some((name, false)) = stub_by_offset.get(&offset) {
+                *target = (*name).to_owned();
+                rewritten += 1;
+            }
+        }
+        // The machine-level pseudo statements carry the same calls; keep both
+        // views consistent so reports and IR agree with the render.
+        for statement in &mut function.statements {
+            let PseudoStatement::DirectCall {
+                target,
+                target_address,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let Some(raw) = parse_address(target_address) else {
+                continue;
+            };
+            let Some(offset) = raw.checked_sub(image_base) else {
+                continue;
+            };
+            if let Some((name, _)) = stub_by_offset.get(&offset) {
+                if target.as_deref().is_some_and(|t| t.starts_with("sub_")) {
+                    *target = Some((*name).to_owned());
+                    rewritten += 1;
+                }
+            }
+        }
+    }
+    rewritten
+}
+
+/// Collects enum constant names per enum class from the const-instance
+/// graph. An enum value is a canonical `Instance` of the enum class whose
+/// `_Enum` layout stores a String `_name` (sdk core `enum.dart`). Names are
+/// object-identity evidence — string constants survive `--obfuscate` because
+/// only symbols are renamed. Values are returned in snapshot order, which
+/// matches declaration order for the values that survived; entries removed
+/// by tree-shaking never appear at all.
+fn recover_enum_values(objects: &[AnalyzerObject]) -> HashMap<u64, Vec<String>> {
+    // Enum-class ids first; classes without them are skipped entirely.
+    let is_enum_class = objects
+        .iter()
+        .filter(|object| object.object_type.as_deref() == Some("Class"))
+        .filter(|object| object.is_enum == Some(true))
+        .filter_map(|object| object.id.map(|id| (id, ())))
+        .collect::<HashMap<_, _>>();
+    if is_enum_class.is_empty() {
+        return HashMap::new();
+    }
+    let strings_by_id = objects
+        .iter()
+        .filter(|object| object.object_type.as_deref() == Some("String"))
+        .filter_map(|object| Some((object.id?, object.value.as_deref()?)))
+        .collect::<HashMap<_, _>>();
+    let mut values = HashMap::<u64, Vec<String>>::new();
+    for object in objects {
+        if object.object_type.as_deref() != Some("Instance") {
+            continue;
+        }
+        let Some(class_id) = object.class_object else {
+            continue;
+        };
+        if !is_enum_class.contains_key(&class_id) {
+            continue;
+        }
+        // The `_Enum` base layout puts `_name` in the first reference slot;
+        // enhanced enums append their own fields after it, so any additional
+        // Strings sit later. Taking the first String reference therefore
+        // reads `_name` for both plain and enhanced shapes.
+        let Some(name) = object
+            .references
+            .iter()
+            .filter_map(|reference| strings_by_id.get(reference))
+            .next()
+        else {
+            continue;
+        };
+        values.entry(class_id).or_default().push((*name).to_owned());
+    }
+    values.retain(|_, names| !names.is_empty());
+    values
 }
 
 fn enrich_object_pool_evidence(
@@ -2450,6 +2696,7 @@ mod tests {
             instructions: Vec::new(),
             control_flow: Vec::new(),
             semantic_statements: Vec::new(),
+            source_bands: BTreeMap::new(),
             statements: Vec::new(),
         }
     }
@@ -2552,7 +2799,10 @@ mod tests {
         assert_eq!(dispatch.code_entry_count, Some(4096));
         assert_eq!(dispatch.targets.len(), 1);
         assert_eq!(dispatch.targets[0].selector_index, 42);
-        assert_eq!(dispatch.targets[0].owner_name.as_deref(), Some("get:isEmpty"));
+        assert_eq!(
+            dispatch.targets[0].owner_name.as_deref(),
+            Some("get:isEmpty")
+        );
 
         let ranges = envelope.class_ranges.expect("schema 5 class_ranges");
         assert_eq!(ranges.populated_runs, vec![(1, 900), (902, 1199)]);
@@ -2622,8 +2872,7 @@ mod tests {
         selectors.insert(43usize, "+".to_owned());
 
         let mut functions = vec![function];
-        let resolved =
-            super::apply_dispatch_selector_evidence(&mut functions, &selectors);
+        let resolved = super::apply_dispatch_selector_evidence(&mut functions, &selectors);
         assert_eq!(resolved, 2);
         let statements = &functions[0].statements;
         let PseudoStatement::DispatchTableCall { selector_name, .. } = &statements[0] else {
@@ -2641,6 +2890,79 @@ mod tests {
         };
         assert_eq!(selector_name.as_deref(), Some("+"));
         assert!(candidate_targets.iter().all(|target| target != "sub_1965"));
+    }
+
+    #[test]
+    fn joins_dispatch_candidates_to_oracle_code_offsets() {
+        let image_base = 0x10_0000;
+        let mut function = recovered_closure("int");
+        function.statements = vec![
+            PseudoStatement::DispatchTableCall {
+                address: "0x1008".to_owned(),
+                expression: "dispatch[42 + class_id]".to_owned(),
+                selector_offset: 42,
+                selector_name: None,
+                candidate_targets: vec!["sub_101000".to_owned(), "sub_102000".to_owned()],
+                candidate_count: 2,
+                raw_slot_target_count: 2,
+            },
+            PseudoStatement::DispatchTableCall {
+                address: "0x1010".to_owned(),
+                expression: "dispatch[43 + class_id]".to_owned(),
+                selector_offset: 43,
+                selector_name: None,
+                candidate_targets: vec!["sub_103000".to_owned(), "sub_104000".to_owned()],
+                candidate_count: 2,
+                raw_slot_target_count: 2,
+            },
+        ];
+        let implementations = vec![
+            vm_dispatch_implementation(1, 0x1000, "Alpha", "render"),
+            vm_dispatch_implementation(2, 0x2000, "Beta", "render"),
+            vm_dispatch_implementation(3, 0x3000, "Alpha", "read"),
+            vm_dispatch_implementation(4, 0x4000, "Beta", "write"),
+        ];
+
+        let mut functions = vec![function];
+        let (relabeled, proven) =
+            super::relabel_dispatch_candidates(&mut functions, &implementations, image_base);
+
+        assert_eq!(relabeled, 4);
+        assert_eq!(proven, 1);
+        let PseudoStatement::DispatchTableCall {
+            selector_name,
+            candidate_targets,
+            ..
+        } = &functions[0].statements[0]
+        else {
+            panic!("expected dispatch call");
+        };
+        assert_eq!(selector_name.as_deref(), Some("render"));
+        assert_eq!(candidate_targets, &["Alpha.render", "Beta.render"]);
+        let PseudoStatement::DispatchTableCall { selector_name, .. } = &functions[0].statements[1]
+        else {
+            panic!("expected dispatch call");
+        };
+        assert_eq!(selector_name, &None, "mixed members remain unresolved");
+    }
+
+    fn vm_dispatch_implementation(
+        object_id: u64,
+        code_offset: u64,
+        owner: &str,
+        name: &str,
+    ) -> VmFunctionEvidence {
+        VmFunctionEvidence {
+            object_id,
+            code_object_id: Some(object_id),
+            code_offset: Some(code_offset),
+            name: name.to_owned(),
+            raw_name: Some(name.to_owned()),
+            user_visible_name: Some(name.to_owned()),
+            owner: Some(owner.to_owned()),
+            kind: Some("RegularFunction".to_owned()),
+            ..VmFunctionEvidence::default()
+        }
     }
 
     #[test]
@@ -2721,5 +3043,131 @@ mod tests {
                 ..
             } if target == "CookieStore.load"
         ));
+    }
+
+    #[test]
+    fn stub_call_targets_are_relabelled_and_checknull_calls_removed() {
+        let image_base = 0x10_0000;
+        let stubs = BTreeMap::from([
+            (
+                0x2_74fb8u64,
+                "_iso_stub_NullCastErrorSharedWithoutFPURegsStub".to_owned(),
+            ),
+            (
+                0x2_80000u64,
+                "_iso_stub_StackOverflowSharedWithoutFPURegsStub".to_owned(),
+            ),
+        ]);
+        let mut function = recovered_closure("Cookie");
+        function.semantic_statements = vec![
+            SemanticStatement::ResolvedCall {
+                target: format!("sub_{:x}", image_base + 0x2_74fb8),
+                arguments: vec!["null".to_owned()],
+                confidence: EvidenceConfidence::Medium,
+                address: "0x1004".to_owned(),
+            },
+            SemanticStatement::ResolvedCall {
+                target: "CookieStore.load".to_owned(),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: "0x1008".to_owned(),
+            },
+            SemanticStatement::ResolvedCall {
+                target: format!("sub_{:x}", image_base + 0x2_80000),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: "0x100c".to_owned(),
+            },
+        ];
+        function.statements = vec![PseudoStatement::DirectCall {
+            address: "0x1010".to_owned(),
+            target_address: format!("0x{:x}", image_base + 0x2_74fb8),
+            target_code_address: None,
+            target_entry_offset: None,
+            target_resolution: None,
+            target: Some(format!("sub_{:x}", image_base + 0x2_74fb8)),
+            target_library_uri: None,
+            target_scope: CallTargetScope::Unknown,
+        }];
+
+        let mut functions = vec![function];
+        let rewritten = super::relabel_stub_call_targets(&mut functions, &stubs, image_base);
+
+        // CheckNull call removed; the other two views stay consistent.
+        assert_eq!(rewritten, 3);
+        let semantic = &functions[0].semantic_statements;
+        assert_eq!(semantic.len(), 2);
+        assert!(matches!(
+            &semantic[0],
+            SemanticStatement::ResolvedCall { target, .. } if target == "CookieStore.load"
+        ));
+        assert!(matches!(
+            &semantic[1],
+            SemanticStatement::ResolvedCall { target, .. } if target.starts_with("_iso_stub_StackOverflow")
+        ));
+        assert!(matches!(
+            &functions[0].statements[0],
+            PseudoStatement::DirectCall {
+                target: Some(target),
+                ..
+            } if target.starts_with("_iso_stub_NullCastError")
+        ));
+    }
+
+    #[test]
+    fn named_calls_are_never_confused_with_stubs() {
+        let image_base = 0x10_0000;
+        let stubs = BTreeMap::from([(
+            0x2_74fb8u64,
+            "_iso_stub_NullCastErrorSharedWithoutFPURegsStub".to_owned(),
+        )]);
+        let mut function = recovered_closure("Cookie");
+        function.statements = vec![PseudoStatement::DirectCall {
+            address: "0x1010".to_owned(),
+            target_address: format!("0x{:x}", image_base + 0x2_74fb8),
+            target_code_address: None,
+            target_entry_offset: None,
+            target_resolution: None,
+            target: Some("CookieStore.load".to_owned()),
+            target_library_uri: None,
+            target_scope: CallTargetScope::Application,
+        }];
+        let mut functions = vec![function];
+        // A resolved semantic name at the same address is authoritative
+        // evidence; the stub relabel must not touch or remove it.
+        let rewritten = super::relabel_stub_call_targets(&mut functions, &stubs, image_base);
+        assert_eq!(rewritten, 0);
+    }
+
+    #[test]
+    fn enum_names_are_recovered_from_const_instances() {
+        let objects: Vec<super::AnalyzerObject> = [
+            serde_json::json!({
+                "id": 10, "type": "Class", "name": "Brightness",
+                "class_id": 2311, "is_enum": true
+            }),
+            serde_json::json!({"id": 11, "type": "String", "value": "light"}),
+            serde_json::json!({"id": 12, "type": "String", "value": "dark"}),
+            serde_json::json!({
+                "id": 13, "type": "Instance", "class": 10, "references": [11]
+            }),
+            serde_json::json!({
+                "id": 14, "type": "Instance", "class": 10, "references": [12]
+            }),
+            // A non-enum class instance with a String must not be collected.
+            serde_json::json!({"id": 15, "type": "Class", "name": "Plain"}),
+            serde_json::json!({
+                "id": 16, "type": "Instance", "class": 15, "references": [11]
+            }),
+        ]
+        .iter()
+        .map(|value| serde_json::from_value(value.clone()).expect("valid object"))
+        .collect();
+        let values = super::recover_enum_values(&objects);
+        assert_eq!(
+            values.get(&10).map(Vec::as_slice),
+            Some(&["light".to_owned(), "dark".to_owned()][..])
+        );
+        assert!(!values.contains_key(&15));
     }
 }

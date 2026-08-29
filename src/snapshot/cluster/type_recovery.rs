@@ -19,6 +19,97 @@ const FALSE_REFERENCE: i32 = 11;
 const TYPE_CLASS_ID_SHIFT: u32 = 3;
 const MAX_TYPE_DEPTH: usize = 12;
 
+/// Joins canonical const instances to their enum class to recover constant
+/// names without a VM oracle.
+///
+/// Every enum value is a canonical `Instance` whose cid is the enum's class
+/// id. `_Enum` declares `index` then `_name`, so the instance's first
+/// String-valued reference slot is `_name` — enhanced-enum fields are
+/// declared after the base ones and therefore sort later. The String payload
+/// is data, not an identifier, so `--obfuscate` leaves it intact.
+///
+/// Instances are visited in reference order, which is the order the
+/// serializer wrote the enum's constants, but ordering is treated as
+/// presentation only: no ordinal is claimed from it.
+fn recover_enum_values(
+    isolate: &ParseResult,
+    vm: &ParseResult,
+    cids: &Cids,
+) -> BTreeMap<i32, Vec<String>> {
+    // Only classes the snapshot itself marks as enums (state bit 9) may
+    // receive constants. Read from the object graph rather than the named
+    // table so tree-shaken/unnamed enum classes are still covered.
+    let mut enum_class_ids = BTreeSet::new();
+    for snapshot in [isolate, vm] {
+        for object in &snapshot.objects {
+            if object.cid != cids.class {
+                continue;
+            }
+            let scalars = snapshot.scalars_of(object);
+            let Some(SnapshotScalar::Tagged32(class_id)) = scalars.first() else {
+                continue;
+            };
+            let Some(SnapshotScalar::Tagged32(state_bits)) = scalars.get(6) else {
+                continue;
+            };
+            if state_bits & (1 << 9) != 0
+                && let Ok(class_id) = i32::try_from(*class_id)
+            {
+                enum_class_ids.insert(class_id);
+            }
+        }
+    }
+    if enum_class_ids.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut values = BTreeMap::<i32, Vec<String>>::new();
+    for snapshot in [isolate, vm] {
+        for object in &snapshot.objects {
+            if !object.canonical
+                || object.kind != SnapshotObjectKind::Instance
+                || !enum_class_ids.contains(&object.cid)
+            {
+                continue;
+            }
+            // First String-valued slot is `_Enum._name`. Strings are resolved
+            // through the string table directly: rodata-backed strings are
+            // registered there without a corresponding SnapshotObject, and in
+            // AOT that is where most string payloads live.
+            let name = snapshot.references_of(object).iter().find_map(|slot| {
+                snapshot
+                    .strings
+                    .get(slot)
+                    .or_else(|| vm.strings.get(slot))
+                    .filter(|name| is_enum_member_name(name))
+            });
+            if let Some(name) = name {
+                let members = values.entry(object.cid).or_default();
+                if !members.iter().any(|existing| existing == name) {
+                    members.push(name.clone());
+                }
+            }
+        }
+    }
+    let _ = cids;
+    values.retain(|_, members| !members.is_empty());
+    values
+}
+
+/// Enum constants are Dart identifiers. Requiring that shape keeps unrelated
+/// String payloads in an instance's slots from being promoted to members.
+fn is_enum_member_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
+}
+
 pub(super) struct TypeRecovery<'a> {
     isolate: &'a ParseResult,
     vm: &'a ParseResult,
@@ -26,6 +117,11 @@ pub(super) struct TypeRecovery<'a> {
     abi: Abi,
     obfuscation_map: Option<&'a crate::analysis::LoadedObfuscationMap>,
     class_references: BTreeMap<i32, i32>,
+    /// Class id -> recovered enum constant names, joined from the canonical
+    /// const-instance graph. `_Enum._name` is a plain String payload, so it
+    /// survives `--obfuscate` (which renames identifiers, not string data)
+    /// and is available without any VM oracle.
+    enum_values: BTreeMap<i32, Vec<String>>,
 }
 
 impl<'a> TypeRecovery<'a> {
@@ -60,6 +156,7 @@ impl<'a> TypeRecovery<'a> {
             cids,
             abi,
             obfuscation_map,
+            enum_values: recover_enum_values(isolate, vm, cids),
             class_references,
         }
     }
@@ -198,9 +295,7 @@ impl<'a> TypeRecovery<'a> {
                 .iter()
                 .find(|cluster| cluster.cid == class_id && cluster.next_field_words > 0)
                 .map(|cluster| i64::from(cluster.next_field_words));
-            let field_end = next_field_words
-                .map(|words| words.min(64))
-                .unwrap_or(64);
+            let field_end = next_field_words.map(|words| words.min(64)).unwrap_or(64);
             for word in header_words..field_end {
                 if word < 0 {
                     continue;
@@ -232,6 +327,7 @@ impl<'a> TypeRecovery<'a> {
             interfaces,
             is_abstract: bit(state_bits, 6),
             is_enum: bit(state_bits, 9),
+            enum_values: self.enum_values.get(&class_id).cloned().unwrap_or_default(),
             is_transformed_mixin_application: bit(state_bits, 10),
             is_sealed: bit(state_bits, 14),
             is_mixin_class: bit(state_bits, 15),
@@ -1012,29 +1108,105 @@ mod tests {
         // clear reference slots the unboxed bitmap never records, bit 4 is
         // a genuine unboxed word.
         snapshot.instance_bitmaps.insert(46, 0b101_0000);
-        snapshot.clusters.push(crate::snapshot::cluster::types::Cluster {
-            cid: 46,
-            canonical: false,
-            count: 1,
-            start_ref: 0,
-            next_field_words: 5,
-            main_count: 0,
-            lengths: Vec::new(),
-            predefined_cids: Vec::new(),
-            discarded: Vec::new(),
-            allocation_values: Vec::new(),
-        });
+        snapshot
+            .clusters
+            .push(crate::snapshot::cluster::types::Cluster {
+                cid: 46,
+                canonical: false,
+                count: 1,
+                start_ref: 0,
+                next_field_words: 5,
+                main_count: 0,
+                lengths: Vec::new(),
+                predefined_cids: Vec::new(),
+                discarded: Vec::new(),
+                allocation_values: Vec::new(),
+            });
 
         let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::Arm64V8a, None);
         let metadata = types.class_metadata(62).expect("class metadata");
         let slots = &metadata.instance_slots;
-        assert_eq!(slots.len(), 3, "bits beyond next_field_words must not appear");
+        assert_eq!(
+            slots.len(),
+            3,
+            "bits beyond next_field_words must not appear"
+        );
         assert_eq!(slots[0].slot_type, "reference");
         assert!(slots[0].is_reference);
         assert!(slots[1].is_reference);
         assert_eq!(slots[2].slot_type, "unboxed_field");
         assert!(!slots[2].is_reference);
         assert_eq!(slots[2].offset, 16);
+    }
+
+    #[test]
+    fn recovers_enum_member_names_from_canonical_const_instances() {
+        use crate::snapshot::cluster::types::SnapshotScalar as Scalar;
+        let cids = test_cids();
+        let mut snapshot = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        // Class 900 is marked enum (state bit 9); class 901 is not.
+        let class_scalars = |class_id: u32, is_enum: bool| SnapshotObjectPayload {
+            references: Vec::new(),
+            scalars: vec![
+                Scalar::Tagged32(class_id),
+                Scalar::Tagged32(0),
+                Scalar::Tagged32(0),
+                Scalar::Tagged32(0),
+                Scalar::Tagged32(0),
+                Scalar::Tagged32(0),
+                Scalar::Tagged32(if is_enum { 1 << 9 } else { 0 }),
+            ],
+            bytes: Vec::new(),
+        };
+        snapshot.insert_object(
+            70,
+            cids.class,
+            false,
+            SnapshotObjectKind::Class,
+            class_scalars(900, true),
+        );
+        snapshot.insert_object(
+            71,
+            cids.class,
+            false,
+            SnapshotObjectKind::Class,
+            class_scalars(901, false),
+        );
+
+        // `_Enum` lays out index then _name; the index slot is unboxed, so the
+        // first reference slot is the name string.
+        snapshot.strings.insert(200, "light".to_owned());
+        snapshot.strings.insert(201, "dark".to_owned());
+        snapshot.strings.insert(202, "notAnEnumMember".to_owned());
+        let instance = |name_ref: i32| SnapshotObjectPayload {
+            references: vec![name_ref],
+            scalars: vec![Scalar::Tagged32(0)],
+            bytes: Vec::new(),
+        };
+        snapshot.insert_object(300, 900, true, SnapshotObjectKind::Instance, instance(200));
+        snapshot.insert_object(301, 900, true, SnapshotObjectKind::Instance, instance(201));
+        // Non-enum class instance must never contribute members.
+        snapshot.insert_object(302, 901, true, SnapshotObjectKind::Instance, instance(202));
+        // Non-canonical instance of the enum class is not a declared constant.
+        snapshot.insert_object(303, 900, false, SnapshotObjectKind::Instance, instance(202));
+
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::ArmeabiV7a, None);
+        let metadata = types.class_metadata(70).expect("enum class metadata");
+        assert!(metadata.is_enum);
+        assert_eq!(metadata.enum_values, vec!["light", "dark"]);
+
+        let plain = types.class_metadata(71).expect("plain class metadata");
+        assert!(!plain.is_enum);
+        assert!(
+            plain.enum_values.is_empty(),
+            "non-enum classes never receive recovered constants"
+        );
     }
 
     #[test]
@@ -1066,13 +1238,7 @@ mod tests {
                 bytes: Vec::new(),
             },
         );
-        let types = super::TypeRecovery::new(
-            &snapshot,
-            &snapshot,
-            &cids,
-            Abi::Arm64V8a,
-            None,
-        );
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::Arm64V8a, None);
         let metadata = types.class_metadata(61).expect("class metadata");
         assert!(metadata.instance_slots.is_empty());
     }

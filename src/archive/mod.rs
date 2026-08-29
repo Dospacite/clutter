@@ -39,6 +39,61 @@ impl Artifact {
         {
             ArtifactFormat::Aab
         } else {
+            // P3 amount: some distributors ship a wrapper ZIP containing a single
+            // inner .apk (e.g. wrapper.apk -> Inner-1.0.apk).
+            // Treat the first inner apk that itself looks like a Flutter APK/AAB
+            // as the subject – this recovers wrapped applications without
+            // requiring the user to manually unzip the wrapper.
+            let apk_candidates: Vec<String> = all_names
+                .iter()
+                .filter(|name| name.to_ascii_lowercase().ends_with(".apk"))
+                .cloned()
+                .collect();
+            if let Some(inner_name) = apk_candidates.first() {
+                let mut inner_bytes = Vec::new();
+                if let Ok(mut entry) = zip.by_name(inner_name) {
+                    if entry.read_to_end(&mut inner_bytes).is_ok() {
+                        let cursor = std::io::Cursor::new(inner_bytes);
+                        if let Ok(inner_zip) = ZipArchive::new(cursor) {
+                            let inner_names: BTreeSet<String> =
+                                inner_zip.file_names().map(str::to_owned).collect();
+                            let looks_like_apk = inner_names.contains("AndroidManifest.xml")
+                                || inner_names
+                                    .iter()
+                                    .any(|name| name.ends_with("/manifest/AndroidManifest.xml"));
+                            if looks_like_apk {
+                                let tmp = std::env::temp_dir().join(format!(
+                                    "clutter-wrapper-{}-{}.apk",
+                                    std::process::id(),
+                                    inner_name.replace(['/', '\\'], "_")
+                                ));
+                                if std::fs::write(&tmp, inner_zip.into_inner().into_inner()).is_ok()
+                                {
+                                    match Self::open(&tmp) {
+                                        Ok(artifact) => {
+                                            // Keep the original wrapper path in the report for
+                                            // provenance, but return the inner artifact's
+                                            // payload. Re-create with wrapper path.
+                                            let mut info = artifact.info;
+                                            info.path = path.clone();
+                                            return Ok(Self { path, info });
+                                        }
+                                        Err(inner_err) => {
+                                            // Inner is a valid APK/AAB but not Flutter – surface
+                                            // the more specific Flutter error instead of the
+                                            // generic wrapper-manifest error.
+                                            let msg = format!("{inner_err}");
+                                            if msg.contains("libapp.so") {
+                                                return Err(inner_err);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return Err(ClutterError::InvalidArtifact(
                 "ZIP does not contain an APK or AAB Android manifest".to_owned(),
             ));

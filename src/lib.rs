@@ -4,6 +4,7 @@ mod cli;
 mod diagnostic;
 mod elf;
 mod evidence;
+mod fingerprint;
 mod model;
 mod output;
 mod render;

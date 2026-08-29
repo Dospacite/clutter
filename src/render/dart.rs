@@ -43,7 +43,9 @@ pub(crate) fn callee_optional_named(
     let mut vm_names = vm_evidence.map(|evidence| {
         let mut names: BTreeMap<usize, String> = BTreeMap::new();
         for parameter in &evidence.parameters {
-            if !parameter.is_implicit && let Some(name) = parameter.name.as_deref() {
+            if !parameter.is_implicit
+                && let Some(name) = parameter.name.as_deref()
+            {
                 names.insert(parameter.position.saturating_sub(1), name.to_owned());
             }
         }
@@ -199,10 +201,7 @@ impl RenderIndex {
                 implicit_parameter_count: signature
                     .map(|signature| signature.implicit_parameter_count),
                 fixed_parameter_count: signature.map(|signature| signature.fixed_parameter_count),
-                optional_named: callee_optional_named(
-                    signature,
-                    function.vm_evidence.as_ref(),
-                ),
+                optional_named: callee_optional_named(signature, function.vm_evidence.as_ref()),
                 optional_positional: signature.map_or(0, |signature| {
                     if signature.optional_parameters_are_named {
                         0
@@ -397,10 +396,17 @@ pub(super) fn render_library(
     for (owner, functions) in classes {
         writeln!(output).unwrap();
         let declaration = class_declarations.get(&owner).copied();
-        if declaration
-            .and_then(|declaration| declaration.class_metadata.as_ref())
-            .is_some_and(|metadata| metadata.is_enum)
-        {
+        let metadata = declaration.and_then(|declaration| declaration.class_metadata.as_ref());
+        // A populated const-instance graph restores the enum's real member
+        // names; render a genuine `enum` declaration instead of a class
+        // container with placeholder slots.
+        let enum_metadata =
+            metadata.filter(|metadata| metadata.is_enum && !metadata.enum_values.is_empty());
+        if let Some(metadata) = enum_metadata {
+            render_enum_declaration(&mut output, &owner, metadata, &metadata.enum_values);
+            continue;
+        }
+        if metadata.is_some_and(|metadata| metadata.is_enum) {
             writeln!(
                 output,
                 "/// Snapshot class flags identify this declaration as an enum; values may be tree-shaken."
@@ -699,6 +705,63 @@ fn class_declaration_header(
     output
 }
 
+/// Renders a genuine `enum` declaration from names recovered out of the
+/// snapshot's const-instance graph. Names are object-identity evidence; the
+/// declaration stays sound by never inventing values the graph did not keep,
+/// and instance slots that survived alongside the enum (enhanced-enum fields)
+/// are still listed as members.
+fn render_enum_declaration(
+    output: &mut String,
+    owner: &str,
+    metadata: &RecoveredClassMetadata,
+    values: &[String],
+) {
+    writeln!(
+        output,
+        "/// Enum constant names recovered from the snapshot's const-instance graph."
+    )
+    .unwrap();
+    let members = values
+        .iter()
+        .map(|value| dart_identifier(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let interfaces = metadata.interfaces.as_slice();
+    if interfaces.is_empty() {
+        writeln!(output, "enum {} {{", dart_identifier(owner)).unwrap();
+    } else {
+        writeln!(
+            output,
+            "enum {} implements {} {{",
+            dart_identifier(owner),
+            interfaces
+                .iter()
+                .map(rendered_type)
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+        .unwrap();
+    }
+    for value in members.split(", ").filter(|value| !value.is_empty()) {
+        writeln!(output, "  {value},").unwrap();
+    }
+    if !metadata.instance_slots.is_empty() {
+        // Instance slots include the two `_Enum` base fields (`index`,
+        // `_name`) that every enum inherits; only slots beyond them can be
+        // enhanced-enum fields. The layout does not prove which is which, so
+        // the block is reported verbatim rather than split into declarations.
+        writeln!(
+            output,
+            "  // AOT instance layout (includes inherited _Enum index/_name):"
+        )
+        .unwrap();
+        for slot in &metadata.instance_slots {
+            writeln!(output, "  //   +0x{:x}: {}", slot.offset, slot.slot_type).unwrap();
+        }
+    }
+    writeln!(output, "}}").unwrap();
+}
+
 fn inferred_mixin_declaration(
     owner: &str,
     metadata: &RecoveredClassMetadata,
@@ -891,8 +954,7 @@ fn inline_host_names(
     for function in &program.functions {
         let matches_callee = function.inlined_functions.iter().any(|callee| {
             callee.name == declaration.name
-                && (callee.library_uri.is_none()
-                    || callee.library_uri == declaration.library_uri)
+                && (callee.library_uri.is_none() || callee.library_uri == declaration.library_uri)
         });
         if matches_callee {
             hosts.push(qualified_name(function));
@@ -1577,11 +1639,7 @@ fn render_function(
     let source_operator = if collision_count > 1 {
         None
     } else {
-        source_operator_syntax(
-            forwarder_selector
-                .as_deref()
-                .unwrap_or(&function.name),
-        )
+        source_operator_syntax(forwarder_selector.as_deref().unwrap_or(&function.name))
     };
     let accessor_name: &str = if is_accessor {
         function
@@ -1599,7 +1657,9 @@ fn render_function(
             "{indent}{static_prefix}{return_type} operator {operator_symbol}{parameters_line}{async_modifier} {{"
         )
         .unwrap();
-    } else if function.kind == Some(RecoveredFunctionKind::Setter) || function.name.starts_with("set:") {
+    } else if function.kind == Some(RecoveredFunctionKind::Setter)
+        || function.name.starts_with("set:")
+    {
         writeln!(
             output,
             "{indent}{static_prefix}set {accessor_name}{parameters_line}{async_modifier} {{"
@@ -1826,11 +1886,18 @@ unstructured={} branches={} loops={}",
                     .iter()
                     .enumerate()
                     .filter(|(statement_index, statement)| {
-                        matches!(statement, SemanticStatement::ResolvedCall { .. } | SemanticStatement::Return { .. } | SemanticStatement::FieldWrite { .. } | SemanticStatement::FieldRead { .. } | SemanticStatement::Condition { .. } | SemanticStatement::StringInterpolation { .. })
-                            && (0..structured.claimed.len())
-                                .contains(statement_index)
+                        matches!(
+                            statement,
+                            SemanticStatement::ResolvedCall { .. }
+                                | SemanticStatement::Return { .. }
+                                | SemanticStatement::FieldWrite { .. }
+                                | SemanticStatement::FieldRead { .. }
+                                | SemanticStatement::Condition { .. }
+                                | SemanticStatement::StringInterpolation { .. }
+                        ) && (0..structured.claimed.len()).contains(statement_index)
                             && parse_hex(statement.address()).is_some_and(|address| {
-                                let pc = u32::try_from(address.saturating_sub(base)).unwrap_or(u32::MAX);
+                                let pc =
+                                    u32::try_from(address.saturating_sub(base)).unwrap_or(u32::MAX);
                                 region.start_pc_offset <= pc && pc < region.end_pc_offset
                             })
                     })
@@ -1931,9 +1998,7 @@ fn parse_hex(value: &str) -> Option<u64> {
 /// and bare `snapshotRef(`/`snapshotInstance(` helpers gain their missing
 /// `aot.` qualifier (probe EC-5).
 fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> String {
-    const KEEP_WORDS: &[&str] = &[
-        "this", "null", "true", "false", "super",
-    ];
+    const KEEP_WORDS: &[&str] = &["this", "null", "true", "false", "super"];
     let mut output = String::with_capacity(body.len());
     let mut characters = body.char_indices().peekable();
     // Lexer state so comment and string contents pass through untouched,
@@ -1951,9 +2016,7 @@ fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> St
         }
         if in_block_comment {
             output.push(character);
-            if character == '*'
-                && characters.peek().is_some_and(|(_, next)| *next == '/')
-            {
+            if character == '*' && characters.peek().is_some_and(|(_, next)| *next == '/') {
                 output.push('/');
                 characters.next();
                 in_block_comment = false;
@@ -1993,8 +2056,7 @@ fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> St
                                 _ => hole.push(hole_character),
                             }
                         }
-                        let sanitized_hole =
-                            sanitize_free_machine_identifiers(&hole, bound);
+                        let sanitized_hole = sanitize_free_machine_identifiers(&hole, bound);
                         output.push_str(&sanitized_hole);
                         output.push('}');
                     }
@@ -2017,8 +2079,9 @@ fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> St
                 in_string = Some(character);
                 output.push(character);
             }
-            character if character.is_ascii_alphabetic() || character == '_' || character == '$'
-            => {
+            character
+                if character.is_ascii_alphabetic() || character == '_' || character == '$' =>
+            {
                 let start = index;
                 let mut end = index + character.len_utf8();
                 while let Some((_, next)) = characters.peek() {
@@ -2035,10 +2098,7 @@ fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> St
                     .rev()
                     .find(|character| !character.is_whitespace())
                     == Some('.');
-                if preceded_by_dot
-                    || KEEP_WORDS.contains(&token)
-                    || bound.contains(token)
-                {
+                if preceded_by_dot || KEEP_WORDS.contains(&token) || bound.contains(token) {
                     output.push_str(token);
                     continue;
                 }
@@ -2102,10 +2162,7 @@ fn collect_declared_identifiers(body: &str, parameters: &str) -> BTreeSet<String
         let declaration = rest.trim_start();
         let mut end = 0usize;
         for character in declaration.chars() {
-            if character.is_ascii_alphanumeric()
-                || character == '_'
-                || character == '$'
-            {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '$' {
                 end += character.len_utf8();
             } else {
                 break;
@@ -2258,7 +2315,11 @@ fn node_statement_span(
             let address = parse(*index)?;
             Some((address, address))
         }
-        StructureNode::If { then_body, else_body, .. } => {
+        StructureNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
             let mut spans = vec![node_statement_span(function, then_body)];
             if let Some(else_body) = else_body {
                 spans.push(node_statement_span(function, else_body));
@@ -2322,8 +2383,7 @@ impl<'a> BodyEmitter<'a> {
         writeln!(
             output,
             "{indent}try {{ // protected range 0x{:x}..0x{:x}",
-            region.start,
-            region.end
+            region.start, region.end
         )
         .unwrap();
         self.emit_node(output, function, node, indent);
@@ -2362,9 +2422,22 @@ impl<'a> BodyEmitter<'a> {
             }
             StructureNode::Linear(statements) => {
                 let mut position = 0usize;
+                let mut current_band: Option<i64> = None;
                 while position < statements.len() {
                     let index = statements[position];
                     let statement = &function.semantic_statements[index];
+                    // Source-line bands (C1): when the statement's band
+                    // changes within one straight-line region, the compiler
+                    // moved to a new source statement. Emit a band marker so
+                    // readers see which recovered lines belong together;
+                    // bands come from the retained CodeSourceMap and are
+                    // absent for split-debug builds.
+                    if let Some(band) = function.source_bands.get(statement.address()) {
+                        if current_band.is_some_and(|previous| previous != *band) {
+                            writeln!(output, "{indent}// source line {band}:").unwrap();
+                        }
+                        current_band = Some(*band);
+                    }
                     // AOT lowers `Class(...)` into an allocator call followed
                     // by the real constructor consuming the new instance.
                     // Render the pair as one constructor invocation.
@@ -2489,7 +2562,7 @@ impl<'a> BodyEmitter<'a> {
                     // Close the catch clause opened above. A nested try opened
                     // *inside* the handler stays open and closes at its own
                     // handler or at function end.
-                    writeln!(output, "{indent}}}" ).unwrap();
+                    writeln!(output, "{indent}}}").unwrap();
                 }
             }
             StructureNode::While {
@@ -3061,15 +3134,12 @@ fn detected_async_style(function: &RecoveredFunction) -> Option<AsyncStyle> {
     // generator whose flavor evidence was erased. The modifier renders as a
     // comment either way; the load-bearing effect is machine suppression.
     if style.is_none()
-        && function
-            .code_metadata
-            .as_ref()
-            .is_some_and(|metadata| {
-                metadata
-                    .pc_descriptors
-                    .iter()
-                    .any(|descriptor| descriptor.yield_index >= 0)
-            })
+        && function.code_metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .pc_descriptors
+                .iter()
+                .any(|descriptor| descriptor.yield_index >= 0)
+        })
     {
         style = Some(AsyncStyle::SyncStar);
     }
@@ -3983,10 +4053,7 @@ impl BodyEmitter<'_> {
 /// Formats a catch clause head. When the snapshot's handler row carries
 /// proven guard types (`on X catch`), the first type renders as the `on`
 /// clause; multiple guards stay honest with a comment listing them.
-fn catch_clause_head(
-    indent: &str,
-    region: &TryRegionView,
-) -> String {
+fn catch_clause_head(indent: &str, region: &TryRegionView) -> String {
     let stack = if region.needs_stack_trace && !region.has_catch_all {
         ", stackTrace"
     } else {
@@ -3998,9 +4065,7 @@ fn catch_clause_head(
                 format!("{indent}}} on {guard} catch (e{stack}) {{")
             } else {
                 let others = region.guard_types[1..].join(" | ");
-                format!(
-                    "{indent}}} on {guard} catch (e{stack}) {{ // also catches: {others}"
-                )
+                format!("{indent}}} on {guard} catch (e{stack}) {{ // also catches: {others}")
             }
         }
         _ => format!("{indent}}} catch (e{stack}) {{"),
@@ -4477,13 +4542,16 @@ fn readable_operator_name(value: &str) -> Option<&'static str> {
 /// only rename is the VM's `unary-` selector, which is Dart's unary `-`.
 fn source_operator_syntax(name: &str) -> Option<&'static str> {
     const OPERATOR_SYMBOLS: &[&str] = &[
-        "+", "-", "*", "/", "~/", "%", "|", "&", "^", "<<", ">>", ">>>", "==", "<", ">",
-        "<=", ">=", "[]", "[]=", "~",
+        "+", "-", "*", "/", "~/", "%", "|", "&", "^", "<<", ">>", ">>>", "==", "<", ">", "<=",
+        ">=", "[]", "[]=", "~",
     ];
     if name == "unary-" {
         return Some("-");
     }
-    OPERATOR_SYMBOLS.iter().copied().find(|symbol| *symbol == name)
+    OPERATOR_SYMBOLS
+        .iter()
+        .copied()
+        .find(|symbol| *symbol == name)
 }
 
 pub fn render_support() -> String {
@@ -4666,13 +4734,12 @@ mod tests {
     };
 
     use super::{
-        AsyncStyle, RenderIndex, closure_parent_index, dart_string, detected_async_style,
-        friendly_invoke_target, normalize_function_type_syntax, prettify_snapshot_instance,
-        readable_function_name, readable_nested_string, relative_support_import,
-        render_dynamic_dispatch_evidence, render_library, render_readable_calls,
-        render_readable_expression, render_support, render_type_parameters,
+        AsyncStyle, RenderIndex, callee_optional_named, closure_parent_index, dart_string,
+        detected_async_style, friendly_invoke_target, normalize_function_type_syntax,
+        prettify_snapshot_instance, readable_function_name, readable_nested_string,
+        relative_support_import, render_dynamic_dispatch_evidence, render_library,
+        render_readable_calls, render_readable_expression, render_support, render_type_parameters,
         rendered_function_symbol_root, rendered_parameters, rendered_return_type, variable_stem,
-        callee_optional_named,
     };
 
     #[test]
@@ -5264,6 +5331,7 @@ while (true) {
             instructions: Vec::new(),
             control_flow: Vec::new(),
             semantic_statements: Vec::new(),
+            source_bands: BTreeMap::new(),
             statements: Vec::new(),
         }
     }

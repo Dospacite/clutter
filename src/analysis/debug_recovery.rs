@@ -474,6 +474,8 @@ pub fn recover(
             parameter_count,
             None,
             None,
+            None,
+            None,
         )?;
         if let Some(snapshot) = &snapshot_match {
             retain_snapshot_analysis_hints(&mut disassembly, snapshot);
@@ -535,6 +537,13 @@ pub fn recover(
             code_metadata: snapshot_match
                 .as_ref()
                 .and_then(|function| function.code_metadata.clone()),
+            source_bands: crate::snapshot::source_bands_from_metadata(
+                snapshot_match
+                    .as_ref()
+                    .and_then(|function| function.code_metadata.as_ref()),
+                debug_function.address,
+                &disassembly.semantic_statements,
+            ),
             machine_code: disassembly.evidence,
             instructions: disassembly.instructions,
             control_flow: disassembly.control_flow,
@@ -904,6 +913,7 @@ mod tests {
                     .collect(),
                 is_abstract: is_transformed_mixin_application,
                 is_enum: false,
+                enum_values: Vec::new(),
                 is_sealed: false,
                 is_mixin_class: false,
                 is_base: false,

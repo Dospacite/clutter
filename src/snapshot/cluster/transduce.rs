@@ -25,13 +25,29 @@ pub fn recover(snapshot: &ParseResult, partition: &str) -> Vec<RecoveredString> 
     let mut recovered = snapshot
         .strings
         .iter()
-        .map(|(reference, value)| RecoveredString {
-            value: value.clone(),
-            source: RecoveredStringSource::SnapshotObject,
-            file_offset: None,
-            snapshot_reference: Some(format!("{partition}:{reference}")),
-            transform: None,
-            confidence: None,
+        .filter_map(|(reference, value)| {
+            // P4: huge control-char allocations (e.g. obfuscated `allocateOneByteString`
+            // noise) otherwise pollute `lib/main.dart` with inline literals. Keep
+            // bounded human-readable heap strings; the raw bytes stay reachable
+            // via `aot.snapshotRef` and `reports/coverage.json`.
+            if value.len() > 1024 || value.contains('\0') {
+                return None;
+            }
+            if value
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+                && text_score(value) < MIN_TEXT_SCORE
+            {
+                return None;
+            }
+            Some(RecoveredString {
+                value: value.clone(),
+                source: RecoveredStringSource::SnapshotObject,
+                file_offset: None,
+                snapshot_reference: Some(format!("{partition}:{reference}")),
+                transform: None,
+                confidence: None,
+            })
         })
         .collect::<Vec<_>>();
 

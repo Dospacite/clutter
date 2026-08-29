@@ -11,6 +11,22 @@ android_ndk_root=$(realpath "$2")
 shift 2
 script_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 patch_path="$script_root/dart-sdk-3.11.4.patch"
+# Revision-coupled patch selection, mirroring build-exact-analyzers.sh.
+# `CLUTTER_ANALYZER_PATCH` pins a variant; otherwise probe every shipped
+# patch against this checkout and use the one that applies.
+if [[ -n "${CLUTTER_ANALYZER_PATCH:-}" ]]; then
+  patch_path=$(realpath "$CLUTTER_ANALYZER_PATCH")
+else
+  for candidate in "$script_root"/dart-sdk-*.patch; do
+    [[ -e "$candidate" ]] || continue
+    if git -C "$dart_sdk_root" apply --check "$candidate" 2>/dev/null ||
+      git -C "$dart_sdk_root" apply --check --reverse "$candidate" 2>/dev/null; then
+      patch_path="$candidate"
+      break
+    fi
+  done
+fi
+echo "using analyzer patch: $(basename "$patch_path")"
 
 if [[ ! -f "$dart_sdk_root/runtime/vm/analyze_snapshot_api_impl.cc" ]]; then
   echo "not a Dart SDK source checkout: $dart_sdk_root" >&2
