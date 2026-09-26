@@ -29,7 +29,16 @@ enum AllocKind {
     Empty,
 }
 
-pub fn scan(data: &[u8], start: usize, profile: &Profile, is_vm: bool) -> Result<ParseResult> {
+/// `root_unit` is false for a deferred loading unit, whose canonical
+/// clusters carry no canonical-set layout (`BuildCanonicalSetFromLayout`
+/// only reads it for the root unit).
+pub fn scan(
+    data: &[u8],
+    start: usize,
+    profile: &Profile,
+    is_vm: bool,
+    root_unit: bool,
+) -> Result<ParseResult> {
     let mut reader = Reader::at(data, start)?;
     let header = ClusterHeader {
         num_base_objects: reader.unsigned()?,
@@ -63,6 +72,7 @@ pub fn scan(data: &[u8], start: usize, profile: &Profile, is_vm: bool) -> Result
             &profile.cids,
             profile.compressed_pointers,
             is_vm,
+            root_unit,
         )?;
         next_ref = next_ref
             .checked_add(i32::try_from(cluster.count).map_err(|_| {
@@ -90,6 +100,7 @@ fn read_alloc(
     cids: &Cids,
     compressed_pointers: bool,
     is_vm: bool,
+    root_unit: bool,
 ) -> Result<()> {
     match classify(cluster.cid, cids) {
         AllocKind::Simple => {
@@ -97,7 +108,7 @@ fn read_alloc(
         }
         AllocKind::CanonicalSet => {
             cluster.count = read_count(reader, "canonical objects")?;
-            if cluster.canonical {
+            if cluster.canonical && root_unit {
                 skip_canonical_set(reader, cluster.count)?;
             }
         }
@@ -109,7 +120,7 @@ fn read_alloc(
                     .lengths
                     .push(checked_usize(reader.unsigned()?, "encoded string length")?);
             }
-            if cluster.canonical && !is_vm {
+            if cluster.canonical && !is_vm && root_unit {
                 skip_canonical_set(reader, cluster.count)?;
             }
         }
@@ -120,7 +131,7 @@ fn read_alloc(
                     .lengths
                     .push(checked_usize(reader.unsigned()?, "string offset delta")?);
             }
-            if cluster.canonical && cluster.cid == cids.string {
+            if cluster.canonical && cluster.cid == cids.string && root_unit {
                 skip_canonical_set(reader, cluster.count)?;
             }
         }
@@ -153,7 +164,7 @@ fn read_alloc(
                     .lengths
                     .push(checked_usize(reader.unsigned()?, "type argument length")?);
             }
-            if cluster.canonical {
+            if cluster.canonical && root_unit {
                 skip_canonical_set(reader, cluster.count)?;
             }
         }

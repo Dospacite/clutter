@@ -60,7 +60,7 @@ def matching_statements(program: dict, expected: dict) -> list[dict]:
                 continue
             if any(
                 statement.get(field) != expected[field]
-                for field in ("expression", "target", "arguments")
+                for field in ("expression", "target", "arguments", "confidence", "parts")
                 if field in expected
             ):
                 continue
@@ -120,7 +120,7 @@ def main() -> int:
             + "; pass --allow-partial for a focused run"
         )
 
-    report: dict[str, dict] = {"variants": {}, "semantic_statements": {}}
+    report: dict[str, dict] = {"variants": {}, "semantic_statements": {}, "forbidden_semantic_statements": {}}
     stale: dict[str, list[str]] = {}
     passed = True
     programs: dict[str, dict] = {}
@@ -170,6 +170,16 @@ def main() -> int:
             feature_report[name] = {"passed": bool(matches), "matches": matches}
             passed &= bool(matches)
         report["semantic_statements"][expected["id"]] = feature_report
+
+    for forbidden in expectations.get("forbidden_semantic_statements", []):
+        feature_report = {}
+        for name in forbidden["variants"]:
+            if name not in programs:
+                continue
+            matches = matching_statements(programs[name], forbidden)
+            feature_report[name] = {"passed": not matches, "matches": matches}
+            passed &= not matches
+        report["forbidden_semantic_statements"][forbidden["id"]] = feature_report
 
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if passed else 1

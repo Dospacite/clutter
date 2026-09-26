@@ -29,6 +29,9 @@ pub(super) struct ResolveOptions<'a> {
     pub scope: Scope,
     pub application_package: Option<&'a str>,
     pub obfuscation_map: Option<&'a crate::analysis::LoadedObfuscationMap>,
+    pub instance_header_words: usize,
+    pub unboxed_word_u32_chunks: usize,
+    pub async_modifier_shift: Option<u32>,
 }
 
 pub fn parse_table(
@@ -204,6 +207,49 @@ pub fn resolve(
     image: &CodeImage,
     options: ResolveOptions<'_>,
 ) -> Result<super::Recovery> {
+    let ranges = root_ranges(isolate, table)?;
+    resolve_ranges(isolate, vm, cids, table, image, options, ranges)
+}
+
+/// Recovers a deferred loading unit's functions: the root Code objects the
+/// unit supplies instructions for, in unit instruction-table order
+/// (`Deserializer::ReadInstructions` assigns them sequentially).
+pub(super) fn resolve_unit(
+    merged: &ParseResult,
+    vm: &ParseResult,
+    cids: &Cids,
+    unit: &super::unit::UnitSnapshot,
+    image: &CodeImage,
+    options: ResolveOptions<'_>,
+) -> Result<super::Recovery> {
+    let mut ranges = Vec::with_capacity(unit.codes.len());
+    for (index, unit_code) in unit.codes.iter().enumerate() {
+        let slot = unit.table.first_code.checked_add(index).ok_or_else(|| {
+            ClutterError::InvalidArtifact("unit instruction table slot overflow".to_owned())
+        })?;
+        let entry = unit.table.entries.get(slot).ok_or_else(|| {
+            ClutterError::InvalidArtifact(format!(
+                "deferred Code {} maps to missing unit instruction slot {slot}",
+                unit_code.code_ref
+            ))
+        })?;
+        let owner_ref = merged
+            .codes
+            .iter()
+            .find(|code| code.ref_id == unit_code.code_ref)
+            .map_or(-1, |code| code.owner_ref);
+        ranges.push(Range {
+            code_ref: unit_code.code_ref,
+            owner_ref,
+            pc_offset: entry.pc_offset,
+            stack_map_offset: entry.stack_map_offset,
+            size: 0,
+        });
+    }
+    resolve_ranges(merged, vm, cids, &unit.table, image, options, ranges)
+}
+
+fn root_ranges(isolate: &ParseResult, table: &InstructionTable) -> Result<Vec<Range>> {
     let mut ranges = Vec::new();
     let mut claimed_slots = std::collections::BTreeSet::new();
     for (function_ref, function) in &isolate.named {
@@ -258,6 +304,18 @@ pub fn resolve(
             size: 0,
         });
     }
+    Ok(ranges)
+}
+
+fn resolve_ranges(
+    isolate: &ParseResult,
+    vm: &ParseResult,
+    cids: &Cids,
+    table: &InstructionTable,
+    image: &CodeImage,
+    options: ResolveOptions<'_>,
+    mut ranges: Vec<Range>,
+) -> Result<super::Recovery> {
     ranges.sort_by_key(|range| range.pc_offset);
     assign_sizes(
         &mut ranges,
@@ -293,46 +351,60 @@ pub fn resolve(
     } else {
         options.scope
     };
+    let root_stubs = root_stub_labels(isolate, cids);
     let mut symbols = BTreeMap::new();
     for range in &ranges {
         let address = image.image_virtual_address + u64::from(range.pc_offset);
         let symbol = {
-            let raw_function = names.name(range.owner_ref);
-            if raw_function.is_empty() {
-                crate::analysis::disassembly::Symbol::code_boundary(address)
-            } else {
-                let function = restore_snapshot_name(&raw_function, options.obfuscation_map);
-                let attribution_ref = initializer_fields
-                    .get(&range.owner_ref)
-                    .copied()
-                    .unwrap_or(range.owner_ref);
-                let owner = restore_snapshot_name(
-                    &names.owner_name(attribution_ref),
-                    options.obfuscation_map,
-                );
-                let display = if owner.is_empty() {
-                    function
-                } else {
-                    format!("{owner}.{function}")
-                };
-                let library_uri = restore_library_uri(
-                    names.library_uri(attribution_ref),
-                    options.obfuscation_map,
-                );
-                let result_class = isolate
-                    .named
-                    .get(&range.owner_ref)
-                    .and_then(|function| function.function_kind_tag)
-                    .and_then(RecoveredFunctionKind::from_raw_tag)
-                    .filter(|kind| *kind == RecoveredFunctionKind::Constructor)
-                    .and_then(|_| (!owner.is_empty()).then_some(owner));
+            if let Some(label) = root_stubs.get(&range.code_ref) {
                 crate::analysis::disassembly::Symbol::new(
-                    display,
-                    library_uri,
+                    label.clone(),
+                    None,
                     application_package.as_deref(),
                 )
-                .with_code_identity(address, 0, crate::model::DirectCallResolution::ExactEntry)
-                .with_result_class(result_class)
+                .with_code_identity(
+                    address,
+                    0,
+                    crate::model::DirectCallResolution::ExactEntry,
+                )
+            } else {
+                let raw_function = names.name(range.owner_ref);
+                if raw_function.is_empty() {
+                    crate::analysis::disassembly::Symbol::code_boundary(address)
+                } else {
+                    let function = restore_snapshot_name(&raw_function, options.obfuscation_map);
+                    let attribution_ref = initializer_fields
+                        .get(&range.owner_ref)
+                        .copied()
+                        .unwrap_or(range.owner_ref);
+                    let owner = restore_snapshot_name(
+                        &names.owner_name(attribution_ref),
+                        options.obfuscation_map,
+                    );
+                    let display = if owner.is_empty() {
+                        function
+                    } else {
+                        format!("{owner}.{function}")
+                    };
+                    let library_uri = restore_library_uri(
+                        names.library_uri(attribution_ref),
+                        options.obfuscation_map,
+                    );
+                    let result_class = isolate
+                        .named
+                        .get(&range.owner_ref)
+                        .and_then(|function| function.function_kind_tag)
+                        .and_then(RecoveredFunctionKind::from_raw_tag)
+                        .filter(|kind| *kind == RecoveredFunctionKind::Constructor)
+                        .and_then(|_| (!owner.is_empty()).then_some(owner));
+                    crate::analysis::disassembly::Symbol::new(
+                        display,
+                        library_uri,
+                        application_package.as_deref(),
+                    )
+                    .with_code_identity(address, 0, crate::model::DirectCallResolution::ExactEntry)
+                    .with_result_class(result_class)
+                }
             }
         };
         insert_preferred_symbol(&mut symbols, address, symbol.clone());
@@ -356,8 +428,46 @@ pub fn resolve(
         .map(|range| range.owner_ref)
         .collect::<std::collections::BTreeSet<_>>();
     let object_pool_labels = isolate.object_pools.first().map(|pool| {
-        object_pool_labels(isolate, &names, &types, pool, options.obfuscation_map, cids)
+        object_pool_labels(
+            isolate,
+            &names,
+            &types,
+            pool,
+            options.obfuscation_map,
+            cids,
+            &vm.vm_stub_names,
+        )
     });
+    let constants = isolate
+        .object_pools
+        .first()
+        .map(|pool| {
+            super::constants::ConstantGraphBuilder {
+                isolate,
+                vm,
+                names: &names,
+                types: &types,
+                cids,
+                instance_header_words: options.instance_header_words,
+                unboxed_word_u32_chunks: options.unboxed_word_u32_chunks,
+            }
+            .build(
+                pool.entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        super::types::PoolValue::Reference(reference) => Some(*reference),
+                        _ => None,
+                    })
+                    .chain(isolate.roots.iter().flat_map(|roots| {
+                        roots
+                            .initial_fields
+                            .iter()
+                            .chain(&roots.shared_initial_fields)
+                            .copied()
+                    })),
+            )
+        })
+        .unwrap_or_default();
     let dispatch_target_labels = isolate
         .dispatch_table_code_indices
         .iter()
@@ -368,15 +478,16 @@ pub fn resolve(
         })
         .collect::<Vec<_>>();
     let dispatch_class_ids = class_ids(isolate);
+    let dispatch_target_owner_cids = dispatch_owner_class_ids(isolate, table, cids);
+    let dispatch_subtype_cids = concrete_subtype_class_ids(isolate, &types, cids);
     let dispatch_table = recover_dispatch_table(options.abi, isolate, table, image, &symbols);
     let closure_parents = recover_closure_parents(isolate, cids);
-    let (dispatch_cid_to_name, dispatch_name_to_cids, dispatch_qualified_to_cids, dispatch_super_cids) =
-        build_dispatch_class_maps(
-            isolate,
-            &names,
-            cids,
-            options.obfuscation_map,
-        );
+    let (
+        dispatch_cid_to_name,
+        dispatch_name_to_cids,
+        dispatch_qualified_to_cids,
+        dispatch_super_cids,
+    ) = build_dispatch_class_maps(isolate, &names, &types, cids, options.obfuscation_map);
     let context = FunctionRecoveryContext {
         abi: options.abi,
         isolate,
@@ -394,10 +505,14 @@ pub fn resolve(
         dispatch_name_to_cids: &dispatch_name_to_cids,
         dispatch_qualified_to_cids: &dispatch_qualified_to_cids,
         dispatch_super_cids: &dispatch_super_cids,
+        dispatch_target_owner_cids: &dispatch_target_owner_cids,
+        dispatch_subtype_cids: &dispatch_subtype_cids,
         initializer_fields: &initializer_fields,
         table,
         static_bit: calibrate_static_bit(&names, isolate, cids),
         closure_parents: &closure_parents,
+        root_stubs: &root_stubs,
+        async_modifier_shift: options.async_modifier_shift,
     };
     let recovered = ranges
         .into_par_iter()
@@ -428,16 +543,70 @@ pub fn resolve(
         &options,
         &types,
     );
+    // Field layouts, class hierarchies and callee signatures of every
+    // library sharpen application code that touches framework objects.
+    let evidence_declarations = if effective_scope == Scope::All {
+        declarations.clone()
+    } else {
+        recover_declarations(
+            isolate,
+            vm,
+            cids,
+            &refs_with_code,
+            Scope::All,
+            &options,
+            &types,
+        )
+    };
     let mut snapshot_strings = super::transduce::recover(vm, "vm");
     snapshot_strings.extend(super::transduce::recover(isolate, "isolate"));
     Ok(super::Recovery {
         application_package,
+        root_library_uri: isolate.roots.as_ref().and_then(|roots| {
+            roots.named.get("root_library").and_then(|reference| {
+                restore_library_uri(names.library_uri(*reference), options.obfuscation_map)
+            })
+        }),
         functions,
         declarations,
+        evidence_declarations,
         ownership_obfuscated,
         snapshot_evidence: summarize_snapshot(vm, isolate, table),
         dispatch_table,
+        dispatch_analysis: crate::analysis::disassembly::DispatchTableData {
+            origin_element: dispatch_origin(options.abi),
+            targets: dispatch_target_labels,
+            class_ids: dispatch_class_ids,
+            cid_to_name: dispatch_cid_to_name,
+            name_to_cids: dispatch_name_to_cids,
+            qualified_to_cids: dispatch_qualified_to_cids,
+            super_cids: dispatch_super_cids,
+            target_owner_cids: dispatch_target_owner_cids,
+            subtype_cids: dispatch_subtype_cids,
+        },
         snapshot_strings,
+        snapshot_roots: isolate
+            .roots
+            .as_ref()
+            .map(|roots| crate::model::SnapshotRootEvidence {
+                profile: if roots.exact_3122 {
+                    "dart-3.12.2".to_owned()
+                } else {
+                    format!("dart-3.{}", roots.minor)
+                },
+                root_library_reference: roots.named.get("root_library").copied(),
+                global_object_pool_reference: roots.named.get("global_object_pool").copied(),
+                named_stub_references: roots
+                    .named
+                    .iter()
+                    .filter(|(name, _)| name.ends_with("_stub"))
+                    .map(|(name, reference)| (name.clone(), *reference))
+                    .collect(),
+                initial_field_references: roots.initial_fields.clone(),
+                shared_initial_field_references: roots.shared_initial_fields.clone(),
+            }),
+        constants,
+        loading_units: Vec::new(),
     })
 }
 
@@ -458,12 +627,19 @@ struct FunctionRecoveryContext<'a> {
     dispatch_name_to_cids: &'a BTreeMap<String, Vec<usize>>,
     dispatch_qualified_to_cids: &'a BTreeMap<(Option<String>, String), Vec<usize>>,
     dispatch_super_cids: &'a BTreeMap<usize, usize>,
+    dispatch_target_owner_cids: &'a [Option<usize>],
+    dispatch_subtype_cids: &'a BTreeMap<usize, Vec<usize>>,
     initializer_fields: &'a BTreeMap<i32, i32>,
     table: &'a InstructionTable,
     static_bit: Option<u32>,
     /// Closure-function reference -> lexically enclosing function reference,
     /// recovered from serialized `ClosureData.parent_function` edges.
     closure_parents: &'a BTreeMap<i32, i32>,
+    /// Code reference -> `stub Name` for bodies proven by a unique object-store
+    /// root. Naming the body keeps later call relinking from replacing the
+    /// root identity with a synthetic `sub_` label.
+    root_stubs: &'a BTreeMap<i32, String>,
+    async_modifier_shift: Option<u32>,
 }
 
 /// Maps each closure body Function reference to its lexically enclosing
@@ -588,13 +764,12 @@ fn calibrate_static_bit(_names: &Names<'_>, isolate: &ParseResult, cids: &Cids) 
 /// one-to-many because obfuscation reuses single-letter names across
 /// libraries, as does the `qualified -> cids` map which distinguishes those
 /// collisions when the proven receiver carries a library URI.  `super_cids`
-/// is the direct super-class edge `child -> super` read from the Class
-/// object's reference payload at snapshot position 2 when it decodes to a
-/// class id (Dart version tagging pushes the slot but the super slot stays
-/// the second reference in every isolate we support: Dart 3.4 through 3.12).
+/// is the direct super-class edge `child -> super` decoded from the Class
+/// object's `super_type` (the same slot `TypeRecovery::class_metadata` reads).
 fn build_dispatch_class_maps(
     isolate: &ParseResult,
     names: &Names<'_>,
+    types: &TypeRecovery<'_>,
     cids: &Cids,
     obfuscation_map: Option<&crate::analysis::LoadedObfuscationMap>,
 ) -> (
@@ -638,62 +813,16 @@ fn build_dispatch_class_maps(
                 .entry(class_id)
                 .or_insert_with(|| lib.clone());
 
-            // Try to read super class link: Class object keeps super_type
-            // ClassId in its second reference slot; when that reference points
-            // at a Class, that class's own class_id is the super's id.
-            // This heuristic matches the layout validated on the
-            // obf-raw-arm32 matrix (Dart 3.9).
-            let refs = snapshot.references_of(object);
-            if refs.len() >= 3 {
-                let super_ref = refs[1];
-                if super_ref >= 0 {
-                    if let Some(super_named) = snapshot.named.get(&super_ref) {
-                        if super_named.cid == cids.class {
-                            if let Some(super_object) = snapshot.object(super_ref) {
-                                if let Some(crate::snapshot::cluster::types::SnapshotScalar::Tagged32(sid)) =
-                                    snapshot.scalars_of(super_object).first()
-                                {
-                                    if let Ok(super_id) = usize::try_from(*sid) {
-                                        if super_id != class_id {
-                                            super_cids.entry(class_id).or_insert(super_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(type_object) = snapshot.object(super_ref) {
-                        // Super is encoded as a Type at reference 1 when the
-                        // class is generic: follow one indirection to the
-                        // underlying class reference held in the Type's first
-                        // ref.  Best-effort: only record when we can prove a
-                        // single destination class.
-                        let trefs = snapshot.references_of(type_object);
-                        if let Some(&class_ref) = trefs.first() {
-                            if class_ref >= 0 {
-                                if let Some(cnamed) = snapshot.named.get(&class_ref) {
-                                    if cnamed.cid == cids.class {
-                                        if let Some(cobject) = snapshot.object(class_ref) {
-                                            if let Some(crate::snapshot::cluster::types::SnapshotScalar::Tagged32(sid)) =
-                                                snapshot.scalars_of(cobject).first()
-                                            {
-                                                if let Ok(super_id) = usize::try_from(*sid) {
-                                                    super_cids.entry(class_id).or_insert(super_id);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(super_id) = types.super_class_id(*reference)
+                && super_id != class_id
+            {
+                super_cids.entry(class_id).or_insert(super_id);
             }
         }
     }
 
     let mut name_to_cids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let mut qualified_to_cids: BTreeMap<(Option<String>, String), Vec<usize>> =
-        BTreeMap::new();
+    let mut qualified_to_cids: BTreeMap<(Option<String>, String), Vec<usize>> = BTreeMap::new();
     for (&cid, name) in &cid_to_name {
         name_to_cids.entry(name.clone()).or_default().push(cid);
         let lib = cid_to_library.get(&cid).cloned().unwrap_or(None);
@@ -767,8 +896,14 @@ fn recover_range(
     else {
         return Ok(None);
     };
+    // A closure's first parameter is the Closure object itself; its owner
+    // class says nothing about that value.
+    let closure_receiver = matches!(
+        kind,
+        Some(RecoveredFunctionKind::Closure | RecoveredFunctionKind::ImplicitClosure)
+    );
     let (receiver_class, receiver_library_uri): (Option<&str>, Option<&str>) =
-        if !is_static.unwrap_or(false) && !owner.is_empty() {
+        if !is_static.unwrap_or(false) && !closure_receiver && !owner.is_empty() {
             (Some(owner.as_str()), library_uri.as_deref())
         } else {
             (None, None)
@@ -787,13 +922,22 @@ fn recover_range(
             name_to_cids: Some(context.dispatch_name_to_cids),
             qualified_to_cids: Some(context.dispatch_qualified_to_cids),
             super_cids: Some(context.dispatch_super_cids),
+            target_owner_cids: context.dispatch_target_owner_cids,
+            subtype_cids: Some(context.dispatch_subtype_cids),
+            label_results: None,
         })
         .filter(|analysis| !analysis.targets.is_empty() && !analysis.class_ids.is_empty()),
         receiver_class,
         receiver_library_uri,
     )?;
-    let fallback = format!("sub_{:x}", range.pc_offset);
-    let is_synthetic = function.is_empty();
+    let root_stub = context
+        .root_stubs
+        .get(&range.code_ref)
+        .filter(|_| function.is_empty());
+    let fallback = root_stub
+        .cloned()
+        .unwrap_or_else(|| format!("sub_{address:x}"));
+    let is_synthetic = function.is_empty() && root_stub.is_none();
     let snapshot_name = (!is_synthetic && raw_function != function).then_some(raw_function);
     let unmapped_function =
         restore_snapshot_name(snapshot_name.as_deref().unwrap_or(&function), None);
@@ -808,7 +952,16 @@ fn recover_range(
     // folded statements (probe EC-1). Nested pushes track per-depth identity.
     let mut inline_regions: Vec<crate::model::RecoveredInlineRegion> = Vec::new();
     if let Some(metadata) = code_metadata.as_ref() {
-        let mut open_pushes: Vec<(u32, i32, String, Option<String>)> = Vec::new();
+        struct OpenPush {
+            start: u32,
+            reference: i32,
+            name: String,
+            library_uri: Option<String>,
+            call_line: Option<i64>,
+        }
+        let mut open_pushes: Vec<OpenPush> = Vec::new();
+        // The latest position the map set: a push's call site.
+        let mut current_line: Option<i64> = None;
         for entry in &metadata.code_source_map {
             match entry.operation {
                 crate::model::CodeSourceMapOperation::PushFunction => {
@@ -845,41 +998,56 @@ fn recover_range(
                             size: 0,
                         });
                     }
-                    open_pushes.push((entry.pc_offset, reference, name, library_uri));
+                    open_pushes.push(OpenPush {
+                        start: entry.pc_offset,
+                        reference,
+                        name,
+                        library_uri,
+                        call_line: entry.source_line.or(current_line),
+                    });
                 }
                 crate::model::CodeSourceMapOperation::PopFunction => {
-                    // Pop the innermost push at or before this pc; unmatched
-                    // pops (trailing cleanup) are ignored.
-                    if let Some((start, reference, name, library_uri)) = open_pushes.pop() {
-                        if entry.pc_offset > start {
-                            inline_regions.push(crate::model::RecoveredInlineRegion {
-                                function_reference: reference,
-                                name,
-                                library_uri,
-                                start_pc_offset: start,
-                                end_pc_offset: entry.pc_offset,
-                            });
-                        }
+                    if let Some(push) = open_pushes.pop()
+                        && entry.pc_offset > push.start
+                    {
+                        inline_regions.push(crate::model::RecoveredInlineRegion {
+                            function_reference: push.reference,
+                            name: push.name,
+                            library_uri: push.library_uri,
+                            start_pc_offset: push.start,
+                            end_pc_offset: entry.pc_offset,
+                            depth: open_pushes.len() + 1,
+                            parent: None,
+                            occurrence: 0,
+                            call_line: push.call_line,
+                        });
                     }
                 }
                 _ => {}
             }
+            if let Some(line) = entry.source_line {
+                current_line = Some(line);
+            }
         }
-        // A push without its pop still owns everything up to the body end.
         if let Some(metadata_last_pc) = metadata.code_source_map.last().map(|entry| entry.pc_offset)
         {
-            for (start, reference, name, library_uri) in open_pushes.into_iter().rev() {
-                if metadata_last_pc > start {
+            while let Some(push) = open_pushes.pop() {
+                if metadata_last_pc > push.start {
                     inline_regions.push(crate::model::RecoveredInlineRegion {
-                        function_reference: reference,
-                        name,
-                        library_uri,
-                        start_pc_offset: start,
+                        function_reference: push.reference,
+                        name: push.name,
+                        library_uri: push.library_uri,
+                        start_pc_offset: push.start,
                         end_pc_offset: metadata_last_pc,
+                        depth: open_pushes.len() + 1,
+                        parent: None,
+                        occurrence: 0,
+                        call_line: push.call_line,
                     });
                 }
             }
         }
+        link_inline_regions(&mut inline_regions);
     }
     let internal_source_line = code_metadata.as_ref().and_then(|metadata| {
         metadata
@@ -913,7 +1081,11 @@ fn recover_range(
     Ok(Some(RecoveredFunction {
         code_reference: range.code_ref,
         code_alias_references: Vec::new(),
-        name: if is_synthetic { fallback } else { function },
+        name: if function.is_empty() {
+            fallback
+        } else {
+            function
+        },
         name_source: if is_synthetic {
             RecoveredNameSource::Synthetic
         } else if map_restored {
@@ -935,6 +1107,12 @@ fn recover_range(
             .is_some()
             .then_some(RecoveredSignatureSource::SnapshotFunction),
         parameter_count,
+        machine_interface: None,
+        loading_unit: None,
+        parameter_defaults: Default::default(),
+        async_modifier: function_kind_tag
+            .zip(context.async_modifier_shift)
+            .map(|(tag, shift)| async_modifier(tag, shift)),
         lexical_parent: lexical_parent(
             context.isolate,
             context.closure_parents,
@@ -1237,6 +1415,75 @@ fn range_code<'a>(isolate: &'a ParseResult, range: &Range) -> Option<&'a super::
         })
 }
 
+/// Derives each region's parent (the smallest enclosing region one level
+/// shallower) and groups discontiguous ranges of one inlined call into an
+/// occurrence: same callee, same parent occurrence and same call line.
+fn link_inline_regions(regions: &mut [crate::model::RecoveredInlineRegion]) {
+    regions.sort_by_key(|region| (region.start_pc_offset, region.depth));
+    for index in 0..regions.len() {
+        let (start, end, depth) = (
+            regions[index].start_pc_offset,
+            regions[index].end_pc_offset,
+            regions[index].depth,
+        );
+        regions[index].parent = (0..regions.len())
+            .filter(|candidate| {
+                let other = &regions[*candidate];
+                other.depth + 1 == depth && other.start_pc_offset <= start && end <= other.end_pc_offset
+            })
+            .min_by_key(|candidate| {
+                regions[*candidate].end_pc_offset - regions[*candidate].start_pc_offset
+            });
+    }
+    let mut occurrences = BTreeMap::<(Option<usize>, i32, Option<i64>), usize>::new();
+    for index in 0..regions.len() {
+        let parent_occurrence = regions[index].parent.map(|parent| regions[parent].occurrence);
+        let key = (
+            parent_occurrence,
+            regions[index].function_reference,
+            regions[index].call_line,
+        );
+        let next = occurrences.len();
+        regions[index].occurrence = *occurrences.entry(key).or_insert(next);
+    }
+}
+
+/// Verified against `UntaggedFunction::kKindBitSize` and
+/// `MethodRecognizer::kKindBitSize` in SDK tags 3.9.2 and 3.12.2.
+/// Both have 17 Function kinds and 448 recognized-method enum values,
+/// so ModifierBits follows five kind bits and nine recognizer bits.
+/// Unknown revisions must not reuse a layout based only on a version label.
+pub(super) fn async_modifier_shift(snapshot_hash: &str) -> Option<u32> {
+    match snapshot_hash {
+        "97ff04a728735e6b6b098bdf983faaba" | "ace654289f5abc240509fc941453ebc5" => Some(14),
+        _ => None,
+    }
+}
+
+fn async_modifier(kind_tag: u32, shift: u32) -> crate::model::AsyncModifier {
+    match (kind_tag >> shift) & 0x3 {
+        0 => crate::model::AsyncModifier::None,
+        1 => crate::model::AsyncModifier::Async,
+        2 => crate::model::AsyncModifier::SyncStar,
+        _ => crate::model::AsyncModifier::AsyncStar,
+    }
+}
+
+/// Decodes the catch-entry move maps a Code's `catch_entry` TypedData holds.
+fn decode_catch_entry_moves(
+    isolate: &ParseResult,
+    code: &super::types::Code,
+    types: &TypeRecovery<'_>,
+) -> Vec<crate::model::CatchEntryMoves> {
+    code.catch_entry_ref
+        .and_then(|reference| isolate.object(reference))
+        .filter(|object| object.kind == super::types::SnapshotObjectKind::TypedData)
+        .and_then(|object| {
+            super::catch_moves::decode(isolate.bytes_of(object), types.native_word())
+        })
+        .unwrap_or_default()
+}
+
 fn range_unchecked_entry_offset(isolate: &ParseResult, range: &Range) -> Option<u64> {
     range_code(isolate, range)?.unchecked_entry_offset
 }
@@ -1248,6 +1495,28 @@ fn code_metadata(
     types: &TypeRecovery<'_>,
 ) -> Option<RecoveredCodeMetadata> {
     let code = range_code(isolate, range)?;
+    let mut code_source_map = decode_code_source_map(isolate, code);
+    // In precompiled Dart code, Code::GetObjectPool returns the isolate
+    // group's global pool. The named root is accepted only after the exact
+    // snapshot layout and root CIDs have been validated.
+    if let Some(pool) = isolate
+        .roots
+        .as_ref()
+        .and_then(|roots| roots.named.get("global_object_pool"))
+        .and_then(|reference| {
+            isolate
+                .object_pools
+                .iter()
+                .find(|pool| pool.reference == *reference)
+        })
+    {
+        attach_null_check_names(&mut code_source_map, |index| {
+            let super::types::PoolValue::Reference(reference) = pool.entries.get(index)? else {
+                return None;
+            };
+            types.resolved_string(*reference).map(str::to_owned)
+        });
+    }
     let handlers = code
         .exception_handlers_ref
         .and_then(|reference| isolate.exception_handlers.get(&reference));
@@ -1262,11 +1531,12 @@ fn code_metadata(
         unchecked_entry_offset: code.unchecked_entry_offset,
         has_monomorphic_entrypoint: code.has_monomorphic_entrypoint,
         catch_entry_reference: code.catch_entry_ref,
+        catch_entry_moves: decode_catch_entry_moves(isolate, code, types),
         inlined_functions_reference: code.inlined_functions_ref,
         pc_descriptors_reference: code.pc_descriptors_ref,
         pc_descriptors: decode_pc_descriptors(isolate, code),
         code_source_map_reference: code.code_source_map_ref,
-        code_source_map: decode_code_source_map(isolate, code),
+        code_source_map,
         exception_handlers_reference: code.exception_handlers_ref,
         handled_types_reference: handlers.map(|handlers| handlers.handled_types_ref),
         handled_types: handlers
@@ -1318,28 +1588,27 @@ fn drop_implicit_call_prefix(name: &str) -> &str {
 /// not in symbol names. Arity comes from the args descriptor array
 /// (`[typeArgsLen, count, size, positionalCount, …]`, dart_entry.h) when it
 /// is present in the snapshot.
-fn unlinked_call_label(isolate: &ParseResult, reference: i32) -> Option<String> {
+/// `dynamicCall("selector", <shape>)` for an UnlinkedCall pool entry. The
+/// shape comes from the call's ArgumentsDescriptor, whose element values
+/// are references to Smi/String objects in either snapshot.
+fn unlinked_call_label(
+    isolate: &ParseResult,
+    types: &TypeRecovery<'_>,
+    reference: i32,
+) -> Option<String> {
     let object = isolate.object(reference)?;
-    let selector = drop_implicit_call_prefix(
-        isolate
-            .strings
-            .get(&isolate.named.get(&reference)?.name_ref)?,
-    );
-    let arity = isolate
+    let name_ref = isolate.named.get(&reference)?.name_ref;
+    let selector = drop_implicit_call_prefix(types.resolved_string(name_ref)?);
+    let selector = serde_json::to_string(selector).ok()?;
+    let shape = isolate
         .references_of(object)
         .get(1)
         .copied()
         .filter(|descriptor| *descriptor >= 0)
-        .and_then(|descriptor| isolate.object(descriptor))
-        .and_then(|array| {
-            let scalars = isolate.scalars_of(array);
-            let type_args_len = scalars.first().and_then(snapshot_scalar_value);
-            let count = scalars.get(1).and_then(snapshot_scalar_value)?;
-            Some(count.saturating_sub(type_args_len.unwrap_or_default()))
-        });
-    Some(match arity {
-        Some(arity) => format!("dynamicCall(\"{selector}\", arity={arity})"),
-        None => format!("dynamicCall(\"{selector}\")"),
+        .and_then(|descriptor| types.arguments_shape(descriptor));
+    Some(match shape {
+        Some(shape) => format!("dynamicCall({selector}, {})", shape.fields()),
+        None => format!("dynamicCall({selector})"),
     })
 }
 
@@ -1362,7 +1631,9 @@ fn object_pool_labels(
     pool: &super::types::ObjectPool,
     obfuscation_map: Option<&crate::analysis::LoadedObfuscationMap>,
     cids: &Cids,
+    vm_stubs: &BTreeMap<i32, &'static str>,
 ) -> Vec<String> {
+    let root_stubs = root_stub_labels(isolate, cids);
     let code_owners = isolate
         .codes
         .iter()
@@ -1393,8 +1664,17 @@ fn object_pool_labels(
             super::types::PoolValue::Reference(reference) => {
                 if let Some(value) = types.scalar_label(*reference) {
                     value
-                } else if let Some(value) = isolate.strings.get(reference) {
+                } else if *reference == cids.base.sentinel {
+                    "uninitializedSentinel".to_owned()
+                } else if let Some(value) = types.resolved_string(*reference) {
+                    // Base-object strings live in the VM snapshot.
                     abbreviated_pool_string(value)
+                } else if let Some(label) = root_stubs.get(reference) {
+                    label.clone()
+                } else if let Some(name) = vm_stubs.get(reference) {
+                    // Pool entries naming shared VM stubs (type tests,
+                    // subtype-test caches, native trampolines).
+                    format!("stub {name}")
                 } else if let Some(object) = isolate.object(*reference)
                     && object.canonical
                     && matches!(
@@ -1407,12 +1687,14 @@ fn object_pool_labels(
                         .filter(|name| !name.is_empty())
                     && names.name(*reference).is_empty()
                 {
-                    format!("snapshotInstance({class_name})")
+                    format!("snapshotInstance({class_name}@{reference})")
                 } else if let Some(object) = isolate.object(*reference)
                     && object.cid == cids.unlinked_call
-                    && let Some(label) = unlinked_call_label(isolate, *reference)
+                    && let Some(label) = unlinked_call_label(isolate, types, *reference)
                 {
                     label
+                } else if let Some(shape) = types.arguments_shape(*reference) {
+                    shape.label()
                 } else {
                     let named_reference = code_owners.get(reference).copied().unwrap_or(*reference);
                     let name = restore_snapshot_name(&names.name(named_reference), obfuscation_map);
@@ -1444,6 +1726,44 @@ fn object_pool_labels(
             super::types::PoolValue::Empty => format!("resetPoolEntry({index})"),
         })
         .collect()
+}
+
+fn root_stub_labels(isolate: &ParseResult, cids: &Cids) -> BTreeMap<i32, String> {
+    let mut candidates = BTreeMap::<i32, Vec<String>>::new();
+    if let Some(roots) = &isolate.roots {
+        for (name, reference) in &roots.named {
+            if name.ends_with("_stub")
+                && isolate
+                    .object(*reference)
+                    .is_some_and(|object| object.cid == cids.code)
+            {
+                candidates.entry(*reference).or_default().push(name.clone());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(reference, names)| {
+            // Shared Code objects retain multiple logical stub identities. Do not
+            // pick one simply because its root name sorts last.
+            (names.len() == 1).then(|| (reference, root_stub_label(&names[0])))
+        })
+        .collect()
+}
+
+fn root_stub_label(name: &str) -> String {
+    let stem = name.strip_suffix("_stub").unwrap_or(name);
+    let words = stem
+        .split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<String>();
+    format!("stub {words}")
 }
 
 fn nested_pool_strings(isolate: &ParseResult, root: i32) -> Vec<String> {
@@ -1523,6 +1843,107 @@ fn class_ids(isolate: &ParseResult) -> Vec<usize> {
     ids.into_iter().collect()
 }
 
+/// Maps each class id to the non-abstract classes that are its subtypes
+/// through `extends`, `implements` or `with` (itself included when
+/// concrete): every runtime receiver class a value of that static type can
+/// have. A class whose supertypes are not all decodable is left out of every
+/// set it might belong to, so callers must treat a missing key as unknown.
+fn concrete_subtype_class_ids(
+    isolate: &ParseResult,
+    types: &TypeRecovery<'_>,
+    cids: &Cids,
+) -> BTreeMap<usize, Vec<usize>> {
+    let mut direct = BTreeMap::<usize, Vec<usize>>::new();
+    let mut concrete = BTreeSet::<usize>::new();
+    for (reference, named) in &isolate.named {
+        if named.cid != cids.class {
+            continue;
+        }
+        let Some(super::types::SnapshotScalar::Tagged32(raw)) = isolate
+            .object(*reference)
+            .and_then(|object| isolate.scalars_of(object).first())
+        else {
+            continue;
+        };
+        let Ok(class_id) = usize::try_from(*raw) else {
+            continue;
+        };
+        let mut supertypes = types.interface_class_ids(*reference);
+        supertypes.extend(types.super_class_id(*reference));
+        supertypes.retain(|supertype| *supertype != class_id);
+        direct.insert(class_id, supertypes);
+        if types.class_is_abstract(*reference) == Some(false) {
+            concrete.insert(class_id);
+        }
+    }
+    let mut subtypes = BTreeMap::<usize, Vec<usize>>::new();
+    for &class_id in &concrete {
+        let mut seen = BTreeSet::from([class_id]);
+        let mut pending = vec![class_id];
+        while let Some(current) = pending.pop() {
+            for supertype in direct.get(&current).into_iter().flatten() {
+                if seen.insert(*supertype) {
+                    pending.push(*supertype);
+                }
+            }
+        }
+        for supertype in seen {
+            subtypes.entry(supertype).or_default().push(class_id);
+        }
+    }
+    subtypes
+}
+
+/// Owner class id of each dispatch-table entry's implementation, following
+/// the instruction slot to its Code/Function and the Function to its (patch)
+/// class. Stubs and discarded Code without a Function owner stay `None`.
+fn dispatch_owner_class_ids(
+    isolate: &ParseResult,
+    table: &InstructionTable,
+    cids: &Cids,
+) -> Vec<Option<usize>> {
+    let mut slot_owners = BTreeMap::<usize, i32>::new();
+    for (function_ref, function) in &isolate.named {
+        if let Some(slot) = function.instruction_index {
+            slot_owners.entry(slot).or_insert(*function_ref);
+        }
+    }
+    for code in &isolate.codes {
+        if let Some(slot) = code
+            .instruction_index
+            .and_then(|index| table.first_code.checked_add(index))
+        {
+            slot_owners.entry(slot).or_insert(code.owner_ref);
+        }
+    }
+    let class_id = |reference: i32| -> Option<usize> {
+        let object = isolate.object(reference)?;
+        let class_ref = if object.cid == cids.class {
+            reference
+        } else if object.cid == cids.patch_class {
+            *isolate.references_of(object).first()?
+        } else {
+            return None;
+        };
+        match isolate.scalars_of(isolate.object(class_ref)?).first()? {
+            super::types::SnapshotScalar::Tagged32(value) => usize::try_from(*value).ok(),
+            _ => None,
+        }
+    };
+    isolate
+        .dispatch_table_code_indices
+        .iter()
+        .map(|code_index| {
+            let slot = code_index.and_then(|index| index.checked_sub(1))?;
+            let function = isolate.named.get(slot_owners.get(&slot)?)?;
+            if function.cid != cids.function {
+                return None;
+            }
+            class_id(function.owner_ref)
+        })
+        .collect()
+}
+
 fn dispatch_target(
     code_index: usize,
     table: &InstructionTable,
@@ -1589,14 +2010,32 @@ fn recover_dispatch_table(
     })
 }
 
+/// A string pool label: the JSON-encoded value, cut to 160 characters with
+/// a trailing `…` outside the quotes when longer. Consumers decode it as
+/// JSON, so the escaping must be JSON's, not Rust's `{:?}` (`\u{202e}`,
+/// `\0`), or a string holding control characters would stop decoding and
+/// be mistaken for an expression.
 fn abbreviated_pool_string(value: &str) -> String {
     const MAX_CHARS: usize = 160;
     let mut characters = value.chars();
     let prefix = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    let encoded = serde_json::to_string(&prefix).unwrap_or_else(|_| "\"\"".to_owned());
+    // JSON leaves bidirectional formatting characters raw; escape them so
+    // no report or listing displays differently from what it contains.
+    let encoded = encoded
+        .chars()
+        .map(|character| {
+            if crate::analysis::disassembly::needs_unicode_escape(character) {
+                format!("\\u{:04x}", character as u32)
+            } else {
+                character.to_string()
+            }
+        })
+        .collect::<String>();
     if characters.next().is_some() {
-        format!("{prefix:?}…")
+        format!("{encoded}…")
     } else {
-        format!("{prefix:?}")
+        encoded
     }
 }
 
@@ -1641,18 +2080,8 @@ fn decode_pc_descriptors(
         .map(|object| isolate.bytes_of(object))
         .filter(|bytes| !bytes.is_empty())
     else {
-        #[cfg(debug_assertions)]
-        if code.pc_descriptors_ref.is_some() {
-            // eprintln!("DEBUG pcd empty for ref {:?}", code.pc_descriptors_ref);
-        }
         return Vec::new();
     };
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "DEBUG pcd bytes={} ref={:?}",
-        bytes.len(),
-        code.pc_descriptors_ref
-    );
     let mut cursor = 0usize;
     let mut pc_offset = 0i64;
     let mut entries = Vec::new();
@@ -1783,12 +2212,26 @@ fn decode_code_source_map_bytes(
             inline_depth: lines.len().saturating_sub(1),
             source_line: lines.last().copied().filter(|line| *line > 0),
             function_reference,
+            null_check_name: None,
         });
         if operation == CodeSourceMapOperation::Unknown {
             break;
         }
     }
     entries
+}
+
+fn attach_null_check_names(
+    entries: &mut [CodeSourceMapEntry],
+    mut resolve: impl FnMut(usize) -> Option<String>,
+) {
+    for entry in entries {
+        if entry.operation == CodeSourceMapOperation::NullCheck
+            && let Ok(index) = usize::try_from(entry.argument)
+        {
+            entry.null_check_name = resolve(index).filter(|name| !name.is_empty());
+        }
+    }
 }
 
 fn summarize_snapshot(
@@ -2009,7 +2452,7 @@ fn include_library(uri: Option<&str>, scope: Scope, application_package: Option<
     }
 }
 
-struct Names<'a> {
+pub(crate) struct Names<'a> {
     isolate: &'a ParseResult,
     strings: BTreeMap<i32, &'a str>,
 }
@@ -2030,7 +2473,7 @@ impl<'a> Names<'a> {
         Self { isolate, strings }
     }
 
-    fn name(&self, reference: i32) -> String {
+    pub(crate) fn name(&self, reference: i32) -> String {
         self.isolate
             .named
             .get(&reference)
@@ -2040,14 +2483,14 @@ impl<'a> Names<'a> {
             .to_owned()
     }
 
-    fn owner_name(&self, reference: i32) -> String {
+    pub(crate) fn owner_name(&self, reference: i32) -> String {
         self.isolate
             .named
             .get(&reference)
             .map_or_else(String::new, |object| self.name(object.owner_ref))
     }
 
-    fn library_uri(&self, reference: i32) -> Option<String> {
+    pub(crate) fn library_uri(&self, reference: i32) -> Option<String> {
         let mut current = reference;
         for _ in 0..12 {
             let object = self.isolate.named.get(&current)?;
@@ -2079,10 +2522,12 @@ fn round_up(value: u64, alignment: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Names, Range, assign_sizes, count_stack_map_entries, decode_code_source_map_bytes,
-        drop_implicit_call_prefix, lexical_parent, library_ownership_is_obfuscated,
-        nested_pool_strings, object_pool_labels, parse_table, recover_closure_parents,
-        select_application_package,
+
+
+        Names, Range, assign_sizes, attach_null_check_names, count_stack_map_entries,
+        decode_code_source_map_bytes, drop_implicit_call_prefix, lexical_parent,
+        library_ownership_is_obfuscated, nested_pool_strings, object_pool_labels, parse_table,
+        recover_closure_parents, select_application_package,
     };
     use crate::model::CodeSourceMapOperation;
     use crate::snapshot::cluster::cid::test_cids;
@@ -2090,6 +2535,60 @@ mod tests {
     use crate::snapshot::cluster::types::{
         ClusterHeader, NamedObject, ParseResult, SnapshotObjectKind, SnapshotObjectPayload,
     };
+
+    #[test]
+    fn async_modifiers_use_only_verified_snapshot_layouts() {
+        use crate::model::AsyncModifier;
+        for hash in [
+            "97ff04a728735e6b6b098bdf983faaba",
+            "ace654289f5abc240509fc941453ebc5",
+        ] {
+            let shift = super::async_modifier_shift(hash).unwrap();
+            for (bits, expected) in [
+                (0, AsyncModifier::None),
+                (1, AsyncModifier::Async),
+                (2, AsyncModifier::SyncStar),
+                (3, AsyncModifier::AsyncStar),
+            ] {
+                // Kind, recognizer and higher modifier flags must not affect
+                // the two async bits, even with obfuscated function names.
+                let tag = (bits << shift) | 16 | (447 << 5) | (1 << (shift + 2));
+                assert_eq!(super::async_modifier(tag, shift), expected);
+            }
+        }
+        assert_eq!(super::async_modifier_shift("unknown"), None);
+    }
+
+    #[test]
+    fn inline_regions_link_parents_and_split_occurrences() {
+        use crate::model::RecoveredInlineRegion;
+        let region = |reference, start, end, depth, line| RecoveredInlineRegion {
+            function_reference: reference,
+            name: format!("f{reference}"),
+            library_uri: None,
+            start_pc_offset: start,
+            end_pc_offset: end,
+            depth,
+            parent: None,
+            occurrence: 0,
+            call_line: Some(line),
+        };
+        // A(10..40) contains B(12..20); A's call is split at 50..60; a second
+        // call of A from another line is its own occurrence.
+        let mut regions = vec![
+            region(1, 50, 60, 1, 7),
+            region(2, 12, 20, 2, 3),
+            region(1, 10, 40, 1, 7),
+            region(1, 70, 80, 1, 9),
+        ];
+        super::link_inline_regions(&mut regions);
+        let find = |start| regions.iter().position(|r| r.start_pc_offset == start).unwrap();
+        assert_eq!(regions[find(12)].parent, Some(find(10)));
+        assert_eq!(regions[find(10)].parent, None);
+        assert_eq!(regions[find(10)].occurrence, regions[find(50)].occurrence);
+        assert_ne!(regions[find(10)].occurrence, regions[find(70)].occurrence);
+        assert_ne!(regions[find(12)].occurrence, regions[find(10)].occurrence);
+    }
 
     #[test]
     fn recovers_closure_lexical_parents_from_closure_data_edges() {
@@ -2243,25 +2742,46 @@ mod tests {
             false,
             SnapshotObjectKind::Standard,
             SnapshotObjectPayload {
-                references: vec![10, 21],
+                references: vec![10, 121],
                 scalars: Vec::new(),
                 bytes: Vec::new(),
             },
         );
-        // ArgsDescriptor array [typeArgsLen=0, count=2, size, positionalCount=2].
+        // `fill_skip::array` stores [type_arguments, elements...] as
+        // references and only the length as a scalar. The descriptor's
+        // Smi elements are base objects of the VM snapshot here:
+        // [typeArgsLen=0, count=2, size=2, positionalCount=1, "flag", 1, null].
+        let mut vm = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        for (reference, value) in [(2, 0i64), (3, 2), (4, 1)] {
+            vm.insert_object(
+                reference,
+                cids.mint,
+                false,
+                SnapshotObjectKind::Integer,
+                SnapshotObjectPayload {
+                    references: Vec::new(),
+                    scalars: vec![crate::snapshot::cluster::types::SnapshotScalar::Tagged64(
+                        value,
+                    )],
+                    bytes: Vec::new(),
+                },
+            );
+        }
+        vm.strings.insert(5, "flag".to_owned());
         snapshot.insert_object(
-            21,
+            121,
             cids.immutable_array,
             false,
             SnapshotObjectKind::Array,
             SnapshotObjectPayload {
-                references: vec![-1, -1, -1, -1],
-                scalars: vec![
-                    crate::snapshot::cluster::types::SnapshotScalar::Unsigned(0),
-                    crate::snapshot::cluster::types::SnapshotScalar::Unsigned(2),
-                    crate::snapshot::cluster::types::SnapshotScalar::Unsigned(4),
-                    crate::snapshot::cluster::types::SnapshotScalar::Unsigned(2),
-                ],
+                references: vec![1, 2, 3, 3, 4, 5, 4, 1],
+                scalars: vec![crate::snapshot::cluster::types::SnapshotScalar::Unsigned(7)],
                 bytes: Vec::new(),
             },
         );
@@ -2270,18 +2790,27 @@ mod tests {
             entries: vec![
                 super::super::types::PoolValue::Reference(20),
                 super::super::types::PoolValue::Empty,
+                super::super::types::PoolValue::Reference(121),
+                // Base object 21: the first cached VM descriptor.
+                super::super::types::PoolValue::Reference(21),
             ],
         };
-        let names = Names::new(&snapshot, &snapshot);
-        let types = TypeRecovery::new(
-            &snapshot,
-            &snapshot,
-            &cids,
-            crate::model::Abi::Arm64V8a,
-            None,
+        let names = Names::new(&snapshot, &vm);
+        let types = TypeRecovery::new(&snapshot, &vm, &cids, crate::model::Abi::Arm64V8a, None);
+        let labels =
+            object_pool_labels(&snapshot, &names, &types, &pool, None, &cids, &std::collections::BTreeMap::new());
+        assert_eq!(
+            labels[0],
+            "dynamicCall(\"isEmpty\", typeArgs=0, count=2, positional=1, named=[\"flag\"@1])"
         );
-        let labels = object_pool_labels(&snapshot, &names, &types, &pool, None, &cids);
-        assert_eq!(labels[0], "dynamicCall(\"isEmpty\", arity=2)");
+        assert_eq!(
+            labels[2],
+            "argsDescriptor(typeArgs=0, count=2, positional=1, named=[\"flag\"@1])"
+        );
+        assert_eq!(
+            labels[3],
+            "argsDescriptor(typeArgs=0, count=0, positional=0)"
+        );
         assert_eq!(labels[1], "resetPoolEntry(1)");
     }
 
@@ -2472,6 +3001,23 @@ mod tests {
     }
 
     #[test]
+    fn null_check_name_uses_only_its_pool_index() {
+        let mut bytes = Vec::new();
+        write_source_map_op(&mut bytes, 1, 5);
+        write_source_map_op(&mut bytes, 4, 7);
+        write_source_map_op(&mut bytes, 4, -1);
+        write_source_map_op(&mut bytes, 0, 3);
+        let mut entries = decode_code_source_map_bytes(&bytes, &[]);
+        attach_null_check_names(&mut entries, |index| {
+            (index == 7).then(|| "quantity".to_owned())
+        });
+        assert_eq!(entries[1].null_check_name.as_deref(), Some("quantity"));
+        assert_eq!(entries[2].null_check_name, None);
+        assert_eq!(entries[3].null_check_name, None);
+        assert_eq!(entries[1].pc_offset, 5);
+    }
+
+    #[test]
     fn rejects_dwarf_table_when_retained_count_disagrees() {
         let header = ClusterHeader {
             num_base_objects: 0,
@@ -2501,6 +3047,7 @@ mod tests {
                 unchecked_entry_offset: None,
                 has_monomorphic_entrypoint: false,
                 catch_entry_reference: None,
+                catch_entry_moves: Vec::new(),
                 inlined_functions_reference: None,
                 pc_descriptors_reference: None,
                 pc_descriptors: Vec::new(),
@@ -2530,6 +3077,7 @@ mod tests {
                 inline_depth: 0,
                 source_line: None,
                 function_reference: None,
+                null_check_name: None,
             },
             CodeSourceMapEntry {
                 pc_offset: 8,
@@ -2538,6 +3086,7 @@ mod tests {
                 inline_depth: 0,
                 source_line: Some(10),
                 function_reference: None,
+                null_check_name: None,
             },
             CodeSourceMapEntry {
                 pc_offset: 24,
@@ -2546,6 +3095,7 @@ mod tests {
                 inline_depth: 1,
                 source_line: Some(99),
                 function_reference: Some(7),
+                null_check_name: None,
             },
             CodeSourceMapEntry {
                 pc_offset: 40,
@@ -2554,6 +3104,7 @@ mod tests {
                 inline_depth: 0,
                 source_line: Some(12),
                 function_reference: None,
+                null_check_name: None,
             },
         ];
         let base = 0x1000u64;
@@ -2601,5 +3152,17 @@ mod tests {
             "rows inside an inlinee range never band the host body"
         );
         assert_eq!(bands.get(&format!("0x{:x}", base + 44)), Some(&12));
+    }
+
+    #[test]
+    fn string_pool_labels_are_json_even_for_hostile_text() {
+        let hostile = "evil\u{202E}\u{0}' \" ${x}";
+        let label = super::abbreviated_pool_string(hostile);
+        assert_eq!(serde_json::from_str::<String>(&label).unwrap(), hostile);
+        assert!(label.is_ascii() && label.contains("\\u202e"));
+        let long = "a".repeat(200);
+        let label = super::abbreviated_pool_string(&long);
+        let encoded = label.strip_suffix('…').unwrap();
+        assert_eq!(serde_json::from_str::<String>(encoded).unwrap(), "a".repeat(160));
     }
 }

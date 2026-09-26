@@ -1,5 +1,12 @@
 # Recovery test applications
 
+The local Pavo Connect APK has a separate static regression check. After
+decompiling it, run `python3 test/tool/evaluate_pavo.py OUTPUT_DIRECTORY`.
+The check verifies the exact artifact, root metadata, async modifiers, await
+PC descriptors, stub filtering and function preservation. See
+[`PAVO_REVIEW.md`](../PAVO_REVIEW.md) for measured results and limitations.
+The APK and recovered application data are not committed.
+
 Two minimal Flutter apps used as ground truth for measuring and improving
 Clutter's decompilation. Both contain identical Dart code
 (`lib/main.dart`, `lib/models.dart`) exercising constructs a decompiler must
@@ -7,6 +14,10 @@ recover: enums, const constructors, final/instance/map fields, getters,
 methods with optional named parameters, generic functions with function-typed
 parameters, closures, `async`/`await`, string interpolation, collection
 operations, and exceptions.
+
+`lib/hardening.dart` and the small libraries beside it add adversarial code:
+what an app author could write to minimize what a decompiler recovers, or to
+break its output. See [Adversarial edge cases](#adversarial-edge-cases).
 
 ## What current Clutter recovers in these apps
 
@@ -103,6 +114,43 @@ silently pass. Use `--allow-partial` only for a focused local check. The
 current checks prove application-package attribution, a coarse retained-body
 safety floor, the exact negated unboxed-double price predicate on all three
 ABIs, and preservation of the boxed-double receiver in `formatPrice` IR.
+
+## Adversarial edge cases
+
+`lib/hardening.dart` runs at startup with a runtime seed, so tree shaking and
+constant folding keep every section. The sections target distinct attacks:
+
+| Attack | Construct |
+| --- | --- |
+| Output injection | String literals holding `*/`, newlines, quotes, `$`, NUL and a U+202E bidi override ("Trojan Source"); a literal longer than the 160-character pool-label cut |
+| Vocabulary collisions | Declarations named `aot` (the support-import prefix), `native`, `sub_1000`, register-shaped `x1`/`r2`, and classes named `Context` and `_Closure` |
+| IR spoofing | A string that looks like an ICData label (`dynamicCall('delete')`), a literal holding ` ? `, a comparison of comparisons |
+| Output-path collisions | `lib/dart/core/bool.dart`, `lib/packages/flutter/src/widgets/framework.dart`, and `Case.dart` beside `case.dart` |
+| Control-flow obfuscation | A flattened `switch` state machine with an opaque predicate, a dense 16-way switch expression |
+| Data hiding | XOR-sealed strings, a 300-entry constant map, nested generic constants, list literals |
+| Indirection | Function tables, `dynamic` calls, `Function.apply`, `noSuchMethod`, callable objects |
+| Language features | Sealed classes with patterns, records, extension types, mixins, `late final`, `sync*`/`async*` |
+| Resource pressure | A 40-variable triple loop, Ackermann recursion, exceptions as control flow, deep mutating closures |
+
+`tool/evaluate_hardening.py` checks the outputs of all nine variants:
+
+```sh
+python3 test/tool/evaluate_hardening.py \
+  plain=out/plain obfuscated_map=out/obf-map obfuscated_raw=out/obf-raw \
+  plain_arm32=out/plain-arm32 ...
+```
+
+Every generated library must parse (`dart format`; pass `--no-parse` without
+the Dart SDK). No generated file or report may contain a raw control or
+bidirectional-formatting character. No hostile literal may escape its string
+or comment, and no snapshot label internals may leak into expressions. Output
+paths must stay unique, even case-insensitively. In the variants that retain
+names, the colliding declarations must keep their meaning and the list
+literal built by `runHardening` must keep its elements.
+
+The output-path collision only arises with `--scope all`, where the SDK libraries
+are written too: before the fix, Clutter refused to write any output for the
+plain fixture in that scope.
 
 ## Known baseline gaps (measurement targets)
 

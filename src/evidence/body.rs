@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::tier::{EvidenceTier, TieredClaim};
 use crate::diagnostic::{ClutterError, Result};
@@ -49,6 +50,7 @@ pub const SOURCE_RUNTIME_TRACE: EvidenceSourceId = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "relation", rename_all = "snake_case")]
 pub enum RangeRelation {
+    Unknown,
     Exact,
     SameStartDifferentEnd { static_end: u64, oracle_end: u64 },
     OracleContainedByStatic,
@@ -133,11 +135,23 @@ pub struct BodyBinding {
 /// The full graph for one payload subject.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyGraph {
+    pub subject: Option<BodySubject>,
     pub bodies: Vec<PhysicalBody>,
     pub occurrences: Vec<FunctionOccurrence>,
     pub bindings: Vec<BodyBinding>,
     /// Bodies shared by more than one occurrence, keyed by body id order.
     pub shared_bodies: Vec<PhysicalBodyId>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BodySubject {
+    pub abi: crate::model::Abi,
+    pub module: String,
+    pub loading_unit: u32,
+    pub payload_sha256: String,
+    pub instructions_region: String,
+    pub region_sha256: String,
+    pub image_base: u64,
 }
 
 impl BodyGraph {
@@ -260,13 +274,27 @@ pub struct BodyGraphReport {
 /// overwriting them.
 pub fn build(
     program: &crate::model::RecoveredProgram,
-    abi: crate::model::Abi,
-    instructions_region: Option<&crate::model::SnapshotRegion>,
+    subject: &super::subject::ArtifactSubject,
+    instructions_region: &crate::model::SnapshotRegion,
     oracle_functions: &[crate::model::VmFunctionEvidence],
 ) -> Result<BodyGraph> {
-    let _ = instructions_region;
+    let abi = subject.abi;
+    let image_base = parse_hex(&instructions_region.virtual_address).ok_or_else(|| {
+        ClutterError::Analysis(format!(
+            "invalid instruction image base {:?}",
+            instructions_region.virtual_address
+        ))
+    })?;
     let mut graph = BodyGraph::default();
-    let mut by_offset: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    graph.subject = Some(BodySubject {
+        abi,
+        module: subject.module.clone(),
+        loading_unit: 0,
+        payload_sha256: subject.payload.sha256.to_string(),
+        instructions_region: instructions_region.name.clone(),
+        region_sha256: instructions_region.sha256.clone(),
+        image_base,
+    });
     for (index, function) in program.functions.iter().enumerate() {
         let entry = parse_hex(&function.address).ok_or_else(|| {
             ClutterError::Analysis(format!(
@@ -274,13 +302,16 @@ pub fn build(
                 function.name, function.address
             ))
         })?;
-        by_offset.entry(entry).or_default().push(index);
-        let end = entry.saturating_add(function.size);
+        let (extent, hash) =
+            static_extent(entry, function.size, image_base, &instructions_region.data).map_err(
+                |error| ClutterError::Analysis(format!("function {}: {error}", function.name)),
+            )?;
+        let offset = extent.start;
         graph.insert_body(PhysicalBody {
-            id: PhysicalBodyId { abi, entry },
-            entry: IsolateInstructionOffset(entry),
-            static_extent: ByteExtent { start: entry, end },
-            static_bytes_sha256: String::new(),
+            id: PhysicalBodyId { abi, entry: offset },
+            entry: IsolateInstructionOffset(offset),
+            static_extent: extent,
+            static_bytes_sha256: hash,
         });
         graph.insert_occurrence(FunctionOccurrence {
             id: FunctionOccurrenceId {
@@ -297,33 +328,15 @@ pub fn build(
             parent_occurrence: None,
             is_closure: function.kind == Some(crate::model::RecoveredFunctionKind::Closure),
         });
-        // Oracle size claim for this same address, when present.
-        let relation = match oracle_functions
-            .iter()
-            .find(|candidate| candidate.code_offset == Some(entry))
-        {
-            Some(candidate) if candidate.code_size.is_some() => {
-                let oracle_end = entry.saturating_add(candidate.code_size.unwrap());
-                RangeRelation::classify((entry, end), (entry, oracle_end))
-            }
-            _ => RangeRelation::Exact,
-        };
-        let extent_conflict = match relation {
-            RangeRelation::SameStartDifferentEnd {
-                static_end,
-                oracle_end,
-            } => Some((static_end - entry, oracle_end - entry)),
-            _ => None,
-        };
         graph.bind(BodyBinding {
-            body: PhysicalBodyId { abi, entry },
+            body: PhysicalBodyId { abi, entry: offset },
             function: FunctionOccurrenceId {
                 source: SOURCE_STATIC,
                 object: index as u64,
             },
-            relation,
+            relation: RangeRelation::Exact,
             tier: EvidenceTier::Proven,
-            extent_conflict,
+            extent_conflict: None,
         });
     }
 
@@ -334,13 +347,6 @@ pub fn build(
         let Some(offset) = candidate.code_offset else {
             continue;
         };
-        let end = offset.saturating_add(candidate.code_size.unwrap_or(0));
-        graph.insert_body(PhysicalBody {
-            id: PhysicalBodyId { abi, entry: offset },
-            entry: IsolateInstructionOffset(offset),
-            static_extent: ByteExtent { start: offset, end },
-            static_bytes_sha256: String::new(),
-        });
         let mut names = Vec::new();
         if !candidate.name.is_empty() {
             names.push(TieredClaim::new(
@@ -374,30 +380,63 @@ pub fn build(
             }),
             is_closure: candidate.parent_function_object_id.is_some(),
         });
-        let extent_conflict = match (
-            by_offset
-                .get(&offset)
-                .and_then(|indices| program.functions.get(*indices.first()?).map(|f| f.size)),
-            candidate.code_size,
-        ) {
-            (Some(static_size), Some(oracle_size)) if static_size != oracle_size => {
-                Some((static_size, oracle_size))
-            }
-            _ => None,
-        };
-        graph.bind(BodyBinding {
-            body: PhysicalBodyId { abi, entry: offset },
-            function: FunctionOccurrenceId {
-                source: SOURCE_VM_ORACLE,
-                object: candidate.object_id,
-            },
-            relation: RangeRelation::Exact,
-            tier: EvidenceTier::Proven,
-            extent_conflict,
-        });
+        if let Some(static_body) = graph.body(PhysicalBodyId { abi, entry: offset }) {
+            let static_size = static_body.static_extent.end - static_body.static_extent.start;
+            let relation = candidate
+                .code_size
+                .map_or(RangeRelation::Unknown, |oracle_size| {
+                    RangeRelation::classify(
+                        (offset, offset.saturating_add(static_size)),
+                        (offset, offset.saturating_add(oracle_size)),
+                    )
+                });
+            let extent_conflict = candidate
+                .code_size
+                .filter(|oracle_size| *oracle_size != static_size)
+                .map(|oracle_size| (static_size, oracle_size));
+            graph.bind(BodyBinding {
+                body: PhysicalBodyId { abi, entry: offset },
+                function: FunctionOccurrenceId {
+                    source: SOURCE_VM_ORACLE,
+                    object: candidate.object_id,
+                },
+                relation,
+                tier: EvidenceTier::Proven,
+                extent_conflict,
+            });
+        }
     }
     graph.recompute_shared();
     Ok(graph)
+}
+
+fn static_extent(
+    absolute_entry: u64,
+    size: u64,
+    image_base: u64,
+    image: &[u8],
+) -> Result<(ByteExtent, String)> {
+    let offset = absolute_entry.checked_sub(image_base).ok_or_else(|| {
+        ClutterError::Analysis(format!(
+            "address 0x{absolute_entry:x} precedes instruction image at 0x{image_base:x}"
+        ))
+    })?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| ClutterError::Analysis("instruction range overflows".to_owned()))?;
+    let bytes = usize::try_from(offset)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(start, end)| image.get(start..end))
+        .ok_or_else(|| {
+            ClutterError::Analysis(format!(
+                "range 0x{offset:x}..0x{end:x} exceeds instruction image"
+            ))
+        })?;
+    Ok((
+        ByteExtent { start: offset, end },
+        hex::encode(Sha256::digest(bytes)),
+    ))
 }
 
 fn tier_for_name_source(source: crate::model::RecoveredNameSource) -> EvidenceTier {
@@ -455,6 +494,7 @@ mod tests {
     #[test]
     fn only_exact_relations_support_semantic_promotion() {
         assert!(RangeRelation::Exact.supports_semantic_promotion());
+        assert!(!RangeRelation::Unknown.supports_semantic_promotion());
         assert!(
             !RangeRelation::SameStartDifferentEnd {
                 static_end: 1,
@@ -462,6 +502,16 @@ mod tests {
             }
             .supports_semantic_promotion()
         );
+    }
+
+    #[test]
+    fn converts_absolute_addresses_and_hashes_only_the_body_bytes() {
+        let image = [0x10, 0x20, 0x30, 0x40, 0x50];
+        let (extent, hash) = static_extent(0x1002, 2, 0x1000, &image).unwrap();
+        assert_eq!(extent, ByteExtent { start: 2, end: 4 });
+        assert_eq!(hash, hex::encode(Sha256::digest([0x30, 0x40])));
+        assert!(static_extent(0xfff, 1, 0x1000, &image).is_err());
+        assert!(static_extent(0x1004, 2, 0x1000, &image).is_err());
     }
 
     #[test]

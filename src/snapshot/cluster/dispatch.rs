@@ -85,6 +85,15 @@ fn decode_candidate(
     (repeat_count == 0 && reader.position() == end).then_some(table)
 }
 
+pub(super) fn decode_at(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    first_code_reference: i32,
+) -> Option<Vec<Option<usize>>> {
+    decode_candidate(data, start, end, i64::from(first_code_reference))
+}
+
 #[cfg(test)]
 mod tests {
     use super::find_table;

@@ -175,6 +175,7 @@ pub struct ExceptionHandlers {
 #[derive(Clone, Debug)]
 pub struct ParseResult {
     pub header: ClusterHeader,
+    pub roots: Option<super::roots::SnapshotRoots>,
     pub clusters: Vec<Cluster>,
     pub fill_start: usize,
     pub strings: BTreeMap<i32, String>,
@@ -197,12 +198,16 @@ pub struct ParseResult {
     /// Snapshot Code indices from the VM's compressed class dispatch table.
     /// `None` is a null dispatch entry; positive values use GetCodeIndex encoding.
     pub dispatch_table_code_indices: Vec<Option<usize>>,
+    /// VM snapshot only: stub Code reference -> `VM_STUB_CODE_LIST` name,
+    /// from the stub roots the VM snapshot writes last.
+    pub vm_stub_names: BTreeMap<i32, &'static str>,
 }
 
 impl ParseResult {
     pub fn new(header: ClusterHeader) -> Self {
         Self {
             header,
+            roots: None,
             clusters: Vec::new(),
             fill_start: 0,
             strings: BTreeMap::new(),
@@ -220,6 +225,7 @@ impl ParseResult {
             exception_handlers: BTreeMap::new(),
             instance_bitmaps: BTreeMap::new(),
             dispatch_table_code_indices: Vec::new(),
+            vm_stub_names: BTreeMap::new(),
         }
     }
 

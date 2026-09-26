@@ -9,7 +9,7 @@ use crate::diagnostic::{ClutterError, Result};
 use crate::elf::ElfImage;
 use crate::model::{ProfileMatch, SnapshotInfo};
 
-pub use cluster::recover_functions;
+pub use cluster::{DeferredUnitImage, recover_functions, unit_id};
 pub(crate) use cluster::source_bands_from_metadata;
 pub use image::CodeImage;
 
@@ -34,6 +34,34 @@ pub fn inspect(elf: &ElfImage<'_>, libflutter: Option<&[u8]>) -> Result<Snapshot
         vm_header,
         isolate_header,
         regions,
+    })
+}
+
+/// Reads a deferred loading unit (`libapp.so-N.part.so`). Its instruction
+/// addresses carry the unit id in bits 40 and up, so they never collide with
+/// the root image or another unit.
+pub fn deferred_unit_image(
+    bytes: &[u8],
+    abi: crate::model::Abi,
+    path: &str,
+) -> Result<DeferredUnitImage> {
+    let id = unit_id(path).ok_or_else(|| {
+        ClutterError::InvalidArtifact(format!("{path} is not a Flutter loading unit"))
+    })?;
+    let elf = crate::elf::ElfImage::parse(bytes, abi)?;
+    let regions = elf.unit_snapshot_regions()?;
+    let data = region(&regions, "_kDartIsolateSnapshotData")?.data.clone();
+    let instructions = region(&regions, "_kDartIsolateSnapshotInstructions")?;
+    let code = image::parse(
+        &instructions.data,
+        parse_hex(&instructions.virtual_address)? | (u64::from(id) << 40),
+        elf.pointer_width,
+    )?;
+    Ok(DeferredUnitImage {
+        id,
+        path: path.to_owned(),
+        data,
+        code,
     })
 }
 

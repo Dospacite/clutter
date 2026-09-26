@@ -4,6 +4,13 @@ use crate::model::SnapshotInfo;
 #[derive(Clone, Copy)]
 pub struct Profile {
     pub cids: Cids,
+    /// Object-store root names serialized ahead of the field tables, for the
+    /// release family (`OBJECT_STORE_FIELD_LIST` through `slow_tts_stub`).
+    pub root_names: &'static [&'static str],
+    /// Dart 3.5 added the shared initial field table after the first one.
+    pub shared_field_table: bool,
+    /// Dart minor release, naming the root profile of release-family roots.
+    pub minor: u32,
     pub compressed_pointers: bool,
     pub instance_header_words: usize,
     pub unboxed_word_u32_chunks: usize,
@@ -85,6 +92,110 @@ pub struct Cids {
     pub typed_data_first: i32,
     pub byte_data_view: i32,
     pub predefined_count: i32,
+    /// References of the VM snapshot's predefined base objects.
+    pub base: BaseObjects,
+    /// Heap-object layout of the target build.
+    pub layout: ObjectLayout,
+}
+
+/// Target heap-object layout: the header precedes the first instance
+/// field, and instance fields (and the unboxed-field bitmap) are counted in
+/// compressed words, which are 4 bytes on 32-bit targets and on 64-bit
+/// targets with compressed pointers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectLayout {
+    pub header_bytes: i64,
+    pub compressed_word: i64,
+    pub native_word: i64,
+}
+
+impl ObjectLayout {
+    pub fn new(pointer_width: usize, compressed_pointers: bool) -> Self {
+        let native_word = pointer_width as i64;
+        Self {
+            // The tags word (with the identity hash in its upper half on
+            // 64-bit targets) is one native word.
+            header_bytes: native_word,
+            compressed_word: if compressed_pointers { 4 } else { native_word },
+            native_word,
+        }
+    }
+}
+
+/// Reference numbers of the objects the VM snapshot serializer registers
+/// with `AddBaseObject` before any cluster (`VMSerializationRoots`). The
+/// runtime creates these itself; the snapshot never serializes their
+/// contents, so references to them must be interpreted from this layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaseObjects {
+    pub null: i32,
+    /// `Object::sentinel()`: the value of a `late` or lazily initialized
+    /// static field before its first assignment.
+    pub sentinel: i32,
+    pub empty_array: i32,
+    pub dynamic_type: i32,
+    pub void_type: i32,
+    pub empty_type_arguments: i32,
+    pub true_value: i32,
+    pub false_value: i32,
+    /// First cached `ArgumentsDescriptor` (`ArgumentsDescriptor::Init`
+    /// order: for each type-argument count, value-argument counts 0..=max).
+    pub cached_descriptors: i32,
+    /// Largest cached value-argument count per type-argument count.
+    pub cached_descriptor_max_arguments: &'static [usize],
+}
+
+impl BaseObjects {
+    /// Dart 3.4 still registered `transition_sentinel` third.
+    const DART_3_4: Self = Self {
+        null: 1,
+        sentinel: 2,
+        empty_array: 5,
+        dynamic_type: 8,
+        void_type: 9,
+        empty_type_arguments: 10,
+        true_value: 11,
+        false_value: 12,
+        cached_descriptors: 22,
+        cached_descriptor_max_arguments: &[31],
+    };
+    const DART_3_5: Self = Self {
+        null: 1,
+        sentinel: 2,
+        empty_array: 4,
+        dynamic_type: 7,
+        void_type: 8,
+        empty_type_arguments: 9,
+        true_value: 10,
+        false_value: 11,
+        cached_descriptors: 21,
+        cached_descriptor_max_arguments: &[31],
+    };
+    /// Dart 3.9 added cached descriptors with one type argument.
+    const DART_3_9: Self = Self {
+        cached_descriptor_max_arguments: &[31, 2],
+        ..Self::DART_3_5
+    };
+
+    pub fn for_minor(minor: u32) -> Self {
+        match minor {
+            ..=4 => Self::DART_3_4,
+            5..=8 => Self::DART_3_5,
+            _ => Self::DART_3_9,
+        }
+    }
+
+    /// `(type_args_len, count)` of a cached descriptor base object.
+    pub fn cached_descriptor(&self, reference: i32) -> Option<(usize, usize)> {
+        let mut index = usize::try_from(reference.checked_sub(self.cached_descriptors)?).ok()?;
+        for (type_args_len, max) in self.cached_descriptor_max_arguments.iter().enumerate() {
+            if index <= *max {
+                return Some((type_args_len, index));
+            }
+            index -= max + 1;
+        }
+        None
+    }
 }
 
 pub fn profile_for(info: &SnapshotInfo, pointer_width: usize) -> Result<Profile> {
@@ -108,7 +219,7 @@ pub fn profile_for(info: &SnapshotInfo, pointer_width: usize) -> Result<Profile>
         .features
         .iter()
         .any(|feature| feature == "compressed-pointers");
-    let cids = match minor {
+    let mut cids = match minor {
         4 | 5 => CIDS_343,
         6..=8 => CIDS_362,
         9..=12 => CIDS_392,
@@ -118,10 +229,25 @@ pub fn profile_for(info: &SnapshotInfo, pointer_width: usize) -> Result<Profile>
             )));
         }
     };
+    cids.base = BaseObjects::for_minor(minor);
+    cids.layout = ObjectLayout::new(pointer_width, compressed_pointers);
     let (instance_header_words, unboxed_word_u32_chunks) =
         serialized_instance_layout(pointer_width, compressed_pointers)?;
+    use super::root_names as names;
+    let root_names = match minor {
+        4 => names::ROOT_NAMES_34,
+        5 => names::ROOT_NAMES_35,
+        6..=8 => names::ROOT_NAMES_36,
+        9 => names::ROOT_NAMES_39,
+        10 => names::ROOT_NAMES_310,
+        11 => names::ROOT_NAMES_311,
+        _ => names::ROOT_NAMES_3122,
+    };
     Ok(Profile {
         cids,
+        root_names,
+        shared_field_table: minor >= 5,
+        minor,
         compressed_pointers,
         instance_header_words,
         unboxed_word_u32_chunks,
@@ -288,6 +414,12 @@ macro_rules! common_cids {
             typed_data_first: $typed_first,
             byte_data_view: $byte_view,
             predefined_count: $predefined,
+            base: BaseObjects::DART_3_9,
+            layout: ObjectLayout {
+                header_bytes: 8,
+                compressed_word: 4,
+                native_word: 8,
+            },
         }
     };
 }

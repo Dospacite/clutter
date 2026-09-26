@@ -70,9 +70,112 @@
       "kind": "resolved_call",
       "target": "_Double.toStringAsFixed",
       "arguments": [
-        "local10",
+        "arg0",
         "2"
       ]
+    },
+    {
+      "id": "arm64_no_stale_allocation_argument",
+      "variants": [
+        "plain",
+        "plain_x64"
+      ],
+      "function": "toString",
+      "kind": "resolved_call",
+      "target": "_Double.toStringAsFixed",
+      "arguments": [
+        "this._slot_10",
+        "2"
+      ]
+    },
+    {
+      "id": "arm32_no_extra_int64_half",
+      "variants": [
+        "plain_arm32"
+      ],
+      "function": "toString",
+      "kind": "resolved_call",
+      "target": "_Double.toStringAsFixed",
+      "arguments": [
+        "this._slot_c",
+        "2"
+      ]
+    },
+    {
+      "id": "format_price_complete_low_confidence",
+      "variants": [
+        "plain",
+        "plain_x64",
+        "plain_arm32"
+      ],
+      "function": "formatPrice",
+      "kind": "return",
+      "expression": "'\\$${_Double_toStringAsFixed_result}'",
+      "confidence": "low"
+    },
+    {
+      "id": "item_count_accumulator_starts_at_zero",
+      "variants": [
+        "plain",
+        "plain_x64",
+        "plain_arm32"
+      ],
+      "function": "get:itemCount",
+      "owner": "Cart",
+      "kind": "assign",
+      "value": "0"
+    },
+    {
+      "id": "subtotal_accumulator_starts_at_zero",
+      "variants": [
+        "plain",
+        "plain_x64",
+        "plain_arm32"
+      ],
+      "function": "get:subtotal",
+      "owner": "Cart",
+      "kind": "assign",
+      "value": "0.0"
+    },
+    {
+      "id": "checkout_awaits_delayed_future",
+      "variants": [
+        "plain",
+        "plain_x64",
+        "plain_arm32"
+      ],
+      "function": "_checkout",
+      "kind": "resolved_call",
+      "target": "stub Await",
+      "arguments": [
+        "Future_Future_delayed_result"
+      ]
+    }
+  ],
+  "forbidden_semantic_statements": [
+    {
+      "id": "format_price_incomplete_high_confidence",
+      "variants": [
+        "plain",
+        "plain_x64",
+        "plain_arm32"
+      ],
+      "function": "formatPrice",
+      "kind": "return",
+      "expression": "'${snapshotRef(371)}'",
+      "confidence": "high"
+    },
+    {
+      "id": "subtotal_returns_loop_condition",
+      "variants": [
+        "plain",
+        "plain_x64",
+        "plain_arm32"
+      ],
+      "function": "get:subtotal",
+      "owner": "Cart",
+      "kind": "return",
+      "expression": "_CompactIterator_moveNext_result"
     }
   ]
 }

@@ -2,12 +2,12 @@
 # Differential compiler laboratory.
 #
 # Generates small Dart programs (one construct per case), compiles each across
-# every installed Flutter/SDK version, all three ABIs, and obfuscation modes,
+# one explicitly selected Flutter SDK, requested ABIs, and obfuscation modes,
 # runs Clutter on every artifact, then mines cross-build lowering templates
 # and regression fixtures from the recovered IR.
 #
 # Usage:
-#   test/tool/compiler_lab.sh [--corpus DIR] [--out DIR] [--abis LIST] [--cases NAME,...]
+#   test/tool/compiler_lab.sh [--flutter-bin PATH] [--out DIR] [--abis LIST] [--cases NAME,...]
 #
 # Outputs under --out (default: target/compiler-lab):
 #   <case>/<variant>/decompilation.json   Clutter output per build variant
@@ -23,12 +23,14 @@ fi
 lab_out="target/compiler-lab"
 abis="android-arm64,android-arm,android-x64"
 cases="all"
+flutter_bin=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) lab_out="$2"; shift 2 ;;
     --abis) abis="$2"; shift 2 ;;
     --cases) cases="$2"; shift 2 ;;
+    --flutter-bin) flutter_bin="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -284,12 +286,17 @@ fi
 # ---------------------------------------------------------------------------
 # Build + decompile matrix
 # ---------------------------------------------------------------------------
-flutter_bin="$(command -v flutter || true)"
+if [[ -z "$flutter_bin" ]]; then
+  flutter_bin="$(command -v flutter || true)"
+fi
 clutter_bin="$root/target/release/clutter"
 
-if [[ -z "$flutter_bin" ]]; then
-  echo "flutter not found on PATH: building corpus only (no matrix)" >&2
+if [[ -z "$flutter_bin" || ! -x "$flutter_bin" ]]; then
+  echo "Flutter executable is missing; pass --flutter-bin PATH" >&2
+  exit 2
 fi
+flutter_bin="$(realpath "$flutter_bin")"
+"$flutter_bin" --version --machine > "$lab_out/flutter-version.json"
 if [[ ! -x "$clutter_bin" ]]; then
   (cd "$root" && cargo build --release)
 fi
@@ -299,6 +306,7 @@ echo '{"schema":"clutter.compiler-lab/v1","rows":[' > "$matrix"
 first_row=true
 
 IFS=',' read -ra abi_list <<< "$abis"
+expected_rows=$(( ${#wanted[@]} * ${#abi_list[@]} * 2 ))
 for case_name in "${wanted[@]}"; do
   case_dir="$lab_out/cases/$case_name"
   for mode in plain obfuscated; do
@@ -309,7 +317,7 @@ for case_name in "${wanted[@]}"; do
     # Scaffold the Android platform once per case (pure-Dart cases have no
     # android/ directory until flutter create generates it).
     if [[ ! -f "$case_dir/android/app/build.gradle" && ! -f "$case_dir/android/app/build.gradle.kts" ]]; then
-      (cd "$case_dir" && flutter create --platforms=android --project-name "lab_${case_name}" . >/dev/null 2>&1) \
+      (cd "$case_dir" && "$flutter_bin" create --platforms=android --project-name "lab_${case_name}" . >/dev/null 2>&1) \
         || { echo "flutter create failed: $case_name" >&2; continue; }
       # Restore our minimal pubspec sections that flutter create may rewrite.
       cp "$case_dir/pubspec.yaml" "$lab_out/cases/$case_name/pubspec.yaml.bak" 2>/dev/null || true
@@ -317,11 +325,8 @@ for case_name in "${wanted[@]}"; do
     for abi in "${abi_list[@]}"; do
       variant="${mode}-${abi}"
       out_dir="$lab_out/$case_name/$variant"
-      if [[ -z "$flutter_bin" ]]; then
-        continue
-      fi
       echo "[lab] building $case_name / $variant" >&2
-      (cd "$case_dir" && flutter build apk --release --target-platform "$abi" "${extra[@]+"${extra[@]}"}") \
+      (cd "$case_dir" && "$flutter_bin" build apk --release --target-platform "$abi" "${extra[@]+"${extra[@]}"}") \
         || { echo "build failed: $case_name/$variant" >&2; continue; }
       apk_src="$case_dir/build/app/outputs/flutter-apk/app-release.apk"
       [[ -f "$apk_src" ]] || continue
@@ -354,11 +359,20 @@ PYEOF
 done
 
 echo ']}' >> "$matrix"
+actual_rows="$(python3 - "$matrix" <<'PYEOF'
+import json, sys
+print(len(json.load(open(sys.argv[1]))["rows"]))
+PYEOF
+)"
+if [[ "$actual_rows" -ne "$expected_rows" ]]; then
+  echo "incomplete compiler matrix: $actual_rows of $expected_rows required variants succeeded" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
-# Template mining: group IR statements by shape across variants of one case.
-# A "template" is an ordered statement-shape sequence that appears in EVERY
-# successful variant — that is what a lowering rule may rely on.
+# Template mining compares each uniquely named function across every required
+# variant. It records the intersection of statement-shape counts, including
+# calls, without depending on whole-program order.
 # ---------------------------------------------------------------------------
 python3 - "$lab_out" "${wanted[@]}" <<'PYEOF'
 import json, sys, pathlib, collections
@@ -368,30 +382,24 @@ wanted = sys.argv[2:]
 templates_root = lab / "templates"
 templates_root.mkdir(parents=True, exist_ok=True)
 
-def shape_sequence(program):
-    seq = []
+def function_shapes(program):
+    shapes = {}
+    duplicates = set()
     for fn in program.get("functions", []):
+        key = (fn.get("library_uri"), fn.get("owner"), fn.get("name"))
+        if key in shapes:
+            duplicates.add(key)
+            continue
+        seq = []
         for st in fn.get("statements", []):
-            kind = st.get("kind", "Unknown")
-            if kind == "DirectCall":
-                kind = f"DirectCall[{st.get('target')}]"
-            elif kind == "ObjectPoolCall":
-                kind = f"ObjectPoolCall[{st.get('target')}]"
+            kind = st.get("kind", "unknown")
+            if kind in ("direct_call", "object_pool_call"):
+                kind = f"{kind}[{st.get('target')}]"
             seq.append(kind)
-    return tuple(seq)
-
-def common_prefix(seqs):
-    if not seqs:
-        return []
-    shortest = min(seqs, key=len)
-    prefix = []
-    for i, value in enumerate(shortest):
-        column = {seq[i] for seq in seqs}
-        if len(column) == 1:
-            prefix.append(value)
-        else:
-            break
-    return prefix
+        shapes[key] = collections.Counter(seq)
+    for key in duplicates:
+        shapes.pop(key, None)
+    return shapes
 
 summary = {}
 for case in wanted:
@@ -401,16 +409,28 @@ for case in wanted:
         if not ir.is_file():
             continue
         program = json.loads(ir.read_text())
-        shapes[variant_dir.name] = shape_sequence(program)
+        shapes[variant_dir.name] = function_shapes(program)
     if len(shapes) < 2:
         summary[case] = {"variants_compared": len(shapes),
                          "note": "need >=2 variants to mine a template"}
         continue
-    shared = common_prefix(list(shapes.values()))
+    common_keys = set.intersection(*(set(value) for value in shapes.values()))
+    functions = []
+    for key in sorted(common_keys, key=str):
+        counters = [value[key] for value in shapes.values()]
+        shared = counters[0].copy()
+        for counter in counters[1:]:
+            shared &= counter
+        if shared:
+            functions.append({
+                "library_uri": key[0], "owner": key[1], "name": key[2],
+                "shared_statement_shapes": dict(sorted(shared.items())),
+            })
     summary[case] = {
         "variants_compared": len(shapes),
-        "template_length": len(shared),
-        "template": shared[:32],
+        "functions_compared": len(common_keys),
+        "functions_with_shared_shapes": len(functions),
+        "functions": functions,
     }
     (templates_root / f"{case}.json").write_text(
         json.dumps({"schema": "clutter.lowering-template/v1",

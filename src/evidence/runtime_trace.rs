@@ -151,10 +151,20 @@ pub struct TraceRefinement {
     pub executed_bodies: Vec<TraceFact<u64>>,
     /// For each selector slot, the most frequently taken target offset.
     pub dominant_dispatch_targets: Vec<(u64, TraceFact<u64>)>,
+    /// Every target observed for a selector, including minority targets.
+    pub observed_dispatch_targets: Vec<(u64, TraceFact<u64>)>,
     /// Observed positional arities per callee offset.
     pub observed_arities: Vec<(u64, TraceFact<usize>)>,
+    /// Every supplied call shape. Named arguments retain their observed order.
+    pub observed_argument_shapes: Vec<(u64, TraceFact<ObservedCallShape>)>,
     /// Receiver CIDs observed per call-site offset.
     pub observed_receivers: Vec<(u64, TraceFact<i64>)>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ObservedCallShape {
+    pub positional_count: usize,
+    pub named_names: Vec<String>,
 }
 
 impl TraceRefinement {
@@ -169,7 +179,17 @@ impl TraceRefinement {
         }
 
         for (selector, mut targets) in trace.dispatch_profile() {
+            let mut counts = BTreeMap::<u64, u64>::new();
+            for (target, hits) in targets.drain(..) {
+                *counts.entry(target).or_default() += hits;
+            }
+            let mut targets = counts.into_iter().collect::<Vec<_>>();
             targets.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+            for (target_offset, hits) in &targets {
+                refinement
+                    .observed_dispatch_targets
+                    .push((selector, TraceFact::new(*target_offset, *hits)));
+            }
             if let Some((target_offset, hits)) = targets.first().copied() {
                 refinement
                     .dominant_dispatch_targets
@@ -178,7 +198,17 @@ impl TraceRefinement {
         }
 
         let mut arities: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
+        let mut shapes: BTreeMap<(u64, ObservedCallShape), u64> = BTreeMap::new();
         for descriptor in &trace.argument_descriptors {
+            *shapes
+                .entry((
+                    descriptor.callee_offset,
+                    ObservedCallShape {
+                        positional_count: descriptor.positional_count,
+                        named_names: descriptor.named_names.clone(),
+                    },
+                ))
+                .or_default() += descriptor.hit_count;
             let entry = arities
                 .entry(descriptor.callee_offset)
                 .or_insert((descriptor.positional_count, 0));
@@ -189,6 +219,11 @@ impl TraceRefinement {
             refinement
                 .observed_arities
                 .push((offset, TraceFact::new(positional, hits)));
+        }
+        for ((offset, shape), hits) in shapes {
+            refinement
+                .observed_argument_shapes
+                .push((offset, TraceFact::new(shape, hits)));
         }
 
         let mut receivers: BTreeMap<u64, BTreeMap<i64, u64>> = BTreeMap::new();
@@ -210,6 +245,9 @@ impl TraceRefinement {
         refinement
             .dominant_dispatch_targets
             .sort_by_key(|(selector, _)| *selector);
+        refinement
+            .observed_dispatch_targets
+            .sort_by_key(|(selector, target)| (*selector, target.value));
         refinement
             .observed_arities
             .sort_by_key(|(offset, _)| *offset);
@@ -299,5 +337,45 @@ mod tests {
         let refinement = TraceRefinement::derive(&trace);
         assert_eq!(refinement.observed_receivers.len(), 1);
         assert_eq!(refinement.observed_receivers[0].1.value, 62);
+    }
+
+    #[test]
+    fn refinement_preserves_minority_targets_and_distinct_call_shapes() {
+        let mut trace = RuntimeTrace::load(SAMPLE.as_bytes()).unwrap();
+        trace.dispatch_targets.push(DispatchObservation {
+            selector_index: 100,
+            target_offset: 8192,
+            hit_count: 3,
+        });
+        trace.argument_descriptors.push(ObservedArgumentDescriptor {
+            callee_offset: 4096,
+            positional_count: 1,
+            named_names: vec!["mode".to_owned()],
+            hit_count: 2,
+        });
+        let refinement = TraceRefinement::derive(&trace);
+        let targets = refinement
+            .observed_dispatch_targets
+            .iter()
+            .filter(|(selector, _)| *selector == 100)
+            .map(|(_, fact)| (fact.value, fact.observations))
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec![(4096, 9), (8192, 5)]);
+        let shapes = refinement
+            .observed_argument_shapes
+            .iter()
+            .filter(|(callee, _)| *callee == 4096)
+            .map(|(_, fact)| {
+                (
+                    fact.value.positional_count,
+                    fact.value.named_names.clone(),
+                    fact.observations,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            vec![(1, vec!["mode".to_owned()], 2), (2, vec![], 4)]
+        );
     }
 }

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'hardening.dart' show runHardening;
 import 'models.dart';
 
 void main() {
@@ -32,6 +33,7 @@ class _CatalogPageState extends State<CatalogPage> {
   final Cart _cart = Cart();
   String _query = '';
   String _status = 'Ready';
+  late final String _hardening = runHardening(DateTime.now().millisecond);
 
   List<Product> get _filteredProducts {
     if (_query.isEmpty) {
@@ -92,6 +94,7 @@ class _CatalogPageState extends State<CatalogPage> {
             ),
           ),
           Text(_status, style: Theme.of(context).textTheme.titleMedium),
+          Text(_hardening, maxLines: 2, overflow: TextOverflow.ellipsis),
           if (cheapest != null)
             Text('Deal: ${cheapest.name} at ${formatPrice(cheapest.price)}'),
           Expanded(

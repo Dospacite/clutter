@@ -1,4 +1,5 @@
 pub(crate) mod body;
+pub(crate) mod call_shape;
 pub(crate) mod consensus;
 pub(crate) mod oracle;
 pub(crate) mod runtime_trace;

@@ -526,6 +526,10 @@ pub fn recover(
             parameter_count: snapshot_match
                 .as_ref()
                 .and_then(|function| function.parameter_count),
+            machine_interface: None,
+            loading_unit: None,
+            parameter_defaults: Default::default(),
+            async_modifier: None,
             lexical_parent: snapshot_match
                 .as_ref()
                 .and_then(|function| function.lexical_parent.clone()),
@@ -652,8 +656,12 @@ fn semantic_address(statement: &crate::model::SemanticStatement) -> &str {
         | crate::model::SemanticStatement::ResolvedCall { address, .. }
         | crate::model::SemanticStatement::FieldRead { address, .. }
         | crate::model::SemanticStatement::FieldWrite { address, .. }
+        | crate::model::SemanticStatement::StaticFieldRead { address, .. }
+        | crate::model::SemanticStatement::Assign { address, .. }
+        | crate::model::SemanticStatement::StaticFieldWrite { address, .. }
         | crate::model::SemanticStatement::Condition { address, .. }
-        | crate::model::SemanticStatement::StringInterpolation { address, .. } => address,
+        | crate::model::SemanticStatement::StringInterpolation { address, .. }
+        | crate::model::SemanticStatement::Throw { address, .. } => address,
     }
 }
 

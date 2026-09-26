@@ -78,6 +78,9 @@ pub(crate) fn structure_body(
     catch_banners: &BTreeSet<u64>,
 ) -> StructuredBody {
     let mut starts: BTreeSet<u64> = BTreeSet::from([entry]);
+    // A handler that leaves through a tail branch has no CFG edge at its
+    // entry; it is still a block the VM enters.
+    starts.extend(handler_blocks.iter().copied());
     for edge in edges {
         if let (Some(from), Some(to)) = (parse_address(&edge.from), parse_address(&edge.to)) {
             starts.insert(from);
@@ -207,6 +210,19 @@ pub(crate) fn structure_body(
     // The linear walk can stall when every successor of a block was already
     // visited (diamonds that re-join). Resume from the lowest unvisited block
     // that carries evidence so its interior branching still structures.
+    // Blocks only a handler reaches belong to its catch clause, which the
+    // handler pass below emits; resuming into them would strand the body
+    // outside the clause.
+    let mut handler_only = BTreeSet::new();
+    let mut queue = catch_banners.iter().copied().collect::<Vec<_>>();
+    while let Some(block) = queue.pop() {
+        if cfg.reachable.contains(&block) || !handler_only.insert(block) {
+            continue;
+        }
+        if let Some(successors) = cfg.succs.get(&block) {
+            queue.extend(successors.iter().copied());
+        }
+    }
     loop {
         if state.budget == 0 {
             break;
@@ -214,7 +230,7 @@ pub(crate) fn structure_body(
         let Some(resume) = starts
             .iter()
             .copied()
-            .filter(|start| !state.visited.contains(start))
+            .filter(|start| !state.visited.contains(start) && !handler_only.contains(start))
             .find(|start| {
                 cfg.statements_by_block
                     .get(start)
@@ -240,12 +256,16 @@ pub(crate) fn structure_body(
     // generated finally/dispatch-cleanup entries stay excluded from loop
     // detection above but never render as `catch` clauses.
     for handler in catch_banners {
-        if !state.visited.contains(handler)
-            && cfg
-                .statements_by_block
-                .get(handler)
-                .is_some_and(|indices| !indices.is_empty())
-        {
+        // The entry block often only restores the frame; the handler's
+        // statements can start in a later block of its region.
+        let region_has_statements = std::iter::once(handler)
+            .chain(handler_only.iter())
+            .any(|block| {
+                cfg.statements_by_block
+                    .get(block)
+                    .is_some_and(|indices| !indices.is_empty())
+            });
+        if !state.visited.contains(handler) && region_has_statements {
             let before_claims = state.claimed.iter().filter(|claim| **claim).count();
             let piece = walk(*handler, &cfg, statements, &mut state);
             let after_claims = state.claimed.iter().filter(|claim| **claim).count();
@@ -331,7 +351,12 @@ fn walk(
             cfg.conditions.get(&address).cloned()
         {
             state.branches += 1;
-            let merge = find_merge(true_target, false_target, cfg);
+            let merge = find_merge(address, true_target, false_target, cfg);
+            let (expression, true_target, false_target) =
+                orient_branch(expression, true_target, false_target, merge);
+            // The arms end at the merge: hold it as visited while walking
+            // them so a fall-through arm does not swallow the join.
+            let release_merge = state.visited.insert(merge);
             // `walk` marks its entry visited itself; only gate on prior
             // visits here so the sub-walk actually executes.
             let then_body = if !state.visited.contains(&true_target) {
@@ -346,6 +371,9 @@ fn walk(
             } else {
                 None
             };
+            if release_merge {
+                state.visited.remove(&merge);
+            }
             pieces.push(demote_empty_low_confidence_branch(
                 expression, confidence, then_body, else_body,
             ));
@@ -381,8 +409,12 @@ fn emit_linear(
         }
         state.claimed[index] = true;
         linear.push(index);
-        // A machine return terminates the block; nothing later is reachable.
-        if matches!(statements[index], SemanticStatement::Return { .. }) {
+        // A machine return or throw terminates the block; nothing later is
+        // reachable.
+        if matches!(
+            statements[index],
+            SemanticStatement::Return { .. } | SemanticStatement::Throw { .. }
+        ) {
             break;
         }
     }
@@ -390,6 +422,13 @@ fn emit_linear(
         return StructureNode::Return(linear[0]);
     }
     StructureNode::Linear(linear)
+}
+
+/// A loop body block: dominated by the header and reachable from the entry.
+/// Handler regions are unreachable from the entry, so their dominator sets
+/// are complete and would otherwise join every enclosing loop.
+fn in_natural_loop(cfg: &Cfg, header: u64, block: u64) -> bool {
+    cfg.reachable.contains(&block) && dominates(cfg, header, block)
 }
 
 fn emit_loop(
@@ -408,7 +447,7 @@ fn emit_loop(
             predecessors
                 .iter()
                 .copied()
-                .filter(|predecessor| dominates(cfg, header, *predecessor))
+                .filter(|predecessor| in_natural_loop(cfg, header, *predecessor))
                 .collect()
         })
         .unwrap_or_default();
@@ -419,7 +458,7 @@ fn emit_loop(
                     predecessors
                         .iter()
                         .copied()
-                        .filter(|predecessor| dominates(cfg, header, *predecessor)),
+                        .filter(|predecessor| in_natural_loop(cfg, header, *predecessor)),
                 );
             }
         }
@@ -694,8 +733,11 @@ fn walk_clamped(
             cfg.conditions.get(&address).cloned()
         {
             state.branches += 1;
-            let merge = find_merge(true_target, false_target, cfg);
+            let merge = find_merge(address, true_target, false_target, cfg);
+            let (expression, true_target, false_target) =
+                orient_branch(expression, true_target, false_target, merge);
             let merge_in_region = boundary.contains(&merge);
+            let release_merge = state.visited.insert(merge);
             let then_body = if !state.visited.contains(&true_target) {
                 walk_clamped(true_target, cfg, statements, state, boundary)
             } else {
@@ -714,6 +756,9 @@ fn walk_clamped(
             } else {
                 None
             };
+            if release_merge {
+                state.visited.remove(&merge);
+            }
             pieces.push(demote_empty_low_confidence_branch(
                 expression, confidence, then_body, else_body,
             ));
@@ -727,6 +772,21 @@ fn walk_clamped(
             .filter(|next| !state.visited.contains(next) && boundary.contains(next));
     }
     StructureNode::Block(pieces)
+}
+
+/// When the true edge goes straight to the merge, the branch guards only the
+/// false arm: negate it so that arm becomes the `then` body.
+fn orient_branch(
+    expression: String,
+    true_target: u64,
+    false_target: u64,
+    merge: u64,
+) -> (String, u64, u64) {
+    if true_target == merge && false_target != merge {
+        (negate_condition(&expression, true), false_target, true_target)
+    } else {
+        (expression, true_target, false_target)
+    }
 }
 
 fn negate_condition(condition: &str, negated: bool) -> String {
@@ -843,6 +903,11 @@ fn demote_cid_compare_towers(
             return None;
         }
         let head = &compact[..compact.len() - digits.len()];
+        // The digits must be a literal operand, not the tail of a name
+        // (`a._slot_8 == b._slot_8`).
+        if !head.ends_with(['=', '<', '>']) {
+            return None;
+        }
         (head.contains('=') || head.contains('<') || head.contains('>'))
             .then(|| {
                 let register = head.trim_end_matches(|c: char| !c.is_ascii_alphabetic());
@@ -942,16 +1007,14 @@ fn dominates(cfg: &Cfg, dominator: u64, candidate: u64) -> bool {
         .is_some_and(|doms| doms.contains(&dominator))
 }
 
-fn find_merge(true_target: u64, false_target: u64, cfg: &Cfg) -> u64 {
-    // The branch's immediate post-dominator is the exact join point when the
-    // CFG reached it; this keeps diamonds that re-enter an arm from folding
-    // into each other (a plain nearest-common-successor search picks the
-    // true edge itself there).
-    if let Some(join) = cfg
-        .ipdom
-        .get(&true_target)
-        .or_else(|| cfg.ipdom.get(&false_target))
-    {
+fn find_merge(branch: u64, true_target: u64, false_target: u64, cfg: &Cfg) -> u64 {
+    // The branch block's immediate post-dominator is the exact join point
+    // when the CFG reached it; this keeps diamonds that re-enter an arm from
+    // folding into each other (a plain nearest-common-successor search picks
+    // the true edge itself there). An arm's own post-dominator is not the
+    // join: for an if-then whose edge goes straight to the join, it lies past
+    // the join and pulls the join into the other arm.
+    if let Some(join) = cfg.ipdom.get(&branch) {
         return *join;
     }
     // Bounded forward search for the nearest common successor.
@@ -1283,6 +1346,150 @@ mod tests {
     }
 
     #[test]
+    fn if_then_join_stays_after_the_branch() {
+        // 0x100 branches straight to the join 0x120 when true and through the
+        // initializer 0x110 when false: `if (!c) init(); join();`. The join
+        // must follow the `if`, not sit inside one arm.
+        let edge = |from: &str, to: &str, kind| ControlFlowEdge {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            kind,
+        };
+        let control_flow = vec![
+            edge("0x100", "0x120", ControlFlowEdgeKind::ConditionalTrue),
+            edge("0x100", "0x110", ControlFlowEdgeKind::ConditionalFalse),
+            edge("0x110", "0x120", ControlFlowEdgeKind::Fallthrough),
+        ];
+        let mut statements = vec![SemanticStatement::Condition {
+            expression: "c".to_owned(),
+            true_target: Some("0x120".to_owned()),
+            false_target: Some("0x110".to_owned()),
+            confidence: EvidenceConfidence::High,
+            address: "0x10c".to_owned(),
+        }];
+        statements.extend(calls_at(&["0x114", "0x124"]));
+        let structured = structure_body(
+            0x100,
+            &control_flow,
+            &statements,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        fn indices(node: &StructureNode, into: &mut Vec<usize>) {
+            match node {
+                StructureNode::Linear(values) => into.extend(values),
+                StructureNode::Return(value) => into.push(*value),
+                StructureNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    indices(then_body, into);
+                    if let Some(body) = else_body {
+                        indices(body, into);
+                    }
+                }
+                StructureNode::While { body, .. } | StructureNode::CatchHandler(body) => {
+                    indices(body, into)
+                }
+                StructureNode::Block(children) => {
+                    children.iter().for_each(|child| indices(child, into))
+                }
+                StructureNode::UnresolvedPredicate(_) => {}
+            }
+        }
+        let StructureNode::Block(children) = &structured.root else {
+            panic!("expected a block root");
+        };
+        let branch = children
+            .iter()
+            .position(|child| matches!(child, StructureNode::If { .. }))
+            .expect("an if region");
+        let mut inside = Vec::new();
+        indices(&children[branch], &mut inside);
+        let mut after = Vec::new();
+        children[branch + 1..]
+            .iter()
+            .for_each(|child| indices(child, &mut after));
+        assert_eq!(inside, vec![1], "only the initializer is conditional");
+        assert_eq!(after, vec![2], "the join follows the branch");
+    }
+
+    fn calls_at(addresses: &[&str]) -> Vec<SemanticStatement> {
+        addresses
+            .iter()
+            .map(|address| SemanticStatement::ResolvedCall {
+                target: format!("sub_{address}"),
+                arguments: Vec::new(),
+                confidence: EvidenceConfidence::Medium,
+                address: address.to_string(),
+            })
+            .collect()
+    }
+
+    fn catch_bodies(node: &StructureNode) -> Vec<Vec<usize>> {
+        fn collect(node: &StructureNode, out: &mut Vec<usize>) {
+            match node {
+                StructureNode::Linear(indices) => out.extend(indices),
+                StructureNode::Block(children) => {
+                    children.iter().for_each(|child| collect(child, out));
+                }
+                _ => {}
+            }
+        }
+        match node {
+            StructureNode::CatchHandler(body) => {
+                let mut out = Vec::new();
+                collect(body, &mut out);
+                vec![out]
+            }
+            StructureNode::Block(children) => children.iter().flat_map(catch_bodies).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn handlers_without_cfg_edges_keep_their_own_statements() {
+        // 0x100 -> 0x110 (return). The handler at 0x120 leaves through a
+        // tail branch outside the function, so no edge mentions it.
+        let control_flow = vec![ControlFlowEdge {
+            from: "0x100".to_owned(),
+            to: "0x110".to_owned(),
+            kind: ControlFlowEdgeKind::Fallthrough,
+        }];
+        let statements = calls_at(&["0x104", "0x114", "0x124"]);
+        let handlers = BTreeSet::from([0x120]);
+        let structured =
+            structure_body(0x100, &control_flow, &statements, &handlers, &handlers);
+        assert_eq!(catch_bodies(&structured.root), vec![vec![2]]);
+    }
+
+    #[test]
+    fn handler_blocks_do_not_join_enclosing_loops() {
+        // Loop 0x110 <-> 0x120; the handler 0x130 rejoins the latch 0x120.
+        let edges = [
+            ("0x100", "0x110"),
+            ("0x110", "0x120"),
+            ("0x120", "0x110"),
+            ("0x110", "0x140"),
+            ("0x130", "0x120"),
+        ];
+        let control_flow = edges
+            .iter()
+            .map(|(from, to)| ControlFlowEdge {
+                from: from.to_string(),
+                to: to.to_string(),
+                kind: ControlFlowEdgeKind::Fallthrough,
+            })
+            .collect::<Vec<_>>();
+        let statements = calls_at(&["0x104", "0x114", "0x124", "0x134"]);
+        let handlers = BTreeSet::from([0x130]);
+        let structured =
+            structure_body(0x100, &control_flow, &statements, &handlers, &handlers);
+        assert_eq!(catch_bodies(&structured.root), vec![vec![3]]);
+    }
+
+    #[test]
     fn demotes_cid_compare_towers_to_single_comment() {
         use super::demote_cid_compare_towers;
         let shell =
@@ -1316,6 +1523,16 @@ mod tests {
             }
             other => panic!("tower not collapsed: {other:?}"),
         }
+        // A comparison of two field reads is not a class-id constant test.
+        let lengths = shell(
+            "list._slot_8 == list._slot_c._slot_8",
+            StructureNode::Block(Vec::new()),
+            None,
+        );
+        assert!(matches!(
+            demote_cid_compare_towers(lengths, &statements),
+            StructureNode::If { .. }
+        ));
         // A tower whose arm carries real statements stays an `if`.
         let with_content = shell(
             "x4 <= 55",

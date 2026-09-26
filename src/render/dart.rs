@@ -9,11 +9,18 @@ use crate::model::{
 
 pub(super) struct RenderIndex {
     functions_by_library: BTreeMap<String, Vec<usize>>,
+    /// Anonymous bodies (discarded Function objects) placed in the one
+    /// library all of their direct callers belong to, keyed by address.
+    placed_by_callers: BTreeMap<String, String>,
+    /// Names of anonymous (`sub_<address>`) bodies rendered in the view, so
+    /// calls to them are emitted instead of summarized as opaque code.
+    rendered_anonymous: BTreeSet<String>,
     declarations_by_library: BTreeMap<String, Vec<usize>>,
     shared_code_primary: BTreeMap<(String, u64), usize>,
     /// Callee evidence for call-site rendering, keyed by qualified readable
     /// name (`Owner.member`) and, for top-level members, bare name.
     callees: BTreeMap<String, CalleeInfo>,
+    constants: std::sync::Arc<super::constants::ConstantIndex>,
 }
 
 /// What a recovered declaration proves about a callable at a call site.
@@ -73,25 +80,113 @@ pub(crate) fn callee_optional_named(
         .collect()
 }
 
-pub(crate) fn source_visible_function(function: &RecoveredFunction) -> bool {
+/// Whether a body belongs in the `.dart` view. Anonymous bodies whose
+/// Function object was discarded (split-debug-info and obfuscated builds
+/// discard most of them) are still compiled Dart code and stay visible;
+/// only code the VM oracle identifies as a stub or boundary is excluded.
+pub(crate) fn source_visible_function(
+    function: &RecoveredFunction,
+    roots: Option<&crate::model::SnapshotRootEvidence>,
+) -> bool {
+    if roots.is_some_and(|roots| {
+        roots.named_stub_references.values().any(|reference| {
+            *reference == function.code_reference
+                || function.code_alias_references.contains(reference)
+        })
+    }) {
+        return false;
+    }
     let vm_kind = function
         .vm_evidence
         .as_ref()
         .and_then(|evidence| evidence.kind.as_deref());
-    if matches!(vm_kind, Some("VmStubCode" | "AotCodeBoundary")) {
-        return false;
+    !matches!(
+        vm_kind,
+        Some("VmStubCode" | "AotCodeBoundary" | "SharedAotCodeBoundary")
+    )
+}
+
+/// Places anonymous, library-less bodies with their callers: a body whose
+/// direct callers all belong (or were placed) in one library is rendered
+/// there. Iterates to a fixpoint so helper chains follow their root caller.
+/// Placement organizes the view; it does not prove the defining library.
+fn call_graph_placements(program: &RecoveredProgram) -> BTreeMap<String, String> {
+    let unplaced = |function: &RecoveredFunction| {
+        function.library_uri.is_none()
+            && function.name_source == crate::model::RecoveredNameSource::Synthetic
+    };
+    let by_address = program
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| (function.address.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut callers = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (caller, function) in program.functions.iter().enumerate() {
+        for statement in &function.statements {
+            let crate::model::PseudoStatement::DirectCall {
+                target_address,
+                target_code_address,
+                target_entry_offset,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let target = match target_entry_offset {
+                Some(offset) if *offset > 0 => target_code_address.as_deref(),
+                _ => target_code_address.as_deref().or(Some(target_address)),
+            };
+            if let Some(&callee) = target.and_then(|target| by_address.get(target))
+                && callee != caller
+                && unplaced(&program.functions[callee])
+            {
+                callers.entry(callee).or_default().insert(caller);
+            }
+        }
     }
-    if function.name_source == crate::model::RecoveredNameSource::Synthetic
-        && (function.library_uri.is_none()
-            || matches!(vm_kind, Some("SharedAotCodeBoundary" | "AotCodeBoundary")))
-    {
-        return false;
+    let mut placed = BTreeMap::<usize, String>::new();
+    loop {
+        let mut changed = false;
+        for (&callee, sources) in &callers {
+            if placed.contains_key(&callee) {
+                continue;
+            }
+            let mut libraries = BTreeSet::new();
+            let mut complete = true;
+            for caller in sources {
+                match program.functions[*caller]
+                    .library_uri
+                    .as_ref()
+                    .or_else(|| placed.get(caller))
+                {
+                    Some(library) => {
+                        libraries.insert(library.clone());
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete && libraries.len() == 1 {
+                placed.insert(callee, libraries.pop_first().unwrap_or_default());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
-    true
+    placed
+        .into_iter()
+        .map(|(index, library)| (program.functions[index].address.clone(), library))
+        .collect()
 }
 
 impl RenderIndex {
     pub(super) fn new(program: &RecoveredProgram) -> Self {
+        let placed_by_callers = call_graph_placements(program);
         let mut functions_by_library = BTreeMap::<String, Vec<usize>>::new();
         let mut shared_code_primary = BTreeMap::new();
         for (index, function) in program.functions.iter().enumerate() {
@@ -100,6 +195,7 @@ impl RenderIndex {
                     function
                         .library_uri
                         .clone()
+                        .or_else(|| placed_by_callers.get(&function.address).cloned())
                         .unwrap_or_else(|| "clutter:unattributed".to_owned()),
                 )
                 .or_default()
@@ -219,12 +315,30 @@ impl RenderIndex {
                 function.kind,
             );
         }
+        let rendered_anonymous = program
+            .functions
+            .iter()
+            .filter(|function| {
+                function.name.starts_with("sub_")
+                    && source_visible_function(function, program.snapshot_roots.as_ref())
+            })
+            .map(|function| function.name.clone())
+            .collect();
         Self {
             functions_by_library,
+            placed_by_callers,
+            rendered_anonymous,
             declarations_by_library,
             shared_code_primary,
             callees,
+            constants: std::sync::Arc::new(super::constants::ConstantIndex::new(program)),
         }
+    }
+
+    /// Whether a call target is worth a statement: a named member, or an
+    /// anonymous body the view renders under the same name.
+    fn call_worth_rendering(&self, target: &str) -> bool {
+        meaningful_call_target(target) || self.rendered_anonymous.contains(target)
     }
 
     pub(super) fn callee(&self, target: &str) -> Option<&CalleeInfo> {
@@ -253,6 +367,7 @@ pub(super) fn render_library(
     program: &RecoveredProgram,
     index: &RenderIndex,
 ) -> String {
+    let _constants = super::constants::activate(index.constants.clone());
     let mut output = String::new();
     writeln!(output, "// GENERATED AOT PSEUDOCODE — NOT ORIGINAL SOURCE.").unwrap();
     writeln!(
@@ -304,11 +419,11 @@ pub(super) fn render_library(
         .collect();
     let hidden_function_count = all_functions
         .iter()
-        .filter(|function| !source_visible_function(function))
+        .filter(|function| !source_visible_function(function, program.snapshot_roots.as_ref()))
         .count();
     let functions = all_functions
         .into_iter()
-        .filter(|function| source_visible_function(function))
+        .filter(|function| source_visible_function(function, program.snapshot_roots.as_ref()))
         .collect::<Vec<_>>();
     if hidden_function_count > 0 {
         writeln!(output).unwrap();
@@ -467,7 +582,7 @@ pub(super) fn render_library(
         render_member_group(&mut output, program, index, &functions, true, "  ");
         writeln!(output, "}}").unwrap();
     }
-    output
+    rename_colliding_support_prefix(output)
 }
 
 fn recovered_class_owner(
@@ -855,9 +970,26 @@ fn render_field_declaration(
                 })
         })
         .unwrap_or_default();
+    // A trivial initializer is evaluated at compile time and stored in the
+    // initial field table; any other decoded value is only a snapshot state.
+    let initial = metadata.and_then(|metadata| {
+        let value = super::constants::render_static_initial(
+            metadata.is_shared,
+            metadata.static_field_id.filter(|_| metadata.is_static)?,
+        )?;
+        Some((
+            value,
+            metadata.has_initializer && !metadata.has_nontrivial_initializer,
+        ))
+    });
+    let (initializer, initial_note) = match initial {
+        Some((value, true)) => (format!(" = {value}"), String::new()),
+        Some((value, false)) => (String::new(), format!(" (snapshot value {value})")),
+        None => (String::new(), String::new()),
+    };
     writeln!(
         output,
-        "{indent}{prefix}{field_type} {};{slot_note}",
+        "{indent}{prefix}{field_type} {}{initializer};{slot_note}{initial_note}",
         dart_identifier(&clean_symbol(&declaration.name)),
     )
     .unwrap();
@@ -913,7 +1045,10 @@ fn field_modifiers(metadata: &RecoveredFieldMetadata, in_class: bool) -> String 
         // closest declaration-shaped placeholder.
         modifiers.push("final");
     } else {
-        if metadata.is_late {
+        // The kernel loader marks every static field with an initializer
+        // late (lazy initialization), so the bit proves source `late` only
+        // for instance fields and uninitialized statics.
+        if metadata.is_late && !(metadata.is_static && metadata.has_initializer) {
             modifiers.push("late");
         }
         if metadata.is_final {
@@ -976,7 +1111,7 @@ fn render_function_declaration_stub(
     let inline_hosts = inline_host_names(program, declaration);
     let signature = declaration.signature.as_ref();
     let (parameters, _) = signature
-        .map(rendered_signature_parameters)
+        .map(|signature| rendered_signature_parameters(signature, &BTreeMap::new()))
         .unwrap_or_else(|| ("(List<dynamic> args)".to_owned(), None));
     let mut return_type = signature
         .and_then(|signature| signature.resolved.as_ref())
@@ -1375,6 +1510,16 @@ fn render_function(
         )
         .unwrap();
     }
+    if index.placed_by_callers.contains_key(&function.address) {
+        writeln!(
+            output,
+            "{indent}/// Anonymous AOT body placed with its only callers; its defining library is unproven."
+        )
+        .unwrap();
+    }
+    for note in signature_evidence_notes(program, function) {
+        writeln!(output, "{indent}/// {}", safe_comment(&note)).unwrap();
+    }
     let shared_primary = shared_code_primary(program, index, function);
     if let Some(primary) = shared_primary {
         writeln!(
@@ -1636,19 +1781,25 @@ fn render_function(
     // (probe EC-8 / E15). When several Code objects collide on one name
     // (specializations), identity is ambiguous and the suffixed neutral
     // spelling stays, so members never render duplicate declarations.
-    let source_operator = if collision_count > 1 {
+    // `operator` declarations exist only inside a class; an ownerless body
+    // named `==` keeps the neutral spelling.
+    let source_operator = if collision_count > 1 || !in_class {
         None
     } else {
         source_operator_syntax(forwarder_selector.as_deref().unwrap_or(&function.name))
     };
-    let accessor_name: &str = if is_accessor {
-        function
-            .name
-            .strip_prefix("get:")
-            .or_else(|| function.name.strip_prefix("set:"))
-            .unwrap_or(&function.name)
+    // Accessor names come from the snapshot verbatim; lowered members such
+    // as extension-type getters (`Cents|get#label`) are not identifiers.
+    let accessor_name = if is_accessor {
+        dart_identifier(&clean_symbol(
+            function
+                .name
+                .strip_prefix("get:")
+                .or_else(|| function.name.strip_prefix("set:"))
+                .unwrap_or(&function.name),
+        ))
     } else {
-        ""
+        String::new()
     };
     let mut parameters_line = parameters;
     if let Some(operator_symbol) = &source_operator {
@@ -1716,6 +1867,25 @@ fn render_function(
             initial_aliases.insert("this".to_owned(), "recoveredInstance".to_owned());
         }
         render_readable_literals(output, function, &body_indent);
+        // Values merged at control-flow joins become ordinary locals, one per
+        // join and machine location, assigned on every incoming path.
+        let mut merged = 0usize;
+        for statement in &function.semantic_statements {
+            let SemanticStatement::Assign { variable, .. } = statement else {
+                continue;
+            };
+            if initial_aliases.contains_key(variable) {
+                continue;
+            }
+            merged += 1;
+            let local = format!("merged{merged}");
+            let join = variable
+                .strip_prefix("phi_")
+                .and_then(|rest| rest.split('_').next())
+                .unwrap_or_default();
+            writeln!(output, "{body_indent}var {local}; // merged at 0x{join}").unwrap();
+            initial_aliases.insert(variable.clone(), local);
+        }
 
         // Structure the body into Dart-like control flow.
         let entry = parse_hex(&function.address).unwrap_or_default();
@@ -1814,6 +1984,8 @@ fn render_function(
             ),
             try_regions,
             open_try: None,
+            dead_arrays: BTreeSet::new(),
+            inline_occurrence: None,
             structure_depth: 0,
         };
         if std::env::var("CLUTTER_DEBUG_STRUCTURE").is_ok() {
@@ -1831,7 +2003,7 @@ unstructured={} branches={} loops={}",
         // clause; keep the guard explicit instead of emitting invalid Dart.
         if let Some(region_index) = emitter.open_try.take() {
             let region = &emitter.try_regions[region_index];
-            writeln!(output, "{}", catch_clause_head(&body_indent, region)).unwrap();
+            writeln!(output, "{}", catch_clause_head(&body_indent, region, false)).unwrap();
             writeln!(
                 output,
                 "{body_indent}  aot.unresolvedRegion('catch body not recovered', <dynamic>[]);"
@@ -1850,9 +2022,11 @@ unstructured={} branches={} loops={}",
                     && match statement {
                         SemanticStatement::ResolvedCall { target, .. } => {
                             is_await_boundary(target)
-                                || (!is_vm_runtime_helper(target) && meaningful_call_target(target))
+                                || (!is_vm_runtime_helper(target)
+                                    && index.call_worth_rendering(target))
                         }
-                        SemanticStatement::FieldWrite { .. } => true,
+                        SemanticStatement::FieldWrite { .. }
+                        | SemanticStatement::StaticFieldWrite { .. } => true,
                         _ => false,
                     }
             })
@@ -1872,55 +2046,6 @@ unstructured={} branches={} loops={}",
                     &function.semantic_statements[*statement_index],
                     &body_indent,
                 );
-            }
-        }
-        // Attribute folded inlinee bodies to their owners (probe EC-1): each
-        // `push_function`..`pop_function` pc range in the code source map is
-        // another function's statements living inside this body. Emitting them
-        // under a named banner restores bodies whose standalone Code vanished.
-        if !function.inline_regions.is_empty() {
-            let base = entry;
-            for region in function.inline_regions.iter().take(16) {
-                let members: Vec<usize> = function
-                    .semantic_statements
-                    .iter()
-                    .enumerate()
-                    .filter(|(statement_index, statement)| {
-                        matches!(
-                            statement,
-                            SemanticStatement::ResolvedCall { .. }
-                                | SemanticStatement::Return { .. }
-                                | SemanticStatement::FieldWrite { .. }
-                                | SemanticStatement::FieldRead { .. }
-                                | SemanticStatement::Condition { .. }
-                                | SemanticStatement::StringInterpolation { .. }
-                        ) && (0..structured.claimed.len()).contains(statement_index)
-                            && parse_hex(statement.address()).is_some_and(|address| {
-                                let pc =
-                                    u32::try_from(address.saturating_sub(base)).unwrap_or(u32::MAX);
-                                region.start_pc_offset <= pc && pc < region.end_pc_offset
-                            })
-                    })
-                    .map(|(index, _)| index)
-                    .collect();
-                if members.is_empty() {
-                    continue;
-                }
-                writeln!(output).unwrap();
-                writeln!(
-                    output,
-                    "{body_indent}// Statements of {} (inlined by the optimizer into this body):",
-                    safe_comment(&region.name)
-                )
-                .unwrap();
-                for statement_index in &members {
-                    emitter.emit_statement(
-                        output,
-                        function,
-                        &function.semantic_statements[*statement_index],
-                        &body_indent,
-                    );
-                }
             }
         }
         if !nested
@@ -1997,7 +2122,137 @@ fn parse_hex(value: &str) -> Option<u64> {
 /// provably declared renders as `aot.unresolvedValue`/`unresolvedRegister`,
 /// and bare `snapshotRef(`/`snapshotInstance(` helpers gain their missing
 /// `aot.` qualifier (probe EC-5).
+/// Bare machine register spellings the lifter can leave in an expression:
+/// ARM64 `xN`, ARM32 `rN`, x64 general-purpose names, and the FPU registers
+/// that carry doubles (`dN`/`vN` on ARM, `xmmN` on x64).
+/// Tokens the lifter writes with fixed meanings in expression text.
+fn is_lifter_vocabulary(token: &str) -> bool {
+    let numbered = |prefix: &str| {
+        token
+            .strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    matches!(
+        token,
+        "aot" | "this" | "closureContext" | "null" | "true" | "false"
+    ) || numbered("arg")
+        || numbered("local")
+        || token.starts_with("phi_")
+        || is_machine_register_token(token)
+}
+
+fn is_machine_register_token(token: &str) -> bool {
+    let numbered = |prefix: &str, max_len: usize| {
+        token.len() <= max_len
+            && token.strip_prefix(prefix).is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            })
+    };
+    numbered("x", 4)
+        || numbered("r", 4)
+        || numbered("d", 3)
+        || numbered("v", 3)
+        || numbered("xmm", 5)
+        || matches!(
+            token,
+            "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp"
+        )
+}
+
+/// Rewrites every bare `snapshotInstance(Class@N)` label left in spliced
+/// text through [`prettify_snapshot_instance`].
+/// Byte ranges of `text` that are code: outside string literals (with
+/// their escapes) and `//` / `/* */` comments. Interpolation holes count as
+/// string content.
+fn code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = Some(0);
+    let mut quote = None::<char>;
+    let mut characters = text.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        match quote {
+            Some(open) => {
+                if character == '\\' {
+                    characters.next();
+                } else if character == open {
+                    quote = None;
+                    start = Some(index + 1);
+                }
+            }
+            None => match character {
+                '\'' | '"' => {
+                    ranges.extend(start.take().map(|begin| begin..index));
+                    quote = Some(character);
+                }
+                '/' if characters.peek().is_some_and(|(_, next)| *next == '/') => {
+                    ranges.extend(start.take().map(|begin| begin..index));
+                    let end = text[index..].find('\n').map_or(text.len(), |offset| index + offset);
+                    while characters.peek().is_some_and(|(next, _)| *next < end) {
+                        characters.next();
+                    }
+                    start = Some(end);
+                }
+                '/' if characters.peek().is_some_and(|(_, next)| *next == '*') => {
+                    ranges.extend(start.take().map(|begin| begin..index));
+                    let end = text[index + 2..]
+                        .find("*/")
+                        .map_or(text.len(), |offset| index + 2 + offset + 2);
+                    while characters.peek().is_some_and(|(next, _)| *next < end) {
+                        characters.next();
+                    }
+                    start = Some(end);
+                }
+                _ => {}
+            },
+        }
+    }
+    ranges.extend(start.map(|begin| begin..text.len()));
+    ranges
+}
+
+fn rewrite_snapshot_instances(body: &str) -> std::borrow::Cow<'_, str> {
+    const MARKER: &str = "snapshotInstance(";
+    if !body.contains(MARKER) {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let code = code_ranges(body);
+    let mut output = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find(MARKER) {
+        // Evidence text inside string literals and comments is already
+        // escaped; a rendered constant there would break the literal.
+        let absolute = body.len() - rest.len() + start;
+        if !code.iter().any(|range| range.contains(&absolute)) {
+            output.push_str(&rest[..start + MARKER.len()]);
+            rest = &rest[start + MARKER.len()..];
+            continue;
+        }
+        let preceded_by_identifier = rest[..start].chars().next_back().is_some_and(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '$')
+        });
+        let label_end = rest[start..].find(')').map(|close| start + close + 1);
+        output.push_str(&rest[..start]);
+        match label_end
+            .filter(|_| !preceded_by_identifier)
+            .and_then(|end| Some((end, prettify_snapshot_instance(&rest[start..end])?)))
+        {
+            Some((end, rendered)) => {
+                output.push_str(&rendered);
+                rest = &rest[end..];
+            }
+            None => {
+                output.push_str(MARKER);
+                rest = &rest[start + MARKER.len()..];
+            }
+        }
+    }
+    output.push_str(rest);
+    std::borrow::Cow::Owned(output)
+}
+
 fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> String {
+    let body = rewrite_snapshot_instances(body);
+    let body = body.as_ref();
     const KEEP_WORDS: &[&str] = &["this", "null", "true", "false", "super"];
     let mut output = String::with_capacity(body.len());
     let mut characters = body.char_indices().peekable();
@@ -2098,12 +2353,16 @@ fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> St
                     .rev()
                     .find(|character| !character.is_whitespace())
                     == Some('.');
+                // Lifted text never calls a register or spill slot, so a
+                // called token is an application function (say `x1(...)`).
+                let called = body[end..].trim_start().starts_with('(');
                 if preceded_by_dot || KEEP_WORDS.contains(&token) || bound.contains(token) {
                     output.push_str(token);
                     continue;
                 }
                 // Machine stack-slot temporaries: `local` + lowercase hex.
                 if let Some(slot) = token.strip_prefix("local")
+                    && !called
                     && !slot.is_empty()
                     && slot.chars().all(|character| character.is_ascii_hexdigit())
                 {
@@ -2117,18 +2376,15 @@ fn sanitize_free_machine_identifiers(body: &str, bound: &BTreeSet<String>) -> St
                 // `x` upstream) and ARM32 (`rN`). VFP registers did not leak
                 // in probe outputs; extend here if a future snapshot shows
                 // them.
-                if let Some(digits) = token
-                    .strip_prefix('x')
-                    .or_else(|| token.strip_prefix('r'))
-                    .filter(|rest| !rest.is_empty())
-                    && token.len() <= 4
-                    && digits.chars().all(|character| character.is_ascii_digit())
-                {
+                if !called && !bound.contains(token) && is_machine_register_token(token) {
                     output.push_str(&format!("aot.unresolvedRegister('{token}')"));
                     continue;
                 }
                 // Pool-label helpers that skipped the `aot.` qualifier logic.
-                if token == "snapshotRef" || token == "snapshotInstance" {
+                if token == "snapshotRef"
+                    || token == "snapshotInstance"
+                    || token == "uninitializedSentinel"
+                {
                     output.push_str("aot.");
                     output.push_str(token);
                     continue;
@@ -2153,23 +2409,25 @@ fn collect_declared_identifiers(body: &str, parameters: &str) -> BTreeSet<String
     }
     bound.insert("args".to_owned());
     bound.insert("recoveredInstance".to_owned());
-    // Walk forward through `final ` declarations. The cursor always advances
-    // by at least the keyword length, so scanning cannot stall on bodies
-    // with many locals.
-    let mut rest = body;
-    while let Some(position) = rest.find("final ") {
-        rest = &rest[position + "final ".len()..];
-        let declaration = rest.trim_start();
-        let mut end = 0usize;
-        for character in declaration.chars() {
-            if character.is_ascii_alphanumeric() || character == '_' || character == '$' {
-                end += character.len_utf8();
-            } else {
-                break;
+    // Walk forward through `final ` and `var ` declarations. The cursor
+    // always advances by at least the keyword length, so scanning cannot
+    // stall on bodies with many locals.
+    for keyword in ["final ", "var "] {
+        let mut rest = body;
+        while let Some(position) = rest.find(keyword) {
+            rest = &rest[position + keyword.len()..];
+            let declaration = rest.trim_start();
+            let mut end = 0usize;
+            for character in declaration.chars() {
+                if character.is_ascii_alphanumeric() || character == '_' || character == '$' {
+                    end += character.len_utf8();
+                } else {
+                    break;
+                }
             }
-        }
-        if end > 0 && end <= declaration.len() {
-            bound.insert(declaration[..end].to_owned());
+            if end > 0 && end <= declaration.len() {
+                bound.insert(declaration[..end].to_owned());
+            }
         }
     }
     bound
@@ -2289,6 +2547,11 @@ struct BodyEmitter<'a> {
     /// Index into `try_regions` of the currently open `try {`, if any. It
     /// closes at its handler (`CatchHandler`) or, unreachable-guard, at body end.
     open_try: Option<usize>,
+    /// Allocation result keys whose latest allocation nothing reads; their
+    /// element writes are dropped with them.
+    dead_arrays: BTreeSet<String>,
+    /// Inline occurrence of the last emitted statement.
+    inline_occurrence: Option<usize>,
     /// Structural nesting depth while emitting; try brackets are opened only
     /// at depth 0 so a `catch` can never close across an `if`/`while` brace
     /// boundary and produce invalid Dart.
@@ -2401,7 +2664,16 @@ impl<'a> BodyEmitter<'a> {
         match node {
             StructureNode::Block(children) => {
                 self.structure_depth += 1;
+                let mut returned = false;
                 for child in children {
+                    // A child whose every path ends in a machine return makes
+                    // its following siblings unreachable; rendering them as
+                    // reachable Dart statements would be misleading. Catch
+                    // handlers are entered by the VM, not by falling through,
+                    // so they still render.
+                    if returned && !matches!(child, StructureNode::CatchHandler(_)) {
+                        continue;
+                    }
                     // Root-level children (depth becomes 1 inside) are the one
                     // place a try bracket is guaranteed to pair with its
                     // handler sibling without crossing structured braces.
@@ -2411,12 +2683,7 @@ impl<'a> BodyEmitter<'a> {
                         continue;
                     }
                     self.emit_node(output, function, child, indent);
-                    // A child whose every path ends in a machine return makes
-                    // its following siblings unreachable; rendering them as
-                    // reachable Dart statements would be misleading.
-                    if node_ends_in_terminal_return(child, function) {
-                        break;
-                    }
+                    returned |= node_ends_in_terminal_return(child, function);
                 }
                 self.structure_depth -= 1;
             }
@@ -2438,6 +2705,7 @@ impl<'a> BodyEmitter<'a> {
                         }
                         current_band = Some(*band);
                     }
+                    self.mark_inline_occurrence(output, function, statement, indent);
                     // AOT lowers `Class(...)` into an allocator call followed
                     // by the real constructor consuming the new instance.
                     // Render the pair as one constructor invocation.
@@ -2505,7 +2773,10 @@ impl<'a> BodyEmitter<'a> {
                     // A machine return ends this straight-line region; any
                     // lifted statements after it came from unreachable code
                     // and must not render as reachable Dart.
-                    if matches!(statement, SemanticStatement::Return { .. }) {
+                    if matches!(
+                        statement,
+                        SemanticStatement::Return { .. } | SemanticStatement::Throw { .. }
+                    ) {
                         break;
                     }
                 }
@@ -2536,10 +2807,26 @@ impl<'a> BodyEmitter<'a> {
                 .unwrap();
             }
             StructureNode::CatchHandler(body) => {
-                match self.open_try.take() {
+                // Render the body first: the clause binds `stackTrace` only
+                // when the handler actually reads the stack-trace register.
+                let opened = self.open_try.take();
+                let body_indent = if opened.is_some() {
+                    format!("{indent}  ")
+                } else {
+                    indent.to_owned()
+                };
+                let mut scratch = String::new();
+                self.emit_node(&mut scratch, function, body, &body_indent);
+                match opened {
                     Some(region_index) => {
                         let region = &self.try_regions[region_index];
-                        writeln!(output, "{}", catch_clause_head(indent, region)).unwrap();
+                        let reads_stack_trace = contains_word(&scratch, "stackTrace");
+                        writeln!(
+                            output,
+                            "{}",
+                            catch_clause_head(indent, region, reads_stack_trace)
+                        )
+                        .unwrap();
                     }
                     None => {
                         // The handler decoded without a renderable protected
@@ -2557,11 +2844,11 @@ impl<'a> BodyEmitter<'a> {
                         .unwrap();
                     }
                 }
-                self.emit_node(output, function, body, indent);
-                if self.open_try.is_none() {
-                    // Close the catch clause opened above. A nested try opened
-                    // *inside* the handler stays open and closes at its own
-                    // handler or at function end.
+                output.push_str(&scratch);
+                // Close the catch clause opened above; the banner form opened
+                // none. A nested try opened *inside* the handler stays open
+                // and closes at its own handler or at function end.
+                if opened.is_some() && self.open_try.is_none() {
                     writeln!(output, "{indent}}}").unwrap();
                 }
             }
@@ -2659,6 +2946,179 @@ impl<'a> BodyEmitter<'a> {
         rendered
     }
 
+    /// Marks where statements start belonging to a different inlined call
+    /// (probe EC-1): the code source map's push/pop ranges say which callee's
+    /// code this is, nested outermost first.
+    fn mark_inline_occurrence(
+        &mut self,
+        output: &mut String,
+        function: &RecoveredFunction,
+        statement: &SemanticStatement,
+        indent: &str,
+    ) {
+        let (Some(entry), Some(address)) = (
+            parse_hex(&function.address),
+            parse_hex(statement.address()),
+        ) else {
+            return;
+        };
+        let pc = u32::try_from(address.saturating_sub(entry)).unwrap_or(u32::MAX);
+        let innermost = function
+            .inline_regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| region.start_pc_offset <= pc && pc < region.end_pc_offset)
+            .max_by_key(|(_, region)| region.depth)
+            .map(|(index, _)| index);
+        let occurrence = innermost.map(|index| function.inline_regions[index].occurrence);
+        if occurrence == self.inline_occurrence {
+            return;
+        }
+        self.inline_occurrence = occurrence;
+        let Some(mut index) = innermost else {
+            writeln!(output, "{indent}// (back in {})", safe_comment(&function.name)).unwrap();
+            return;
+        };
+        let mut path = Vec::new();
+        loop {
+            let region = &function.inline_regions[index];
+            path.push(match region.call_line {
+                Some(line) => format!("{} (called at line {line})", region.name),
+                None => region.name.clone(),
+            });
+            match region.parent {
+                Some(parent) => index = parent,
+                None => break,
+            }
+        }
+        path.reverse();
+        writeln!(output, "{indent}// inlined: {}", safe_comment(&path.join(" > "))).unwrap();
+    }
+
+    /// Renders a dispatch-table call the receiver did not resolve. A named
+    /// selector reads as the member invocation it compiles; an unnamed one
+    /// keeps its selector offset, which groups the sites sharing a member.
+    fn render_dispatch(
+        &mut self,
+        output: &mut String,
+        indent: &str,
+        target: &str,
+        selector: &str,
+        arguments: &[String],
+    ) {
+        let rendered = arguments
+            .iter()
+            .map(|argument| self.render_expression(argument))
+            .collect::<Vec<_>>();
+        let (receiver, rest) = match rendered.split_first() {
+            Some((receiver, rest)) => (receiver.clone(), rest),
+            None => ("aot.unresolvedValue('receiver')".to_owned(), &[][..]),
+        };
+        let (offset, name) = selector.split_once(' ').unwrap_or((selector, ""));
+        let name = clean_symbol(name);
+        let expression = if let Some(property) = name.strip_prefix("get:") {
+            format!("{receiver}.{}", dart_identifier(property))
+        } else if let Some(property) = name.strip_prefix("set:")
+            && let [value] = rest
+        {
+            writeln!(output, "{indent}{receiver}.{} = {value};", dart_identifier(property)).unwrap();
+            return;
+        } else if name == "[]" && rest.len() == 1 {
+            format!("{receiver}[{}]", rest[0])
+        } else if name == "[]=" && rest.len() == 2 {
+            writeln!(output, "{indent}{receiver}[{}] = {};", rest[0], rest[1]).unwrap();
+            return;
+        } else if let Some(operator) = operator_member_name(&name)
+            && let [operand] = rest
+        {
+            format!("{receiver} {operator} {operand}")
+        } else if valid_dart_identifier(&name) && !DART_RESERVED_WORDS.contains(&name.as_str()) {
+            format!("{receiver}.{name}({})", rest.join(", "))
+        } else {
+            format!(
+                "aot.dispatch({offset}, {receiver}, <dynamic>[{}])",
+                rest.join(", ")
+            )
+        };
+        let stem = if valid_dart_identifier(&name) && !DART_RESERVED_WORDS.contains(&name.as_str())
+        {
+            format!("{name}Result")
+        } else {
+            "dispatchResult".to_owned()
+        };
+        let variable = next_variable_name(&stem, &mut self.counters);
+        if indent.len() + variable.len() + expression.len() + 10 <= 120 {
+            writeln!(output, "{indent}final {variable} = {expression};").unwrap();
+        } else {
+            writeln!(output, "{indent}final {variable} =").unwrap();
+            writeln!(output, "{indent}  {expression};").unwrap();
+        }
+        self.aliases
+            .insert(format!("{}_result", sanitize_key(target)), variable);
+    }
+
+    /// The Dart value a VM allocation stub creates, with the variable stem
+    /// that binds it. Lengths arrive Smi-tagged: constants are untagged here,
+    /// other values keep the machine shift.
+    fn allocation_expression(
+        &mut self,
+        target: &str,
+        arguments: &[String],
+    ) -> Option<(&'static str, String)> {
+        let stub = target.strip_prefix("stub ")?;
+        let mut rendered = arguments
+            .iter()
+            .map(|argument| self.render_expression(argument))
+            .collect::<Vec<_>>();
+        let untag = |value: &str| match value.parse::<i64>() {
+            Ok(tagged) if tagged % 2 == 0 => (tagged / 2).to_string(),
+            _ => format!("({value} >> 1)"),
+        };
+        match (stub, rendered.as_mut_slice()) {
+            ("InstanceOf", [instance, type_]) => {
+                // A type literal that is no Dart expression (`List<int>`) is
+                // still a valid `is` operand.
+                let spelled = type_
+                    .strip_prefix("aot.constType('")
+                    .and_then(|rest| rest.strip_suffix("')"))
+                    .unwrap_or(type_);
+                Some((
+                    "isInstance",
+                    if is_type_expression(spelled) {
+                        format!("{instance} is {spelled}")
+                    } else {
+                        format!("aot.isInstanceOf({instance}, {type_})")
+                    },
+                ))
+            }
+            (
+                "InstantiateTypeArguments"
+                | "InstantiateTypeArgumentsMayShareInstantiatorTA"
+                | "InstantiateTypeArgumentsMayShareFunctionTA",
+                [uninstantiated, instantiator, function],
+            ) => Some((
+                "typeArguments",
+                format!(
+                    "aot.instantiateTypeArguments({uninstantiated}, {instantiator}, {function})"
+                ),
+            )),
+            ("AllocateContext", [count]) => Some(("context", format!("aot.context({count})"))),
+            ("AllocateArray", [_, length]) => Some((
+                "array",
+                format!("List<dynamic>.filled({}, null)", untag(length)),
+            )),
+            ("AllocateGrowableArray", [_]) => Some(("list", "<dynamic>[]".to_owned())),
+            ("AllocateRecord2" | "AllocateRecord3", fields) => {
+                Some(("record", format!("({})", fields.join(", "))))
+            }
+            (stub, [length]) => {
+                let class = crate::analysis::disassembly::typed_data_list_class(stub)?;
+                Some(("typedList", format!("{class}({})", untag(length))))
+            }
+            _ => None,
+        }
+    }
+
     fn render_expression(&mut self, expression: &str) -> String {
         if let Some(alias) = self.aliases.get(expression) {
             return alias.clone();
@@ -2703,10 +3163,57 @@ impl<'a> BodyEmitter<'a> {
                     self.awaits_rendered += 1;
                     return;
                 }
+                if let Some(selector) = target.strip_prefix("dispatch ") {
+                    self.render_dispatch(output, indent, target, selector, arguments);
+                    return;
+                }
+                // A native body forwards its own arguments to the VM entry
+                // registered under its `vm:external-name`. The space keeps
+                // an application member named `native` from matching.
+                if target == "native call" {
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| self.render_expression(argument))
+                        .collect::<Vec<_>>();
+                    let name = match function.owner.as_deref() {
+                        Some(owner) if !matches!(owner, "::" | "top_level") => {
+                            format!("{owner}.{}", function.name)
+                        }
+                        _ => function.name.clone(),
+                    };
+                    let variable = next_variable_name("nativeResult", &mut self.counters);
+                    writeln!(
+                        output,
+                        "{indent}final {variable} = aot.native({}, <dynamic>[{}]);",
+                        dart_string(&name),
+                        arguments.join(", ")
+                    )
+                    .unwrap();
+                    self.aliases.insert("native_call_result".to_owned(), variable);
+                    return;
+                }
+                if let Some((stem, expression)) = self.allocation_expression(target, arguments) {
+                    // An allocation nothing reads is dead in this rendering:
+                    // an interpolation consumed its elements, or its only
+                    // uses are VM plumbing.
+                    let key = parse_hex(statement.address()).map_or_else(
+                        || format!("{}_result", sanitize_key(target)),
+                        |address| crate::analysis::disassembly::site_result_name(target, address),
+                    );
+                    if allocation_is_dead(function, statement, &key) {
+                        self.dead_arrays.insert(key);
+                        return;
+                    }
+                    self.dead_arrays.remove(&key);
+                    let variable = next_variable_name(stem, &mut self.counters);
+                    writeln!(output, "{indent}final {variable} = {expression};").unwrap();
+                    self.aliases.insert(key, variable);
+                    return;
+                }
                 if target.ends_with("InitAsyncStub") || is_vm_runtime_helper(target) {
                     return;
                 }
-                if !meaningful_call_target(target) {
+                if !self.index.call_worth_rendering(target) {
                     return;
                 }
                 let callee = self.index.callee(target);
@@ -2724,8 +3231,41 @@ impl<'a> BodyEmitter<'a> {
                 }
                 self.aliases
                     .insert(format!("{}_result", sanitize_key(target)), variable.clone());
-                // Also alias by the raw key used in lifted expressions.
-                self.aliases.insert(sanitize_key(target), variable);
+                // Also alias by the raw key used in lifted expressions,
+                // unless an application member shares a name the lifter
+                // itself writes (`aot`, `arg0`, registers): aliasing that
+                // token would rewrite unrelated values.
+                let raw = sanitize_key(target);
+                if !is_lifter_vocabulary(&raw) {
+                    self.aliases.insert(raw, variable);
+                }
+            }
+            SemanticStatement::FieldWrite {
+                receiver,
+                field,
+                value,
+                offset,
+                ..
+            } if field.starts_with('[') => {
+                // An array element store; `field` is `[index]`.
+                if self.dead_arrays.contains(receiver) {
+                    return;
+                }
+                let receiver = self.render_expression(receiver);
+                let value = self.render_expression(value);
+                // `[3]` from a tracked allocation, or `[i + 1]` through an
+                // element pointer.
+                let index = &field[1..field.len() - 1];
+                let index = if index.parse::<usize>().is_ok() {
+                    index.to_owned()
+                } else {
+                    strip_wrapping_parentheses(&self.render_expression(index)).to_owned()
+                };
+                writeln!(
+                    output,
+                    "{indent}{receiver}[{index}] = {value}; // AOT element store +0x{offset:x}"
+                )
+                .unwrap();
             }
             SemanticStatement::FieldWrite {
                 receiver,
@@ -2743,10 +3283,34 @@ impl<'a> BodyEmitter<'a> {
                 )
                 .unwrap();
             }
+            SemanticStatement::Assign {
+                variable, value, ..
+            } => {
+                let variable = self.render_expression(variable);
+                let value = self.render_expression(value);
+                writeln!(output, "{indent}{variable} = {value};").unwrap();
+            }
+            SemanticStatement::StaticFieldWrite {
+                field,
+                field_id,
+                shared,
+                value,
+                ..
+            } => {
+                let value = self.render_expression(value);
+                let table = if *shared { "shared static" } else { "static" };
+                writeln!(
+                    output,
+                    "{indent}{}; // AOT {table} field #{field_id}",
+                    render_static_store(field, *field_id, *shared, &value),
+                )
+                .unwrap();
+            }
             // Field reads flow through register expressions; interpolations
             // surface through their consumers.
-            SemanticStatement::FieldRead { .. } | SemanticStatement::StringInterpolation { .. } => {
-            }
+            SemanticStatement::FieldRead { .. }
+            | SemanticStatement::StaticFieldRead { .. }
+            | SemanticStatement::StringInterpolation { .. } => {}
             SemanticStatement::Return { expression, .. } => {
                 self.returns_seen += 1;
                 let rendered = self.render_expression(expression);
@@ -2754,6 +3318,24 @@ impl<'a> BodyEmitter<'a> {
                     writeln!(output, "{indent}return;").unwrap();
                 } else {
                     writeln!(output, "{indent}return {rendered};").unwrap();
+                }
+            }
+            SemanticStatement::Throw {
+                expression,
+                stack_trace,
+                ..
+            } => {
+                let exception = self.render_expression(expression);
+                match stack_trace {
+                    Some(stack_trace) => {
+                        let stack_trace = self.render_expression(stack_trace);
+                        writeln!(
+                            output,
+                            "{indent}Error.throwWithStackTrace({exception}, {stack_trace});"
+                        )
+                        .unwrap();
+                    }
+                    None => writeln!(output, "{indent}throw {exception};").unwrap(),
                 }
             }
             SemanticStatement::Condition { .. } => {}
@@ -3048,11 +3630,18 @@ enum AsyncStyle {
     SyncStar,
 }
 
-/// Recovers `async`/`async*`/`sync*` from authoritative VM evidence first,
-/// then from the AOT async-machine stubs (`InitAsyncStub`, `AwaitStub`,
+/// Recovers `async`/`async*`/`sync*` from exact snapshot modifiers or VM
+/// evidence, then from the AOT async-machine stubs (`InitAsyncStub`, `AwaitStub`,
 /// wrapper helpers) and named async-runtime collaborators that split-debug
 /// symbols or call targets restore.
 fn detected_async_style(function: &RecoveredFunction) -> Option<AsyncStyle> {
+    match function.async_modifier {
+        Some(crate::model::AsyncModifier::Async) => return Some(AsyncStyle::Async),
+        Some(crate::model::AsyncModifier::SyncStar) => return Some(AsyncStyle::SyncStar),
+        Some(crate::model::AsyncModifier::AsyncStar) => return Some(AsyncStyle::AsyncStar),
+        Some(crate::model::AsyncModifier::None) => return None,
+        None => {}
+    }
     if let Some(evidence) = function.vm_evidence.as_ref() {
         if evidence.is_async_generator == Some(true) {
             return Some(AsyncStyle::AsyncStar);
@@ -3148,26 +3737,43 @@ fn detected_async_style(function: &RecoveredFunction) -> Option<AsyncStyle> {
 
 fn is_await_boundary(target: &str) -> bool {
     let compact = target.replace([' ', '_'], "");
-    compact.contains("AwaitStub") || compact.contains("awaitStub")
+    // `stub Await` is a yield-descriptor-proven suspension in an `async` body.
+    target == "stub Await" || compact.contains("AwaitStub") || compact.contains("awaitStub")
 }
 
-/// Rewrites `snapshotInstance(Class)` pool labels into readable const
-/// constructor expressions, preserving a trailing `.member` chain.
+/// Rewrites `snapshotInstance(Class@N)` pool labels from the decoded
+/// constant graph, preserving a trailing `.member` chain. Instances the
+/// graph does not hold keep their snapshot reference; the class alone does
+/// not say which constructor or arguments produced them.
 fn prettify_snapshot_instance(expression: &str) -> Option<String> {
     let rest = expression.strip_prefix("snapshotInstance(")?;
     let close = rest.find(')')?;
-    let class_name = &rest[..close];
+    let label = &rest[..close];
     let tail = rest[close + 1..].trim_start();
+    let (class_name, reference) = match label.rsplit_once('@') {
+        Some((class_name, reference)) => (class_name, reference.parse::<i32>().ok()),
+        None => (label, None),
+    };
     if !class_name
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '$')
     {
         return None;
     }
-    Some(format!(
-        "const {}(){tail}",
-        dart_identifier(&clean_symbol(class_name))
-    ))
+    let base = match reference {
+        Some(reference) => super::constants::render_reference(reference)
+            .unwrap_or_else(|| format!("aot.snapshotRef({reference})")),
+        None => format!(
+            "aot.unresolvedValue({})",
+            dart_string(&format!("const {}", clean_symbol(class_name)))
+        ),
+    };
+    let base = if tail.is_empty() || !base.contains([' ', ',', '{', '[']) {
+        base
+    } else {
+        format!("({base})")
+    };
+    Some(format!("{base}{tail}"))
 }
 
 fn confidence_note(confidence: EvidenceConfidence) -> &'static str {
@@ -3725,8 +4331,8 @@ fn valid_dart_identifier(value: &str) -> bool {
     let mut characters = value.chars();
     characters
         .next()
-        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        .is_some_and(|character| character.is_ascii_alphabetic() || matches!(character, '_' | '$'))
+        && characters.all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
 }
 
 fn readable_call_expression(
@@ -3846,6 +4452,77 @@ fn render_call_arguments(arguments: &[String], aliases: &BTreeMap<String, String
         .join(", ")
 }
 
+/// Whether nothing reads the value `call` allocates, named `key`. Writes
+/// into its own elements are not reads: an array an interpolation consumed
+/// stays dead even though its elements were stored.
+fn allocation_is_dead(function: &RecoveredFunction, call: &SemanticStatement, key: &str) -> bool {
+    !function.semantic_statements.iter().any(|statement| {
+        !std::ptr::eq(statement, call)
+            && match statement {
+                SemanticStatement::FieldWrite {
+                    receiver,
+                    field,
+                    value,
+                    ..
+                } if receiver == key && field.starts_with('[') => value.contains(key),
+                other => other.mentions(key),
+            }
+    })
+}
+
+/// `text` without one pair of parentheses enclosing all of it: brackets
+/// already delimit an index, so `list[(i + 1)]` reads `list[i + 1]`.
+fn strip_wrapping_parentheses(text: &str) -> &str {
+    text.strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .filter(|inner| {
+            let mut depth = 0i32;
+            inner.chars().all(|character| {
+                match character {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                depth >= 0
+            }) && depth == 0
+        })
+        .unwrap_or(text)
+}
+
+/// Splits `array[index]` at its final, top-level bracket pair.
+fn split_index_expression(expression: &str) -> Option<(&str, &str)> {
+    let body = expression.strip_suffix(']')?;
+    let mut depth = 0i32;
+    for (position, character) in body.char_indices().rev() {
+        match character {
+            ']' | ')' => depth += 1,
+            '(' => depth -= 1,
+            '[' if depth == 0 => {
+                let array = &body[..position];
+                let index = &body[position + 1..];
+                return (!array.is_empty() && !index.is_empty() && !array.ends_with('<'))
+                    .then_some((array, index));
+            }
+            '[' => depth -= 1,
+            '\'' | '"' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `text` reads as a Dart type annotation (`Foo`, `List<int>?`).
+fn is_type_expression(text: &str) -> bool {
+    text.chars().next().is_some_and(|first| first.is_alphabetic() || first == '_')
+        && text
+            .chars()
+            .all(|character| character.is_alphanumeric() || "_$<>, ?().".contains(character))
+        && !matches!(text, "null" | "true" | "false" | "this")
+        && !text.starts_with("aot.")
+        // Obfuscated class names can be keywords (`is`, `in`).
+        && !DART_RESERVED_WORDS.contains(&text.trim_end_matches('?'))
+}
+
 fn render_readable_expression(expression: &str, aliases: &BTreeMap<String, String>) -> String {
     if let Some(alias) = aliases.get(expression) {
         return alias.clone();
@@ -3869,6 +4546,10 @@ fn render_readable_expression(expression: &str, aliases: &BTreeMap<String, Strin
     }
     // Numeric literals are already valid Dart expression atoms.
     if expression.parse::<i64>().is_ok() || expression.parse::<f64>().is_ok() {
+        return expression.to_owned();
+    }
+    // The thread-cached empty array (`Object::empty_array()`).
+    if expression == "const []" {
         return expression.to_owned();
     }
     if matches!(expression, "true" | "false" | "null")
@@ -3901,7 +4582,26 @@ fn render_readable_expression(expression: &str, aliases: &BTreeMap<String, Strin
             .join(".");
     }
     if expression.starts_with("snapshotRef(") && expression.ends_with(')') {
+        if let Some(rendered) = expression["snapshotRef(".len()..expression.len() - 1]
+            .parse::<i32>()
+            .ok()
+            .and_then(super::constants::render_reference)
+        {
+            return rendered;
+        }
         return format!("aot.{expression}");
+    }
+    if let Some(rendered) = render_closure_allocation(expression, aliases) {
+        return rendered;
+    }
+    // `array[index]` from an Array element load: render both sides.
+    if let Some((array, index)) = split_index_expression(expression) {
+        let index = render_readable_expression(index, aliases);
+        return format!(
+            "{}[{}]",
+            render_readable_expression(array, aliases),
+            strip_wrapping_parentheses(&index)
+        );
     }
     // Arithmetic and comparison expressions rebuilt by the lifter over named
     // registers, literals, and field reads are already valid Dart; render
@@ -3912,19 +4612,88 @@ fn render_readable_expression(expression: &str, aliases: &BTreeMap<String, Strin
     format!("aot.unresolvedValue({})", dart_string(expression))
 }
 
+/// `aot.closure('<function>'[, context])`, as the lifter spells an
+/// `AllocateClosure` stub call, optionally followed by member reads. The
+/// context is itself a lifted expression.
+fn render_closure_allocation(
+    expression: &str,
+    aliases: &BTreeMap<String, String>,
+) -> Option<String> {
+    let rest = expression.strip_prefix("aot.closure('")?;
+    let mut function = String::new();
+    let mut characters = rest.char_indices();
+    let after_label = loop {
+        let (index, character) = characters.next()?;
+        match character {
+            '\\' => function.push(characters.next()?.1),
+            '\'' => break index + 1,
+            character => function.push(character),
+        }
+    };
+    let rest = &rest[after_label..];
+    // The call's closing parenthesis, skipping nested calls and strings.
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut close = None;
+    for (index, character) in rest.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted && depth == 0 => {
+                close = Some(index);
+                break;
+            }
+            ')' if !quoted => depth -= 1,
+            _ => {}
+        }
+    }
+    let close = close?;
+    let (arguments, tail) = (&rest[..close], &rest[close + 1..]);
+    let members_are_plain = tail.is_empty()
+        || tail.strip_prefix('.').is_some_and(|members| {
+            members
+                .split('.')
+                .all(|member| valid_dart_identifier(&clean_symbol(member)))
+        });
+    if !members_are_plain {
+        return None;
+    }
+    let function = dart_string(&function);
+    let call = match arguments.strip_prefix(", ") {
+        Some(context) if !context.is_empty() => format!(
+            "aot.closure({function}, {})",
+            render_readable_expression(context, aliases)
+        ),
+        _ if arguments.is_empty() => format!("aot.closure({function})"),
+        _ => return None,
+    };
+    Some(format!("{call}{tail}"))
+}
+
 /// True when an expression is composed purely of Dart-safe tokens the lifter
 /// produced: identifiers, numeric literals, operators, parentheses, member
 /// access, and interpolation placeholders it generated itself.
 fn looks_like_recovered_expression(expression: &str) -> bool {
     if expression.is_empty()
-        || !(expression.contains(['+', '-', '*', '/', '%', '^', '&', '|', '<', '>', '!'])
+        || !(expression.contains(['+', '-', '*', '/', '%', '^', '&', '|', '<', '>', '!', '['])
             || expression.contains("<<")
             || expression.contains(">>"))
     {
         return false;
     }
-    // Interpolation placeholders stay explicit.
-    if expression.contains("aot.") || expression.contains("pool[") || expression.contains("sub_") {
+    // Interpolation placeholders and unaliased shared-code results stay
+    // explicit. Only the `sub_…_result` token shape counts: an application
+    // function may be named `sub_1000`, and its alias `sub_1000Result`.
+    let unaliased_result = identifier_tokens(expression)
+        .into_iter()
+        .any(|(start, end)| {
+            let token = &expression[start..end];
+            token.starts_with("sub_") && token.ends_with("_result")
+        });
+    if expression.contains("aot.") || expression.contains("pool[") || unaliased_result {
         return false;
     }
     let mut identifier = String::new();
@@ -4053,8 +4822,10 @@ impl BodyEmitter<'_> {
 /// Formats a catch clause head. When the snapshot's handler row carries
 /// proven guard types (`on X catch`), the first type renders as the `on`
 /// clause; multiple guards stay honest with a comment listing them.
-fn catch_clause_head(indent: &str, region: &TryRegionView) -> String {
-    let stack = if region.needs_stack_trace && !region.has_catch_all {
+fn catch_clause_head(indent: &str, region: &TryRegionView, reads_stack_trace: bool) -> String {
+    // A catch-all row sets `needs_stack_trace` for rethrow support, so the
+    // flag alone proves a `stackTrace` variable only for guarded rows.
+    let stack = if region.needs_stack_trace && (!region.has_catch_all || reads_stack_trace) {
         ", stackTrace"
     } else {
         ""
@@ -4377,6 +5148,96 @@ fn function_name_collisions(
     counts
 }
 
+/// Provenance of the rendered parameter list.
+///
+/// A retained signature is the compiled callable after TFA signature
+/// shaking, so it is labeled as such. Without one, the solved call-site
+/// facts and the body's machine interface are the only evidence, and
+/// they are stated rather than turned into a guessed declaration.
+fn signature_evidence_notes(
+    program: &RecoveredProgram,
+    function: &RecoveredFunction,
+) -> Vec<String> {
+    use crate::evidence::signature_solver::ShapeOutcome;
+    let mut notes = Vec::new();
+    if function.signature.is_some() {
+        notes.push(
+            "Parameters follow the retained AOT signature; signature shaking may have removed or reordered source parameters."
+                .to_owned(),
+        );
+        return notes;
+    }
+    let solved = crate::analysis::disassembly::parse_immediate_public(&function.address)
+        .and_then(|address| program.signature_solutions.as_ref()?.get(&address));
+    if let Some(ShapeOutcome::Constrained {
+        supplied_counts,
+        named_accepted,
+        needs_arguments_descriptor,
+        calls,
+        ..
+    }) = solved.map(|solved| &solved.outcome)
+    {
+        let mut facts = Vec::new();
+        if !supplied_counts.is_empty() {
+            facts.push(format!(
+                "supply {} argument(s)",
+                supplied_counts
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ));
+        }
+        if !named_accepted.is_empty() {
+            facts.push(format!("pass named `{}`", named_accepted.join("`, `")));
+        }
+        match needs_arguments_descriptor {
+            Some(false) => facts.push(
+                "pass no arguments descriptor (no optional parameters, not generic)".to_owned(),
+            ),
+            Some(true) => facts.push(
+                "pass an arguments descriptor (optional parameters or type arguments)".to_owned(),
+            ),
+            None => {}
+        }
+        if !facts.is_empty() {
+            notes.push(format!("{calls} direct call site(s) {}.", facts.join("; ")));
+        }
+    }
+    if let Some(interface) = &function.machine_interface
+        && !interface.parameters.is_empty()
+    {
+        let parameters = interface
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let representation = match parameter.representation {
+                    "unboxed_double" => " double",
+                    "unboxed_int64" => " int",
+                    _ => "",
+                };
+                let assumed = if parameter.proof == "assumed" {
+                    "?"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}{representation}@{}{assumed}",
+                    parameter.name, parameter.location
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let scope = if interface.parameter_count_known {
+            ""
+        } else {
+            " (parameters the body reads; the count did not survive)"
+        };
+        notes.push(format!("Machine interface{scope}: {parameters}."));
+    }
+    notes
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn qualified_name(function: &RecoveredFunction) -> String {
     match function.owner.as_deref() {
@@ -4398,13 +5259,37 @@ fn rendered_parameters(function: &RecoveredFunction) -> (String, Option<String>)
             }
             _ => {}
         }
+        // Without a signature, the parameters the body was seen to read
+        // still name the values its statements use.
+        if let Some(interface) = &function.machine_interface {
+            let parameters = interface
+                .parameters
+                .iter()
+                .filter(|parameter| {
+                    !matches!(parameter.name.as_str(), "this" | "closureContext")
+                        && valid_dart_identifier(&parameter.name)
+                })
+                .map(|parameter| {
+                    let type_name = match parameter.representation {
+                        "unboxed_double" => "double",
+                        "unboxed_int64" => "int",
+                        _ => "dynamic",
+                    };
+                    format!("{type_name} {}", parameter.name)
+                })
+                .collect::<Vec<_>>();
+            if !parameters.is_empty() {
+                return (format!("({})", parameters.join(", ")), None);
+            }
+        }
         return ("(List<dynamic> args)".to_owned(), None);
     };
-    rendered_signature_parameters(signature)
+    rendered_signature_parameters(signature, &function.parameter_defaults)
 }
 
 fn rendered_signature_parameters(
     signature: &crate::model::RecoveredSignature,
+    defaults: &BTreeMap<usize, String>,
 ) -> (String, Option<String>) {
     if let Some(resolved) = &signature.resolved {
         let mut fixed = Vec::new();
@@ -4431,7 +5316,13 @@ fn rendered_signature_parameters(
             } else {
                 ""
             };
-            let default_note = if parameter.position >= signature.fixed_parameter_count
+            let recovered_default = defaults
+                .get(&parameter.position)
+                .filter(|_| parameter.position >= signature.fixed_parameter_count)
+                .map(|value| format!(" = {}", render_default_value(value)));
+            let default_note = if let Some(default) = recovered_default.as_deref() {
+                default
+            } else if parameter.position >= signature.fixed_parameter_count
                 && !parameter.is_required
             {
                 " /* default unavailable */"
@@ -4497,6 +5388,12 @@ fn rendered_signature_parameters(
         format!("({})", declarations.join(", ")),
         Some(arguments.join(", ")),
     )
+}
+
+/// A recovered default constant as Dart source: pool instances render from
+/// the decoded constant graph when possible.
+fn render_default_value(value: &str) -> String {
+    prettify_snapshot_instance(value).unwrap_or_else(|| value.to_owned())
 }
 
 fn readable_function_name(value: &str) -> String {
@@ -4579,23 +5476,103 @@ dynamic unknownOperation(
 ) =>
     _unresolved('instruction', <Object?>[address, bytes, inputs]);
 
+/// The VM's `Object::sentinel()`: the value a `late` field or a lazily
+/// initialized static field holds until its first assignment. Comparing
+/// against it is the compiled form of an initialization check.
+final Object uninitializedSentinel = Object();
+
 dynamic snapshotRef(int reference) =>
     _unresolved('snapshot-object', reference);
+
+/// A canonical instance recovered from the snapshot: the class name and its
+/// field values by name (or `_slot_<offset>` when no field is proven).
+dynamic constObject(String className, Map<String, Object?> fields) =>
+    _unresolved('const-object', <Object?>[className, fields]);
+
+/// A closure over `function` (its Function object's name) allocated at run
+/// time, with the captured context or tear-off receiver when one is known.
+dynamic closure(String function, [Object? context]) =>
+    _unresolved('closure', <Object?>[function, context]);
+
+/// A constant closure whose target function is named but not rebuilt.
+dynamic constClosure(String function) =>
+    _unresolved('const-closure', function);
+
+/// A type literal whose display name is not a valid Dart expression.
+dynamic constType(String display) => _unresolved('const-type', display);
+
+/// Raw bits of an unboxed field whose representation is not proven.
+dynamic unboxedBits(int bits) => bits;
+
+/// The type-argument vector a generic call or allocation passes, built
+/// from `uninstantiated` with the enclosing class and function type
+/// arguments.
+dynamic instantiateTypeArguments(
+  Object? uninstantiated,
+  Object? instantiator,
+  Object? function,
+) =>
+    _unresolved('type-arguments', <Object?>[uninstantiated, instantiator, function]);
+
+/// `instance is type` for a destination type with no Dart spelling.
+bool isInstanceOf(Object? instance, Object? type) =>
+    _unresolved('instance-of', <Object?>[instance, type]);
+
+/// A dispatch-table call through selector `offset` whose member name and
+/// implementation the snapshot does not prove.
+dynamic dispatch(int offset, Object? receiver, List<dynamic> arguments) =>
+    _unresolved('dispatch', <Object?>[offset, receiver, arguments]);
+
+/// A call into the VM's native implementation of an `external` member.
+dynamic native(String member, List<dynamic> arguments) =>
+    _unresolved('native', <Object?>[member, arguments]);
+
+/// A closure context with `variables` captured-variable slots, allocated
+/// by the VM's `AllocateContext` stub.
+dynamic context(int variables) => _unresolved('context', variables);
 
 dynamic nativePoolEntry(int index) =>
     _unresolved('native-pool-entry', index);
 
 dynamic resetPoolEntry(int index) =>
     _unresolved('reset-pool-entry', index);
+
+/// A static field whose field-table slot no retained Field object names.
+dynamic staticField(int id, {bool shared = false}) =>
+    _unresolved('static-field', <Object?>[id, shared]);
+
+void setStaticField(int id, Object? value, {bool shared = false}) =>
+    _unresolved('static-field-store', <Object?>[id, shared, value]);
 "#
     .to_owned()
 }
 
-fn dart_identifier(value: &str) -> String {
+/// Target of a static-field store: `Owner.name` for a named field, or the
+/// `aot.setStaticField` helper for an anonymous field-table slot.
+fn render_static_store(field: &str, field_id: i64, shared: bool, value: &str) -> String {
+    if is_anonymous_static(field) {
+        let shared = if shared { ", shared: true" } else { "" };
+        return format!("aot.setStaticField({field_id}, {value}{shared})");
+    }
+    let target = field
+        .split('.')
+        .map(|part| dart_identifier(&clean_symbol(part)))
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{target} = {value}")
+}
+
+fn is_anonymous_static(field: &str) -> bool {
+    field.starts_with("aot.staticField(")
+}
+
+pub(super) fn dart_identifier(value: &str) -> String {
     let mut output: String = value
         .chars()
         .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
+            // `$` is legal in Dart identifiers; mapping it to `_` would
+            // merge `a$b` with `a_b`.
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '$') {
                 character
             } else {
                 '_'
@@ -4611,7 +5588,7 @@ fn dart_identifier(value: &str) -> String {
     output
 }
 
-fn clean_symbol(value: &str) -> String {
+pub(super) fn clean_symbol(value: &str) -> String {
     value
         .split('@')
         .next()
@@ -4620,16 +5597,82 @@ fn clean_symbol(value: &str) -> String {
         .to_owned()
 }
 
+/// Each library imports the support intrinsics `as aot`. An application
+/// declaration named `aot` (kept verbatim in unobfuscated builds) would
+/// shadow that prefix, so such a library gets an unused `aot_…` prefix.
+fn rename_colliding_support_prefix(output: String) -> String {
+    let tokens = identifier_tokens(&output);
+    let is_prefix_use = |start: usize, end: usize| {
+        let rest = &output[end..];
+        rest.starts_with('.') || rest.starts_with(';') && output[..start].ends_with("as ")
+    };
+    let bare_aot = tokens
+        .iter()
+        .any(|&(start, end)| &output[start..end] == "aot" && !is_prefix_use(start, end));
+    if !bare_aot {
+        return output;
+    }
+    // No `$`: the prefix also lands in escaped evidence strings, where `$`
+    // would start an interpolation.
+    let mut prefix = "aot_".to_owned();
+    while tokens.iter().any(|&(start, end)| output[start..end] == prefix) {
+        prefix.push('_');
+    }
+    let mut renamed = String::with_capacity(output.len() + 64);
+    let mut last = 0;
+    for (start, end) in tokens {
+        if &output[start..end] == "aot" && is_prefix_use(start, end) {
+            renamed.push_str(&output[last..start]);
+            renamed.push_str(&prefix);
+            last = end;
+        }
+    }
+    renamed.push_str(&output[last..]);
+    renamed
+}
+
+/// Byte ranges of the identifier tokens in `text` (letters, digits, `_`,
+/// `$`), excluding those that are the tail of a longer token.
+fn identifier_tokens(text: &str) -> Vec<(usize, usize)> {
+    let is_identifier = |character: char| character.is_ascii_alphanumeric() || matches!(character, '_' | '$');
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        match (start, is_identifier(character)) {
+            (None, true) => start = Some(index),
+            (Some(begin), false) => {
+                tokens.push((begin, index));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        tokens.push((begin, text.len()));
+    }
+    tokens
+}
+
 fn relative_support_import(library: &RecoveredLibrary) -> String {
     let levels = library.output_path.components().count().max(1);
     format!("{}support/aot_intrinsics.dart", "../".repeat(levels))
 }
 
 fn safe_comment(value: &str) -> String {
-    value.replace(['\n', '\r'], " ").replace("*/", "* /")
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' | '\r' => output.push(' '),
+            character if crate::analysis::disassembly::needs_unicode_escape(character) => {
+                write!(output, "\\u{{{:x}}}", character as u32).unwrap();
+            }
+            character => output.push(character),
+        }
+    }
+    output.replace("*/", "* /")
 }
 
-const DART_RESERVED_WORDS: &[&str] = &[
+pub(super) const DART_RESERVED_WORDS: &[&str] = &[
     "abstract",
     "as",
     "assert",
@@ -4699,7 +5742,7 @@ const DART_RESERVED_WORDS: &[&str] = &[
     "yield",
 ];
 
-fn dart_string(value: &str) -> String {
+pub(super) fn dart_string(value: &str) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('\'');
     for character in value.chars() {
@@ -4710,7 +5753,7 @@ fn dart_string(value: &str) -> String {
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
             '$' => output.push_str("\\$"),
-            value if value.is_control() => {
+            value if crate::analysis::disassembly::needs_unicode_escape(value) => {
                 write!(output, "\\u{{{:x}}}", value as u32).unwrap();
             }
             value => output.push(value),
@@ -4725,7 +5768,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
-    use super::{collect_declared_identifiers, sanitize_free_machine_identifiers};
+    use super::{
+        collect_declared_identifiers, render_closure_allocation, sanitize_free_machine_identifiers,
+    };
     use crate::model::{
         EvidenceConfidence, MachineCodeEvidence, MachineInstruction, PseudoStatement,
         RecoveredFunction, RecoveredFunctionKind, RecoveredLibrary, RecoveredNameSource,
@@ -4855,14 +5900,25 @@ mod tests {
     }
 
     #[test]
+    fn exact_synchronous_modifier_overrides_async_callee_heuristics() {
+        let mut function = sample_function();
+        function.semantic_statements = vec![sample_statement_call("stub Await")];
+        function.async_modifier = Some(crate::model::AsyncModifier::None);
+        assert_eq!(detected_async_style(&function), None);
+        function.async_modifier = Some(crate::model::AsyncModifier::Async);
+        assert_eq!(detected_async_style(&function), Some(AsyncStyle::Async));
+    }
+
+    #[test]
     fn prettifies_snapshot_instance_labels_with_member_tails() {
         assert_eq!(
-            prettify_snapshot_instance("snapshotInstance(Product)").as_deref(),
-            Some("const Product()")
+            prettify_snapshot_instance("snapshotInstance(Product@412)").as_deref(),
+            Some("aot.snapshotRef(412)")
         );
         assert_eq!(
-            prettify_snapshot_instance("snapshotInstance(_CatalogPageState).itemCount").as_deref(),
-            Some("const _CatalogPageState().itemCount")
+            prettify_snapshot_instance("snapshotInstance(_CatalogPageState@7).itemCount")
+                .as_deref(),
+            Some("aot.snapshotRef(7).itemCount")
         );
         assert_eq!(prettify_snapshot_instance("snapshotRef(12)"), None);
     }
@@ -4885,6 +5941,11 @@ mod tests {
                 &bound,
             ),
             "return list.length; // keep local70 mention in comments"
+        );
+        // Instance labels never become invented constructor calls.
+        assert_eq!(
+            sanitize_free_machine_identifiers("return f(snapshotInstance(Product@412));", &bound),
+            "return f(aot.snapshotRef(412));"
         );
     }
 
@@ -5081,6 +6142,251 @@ while (true) {
         assert!(output.contains("final recoveredInstance ="));
         assert!(output.contains("recoveredInstance._slot_8 = arg0;"));
         assert!(!output.contains("this._slot_8 ="));
+    }
+
+    #[test]
+    fn renders_vm_allocations_dispatch_calls_and_type_tests_as_values() {
+        let library = RecoveredLibrary {
+            uri: "package:app/vector.dart".to_owned(),
+            package: Some("app".to_owned()),
+            output_path: PathBuf::from("vector.dart"),
+            is_application: true,
+            vm_object_id: None,
+            imports: Vec::new(),
+            referenced_libraries: Vec::new(),
+        };
+        let call =
+            |target: &str, arguments: &[&str], address: &str| SemanticStatement::ResolvedCall {
+                target: target.to_owned(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+                confidence: EvidenceConfidence::Medium,
+                address: address.to_owned(),
+            };
+        let mut function = sample_function();
+        function.semantic_statements = vec![
+            call("stub AllocateContext", &["1"], "0x1000"),
+            SemanticStatement::FieldWrite {
+                receiver: "stub_AllocateContext_1000_result".to_owned(),
+                field: "captured0".to_owned(),
+                offset: 12,
+                value: "arg0".to_owned(),
+                confidence: EvidenceConfidence::Low,
+                address: "0x1004".to_owned(),
+            },
+            // Consumed by an interpolation: nothing reads it afterwards.
+            call("stub AllocateArray", &["null", "4"], "0x1008"),
+            call("stub AllocateUint8Array", &["arg0"], "0x100c"),
+            call("dispatch 1019 []", &["stub_AllocateUint8Array_100c_result", "2"], "0x1010"),
+            call("dispatch 77", &["arg0", "dispatch_1019____result"], "0x1014"),
+            call("stub InstanceOf", &["dispatch_77_result", "String"], "0x1018"),
+            SemanticStatement::Return {
+                expression: "stub_InstanceOf_1018_result".to_owned(),
+                confidence: EvidenceConfidence::Low,
+                address: "0x101c".to_owned(),
+            },
+        ];
+        let program = RecoveredProgram {
+            libraries: vec![library.clone()],
+            functions: vec![function],
+            ..RecoveredProgram::default()
+        };
+        let index = RenderIndex::new(&program);
+        let output = render_library(&library, &program, &index);
+
+        assert!(
+            output.contains("final context = aot.context(1);"),
+            "{output}"
+        );
+        assert!(output.contains("context.captured0 = arg0;"), "{output}");
+        assert!(!output.contains("List<dynamic>.filled"), "{output}");
+        assert!(
+            output.contains("final typedList = Uint8List((arg0 >> 1));"),
+            "{output}"
+        );
+        assert!(
+            output.contains("final dispatchResult = typedList[2];"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "final dispatchResult2 = aot.dispatch(77, arg0, <dynamic>[dispatchResult]);"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("final isInstance = dispatchResult2 is String;"),
+            "{output}"
+        );
+        assert!(output.contains("return isInstance;"), "{output}");
+        assert!(!output.contains("shared-code result"), "{output}");
+    }
+
+    #[test]
+    fn renders_array_element_reads_as_index_expressions() {
+        let aliases = BTreeMap::from([("sub_1_result".to_owned(), "items".to_owned())]);
+        assert_eq!(
+            super::render_readable_expression("sub_1_result[(arg0 % 10)]", &aliases),
+            "items[arg0 % 10]"
+        );
+        assert_eq!(
+            super::split_index_expression("a[b][c]"),
+            Some(("a[b]", "c"))
+        );
+        assert_eq!(super::split_index_expression("f(x[1])"), None);
+        assert_eq!(super::split_index_expression("'a[b]'"), None);
+    }
+
+    #[test]
+    fn escapes_control_and_bidi_characters_in_literals_and_comments() {
+        assert_eq!(super::dart_string("a\u{202E}b\u{0}"), "'a\\u{202e}b\\u{0}'");
+        assert_eq!(
+            super::safe_comment("x\ny */ \u{2066}z"),
+            "x y * / \\u{2066}z"
+        );
+    }
+
+    #[test]
+    fn renames_the_support_prefix_when_the_library_declares_aot() {
+        let clean = "import 'x.dart' as aot;\nfinal v = aot.invoke('a', []);\n".to_owned();
+        assert_eq!(super::rename_colliding_support_prefix(clean.clone()), clean);
+        let colliding = "import 'x.dart' as aot;\nint aot(int v) => v;\n\
+                         final w = aot.unresolvedValue('aot.staticField(1)') + aot(2);\n"
+            .to_owned();
+        assert_eq!(
+            super::rename_colliding_support_prefix(colliding),
+            "import 'x.dart' as aot_;\nint aot(int v) => v;\n\
+             final w = aot_.unresolvedValue('aot_.staticField(1)') + aot(2);\n"
+        );
+    }
+
+    #[test]
+    fn leaves_snapshot_instances_inside_strings_alone() {
+        let body = "return aot.unresolvedValue('snapshotInstance(Product@412)') \
+                    ?? snapshotInstance(Product@412);";
+        assert_eq!(
+            super::rewrite_snapshot_instances(body),
+            "return aot.unresolvedValue('snapshotInstance(Product@412)') \
+             ?? aot.snapshotRef(412);"
+        );
+    }
+
+    #[test]
+    fn keeps_register_shaped_function_calls_and_lifter_vocabulary() {
+        let bound = BTreeSet::new();
+        assert_eq!(
+            sanitize_free_machine_identifiers("return x1(x1) + r2(local70);", &bound),
+            "return x1(aot.unresolvedRegister('x1')) + r2(aot.unresolvedValue('slot 0x70'));"
+        );
+        assert!(super::is_lifter_vocabulary("aot"));
+        assert!(super::is_lifter_vocabulary("arg12"));
+        assert!(super::is_lifter_vocabulary("x16"));
+        assert!(!super::is_lifter_vocabulary("sub_1000"));
+    }
+
+    #[test]
+    fn renders_native_bodies_through_their_member_name() {
+        let library = RecoveredLibrary {
+            uri: "dart:core".to_owned(),
+            package: None,
+            output_path: PathBuf::from("core.dart"),
+            is_application: true,
+            vm_object_id: None,
+            imports: Vec::new(),
+            referenced_libraries: Vec::new(),
+        };
+        let mut function = sample_function();
+        function.owner = Some("_Double".to_owned());
+        function.name = "_toString".to_owned();
+        function.library_uri = Some("dart:core".to_owned());
+        function.semantic_statements = vec![
+            SemanticStatement::ResolvedCall {
+                target: "native call".to_owned(),
+                arguments: vec!["arg0".to_owned()],
+                confidence: EvidenceConfidence::Medium,
+                address: "0x1000".to_owned(),
+            },
+            SemanticStatement::Return {
+                expression: "native_call_result".to_owned(),
+                confidence: EvidenceConfidence::Medium,
+                address: "0x1004".to_owned(),
+            },
+        ];
+        let program = RecoveredProgram {
+            libraries: vec![library.clone()],
+            functions: vec![function],
+            ..RecoveredProgram::default()
+        };
+        let index = RenderIndex::new(&program);
+        let output = render_library(&library, &program, &index);
+
+        assert!(
+            output
+                .contains("final nativeResult = aot.native('_Double._toString', <dynamic>[arg0]);"),
+            "{output}"
+        );
+        assert!(output.contains("return nativeResult;"), "{output}");
+    }
+
+    #[test]
+    fn renders_throws_and_runtime_closures() {
+        let library = RecoveredLibrary {
+            uri: "package:app/vector.dart".to_owned(),
+            package: Some("app".to_owned()),
+            output_path: PathBuf::from("vector.dart"),
+            is_application: true,
+            vm_object_id: None,
+            imports: Vec::new(),
+            referenced_libraries: Vec::new(),
+        };
+        let mut function = sample_function();
+        function.name = "fail".to_owned();
+        function.semantic_statements = vec![
+            SemanticStatement::ResolvedCall {
+                target: "Timer.run".to_owned(),
+                arguments: vec!["aot.closure('Foo.<anonymous closure>', arg0)".to_owned()],
+                confidence: EvidenceConfidence::Medium,
+                address: "0x1000".to_owned(),
+            },
+            SemanticStatement::Throw {
+                expression: "arg0".to_owned(),
+                stack_trace: None,
+                confidence: EvidenceConfidence::Medium,
+                address: "0x1004".to_owned(),
+            },
+        ];
+        let program = RecoveredProgram {
+            libraries: vec![library.clone()],
+            functions: vec![function],
+            ..RecoveredProgram::default()
+        };
+        let index = RenderIndex::new(&program);
+        let output = render_library(&library, &program, &index);
+
+        assert!(
+            output.contains("aot.closure('Foo.<anonymous closure>', arg0)"),
+            "{output}"
+        );
+        assert!(output.contains("throw arg0;"), "{output}");
+    }
+
+    #[test]
+    fn closure_allocations_render_their_function_and_context() {
+        let aliases = BTreeMap::from([("sub_10_result".to_owned(), "context".to_owned())]);
+        assert_eq!(
+            render_closure_allocation("aot.closure('A.<anonymous closure>')", &aliases).as_deref(),
+            Some("aot.closure('A.<anonymous closure>')")
+        );
+        assert_eq!(
+            render_closure_allocation("aot.closure('it\\'s', sub_10_result)", &aliases).as_deref(),
+            Some("aot.closure('it\\'s', context)")
+        );
+        assert_eq!(
+            render_closure_allocation("aot.closure('A') + 1", &aliases),
+            None
+        );
     }
 
     #[test]
@@ -5322,6 +6628,10 @@ while (true) {
             }),
             signature_source: Some(RecoveredSignatureSource::SnapshotFunction),
             parameter_count: Some(3),
+            machine_interface: None,
+            loading_unit: None,
+            parameter_defaults: Default::default(),
+            async_modifier: None,
             lexical_parent: None,
             vm_evidence: None,
             address: "0x1000".to_owned(),
@@ -5334,6 +6644,30 @@ while (true) {
             source_bands: BTreeMap::new(),
             statements: Vec::new(),
         }
+    }
+
+    #[test]
+    fn static_root_stubs_are_evidence_only_by_code_identity() {
+        let mut function = sample_function();
+        function.name = "opaque".to_owned();
+        let roots = crate::model::SnapshotRootEvidence {
+            profile: "dart-3.9".to_owned(),
+            root_library_reference: None,
+            global_object_pool_reference: None,
+            named_stub_references: BTreeMap::from([("resume_stub".to_owned(), 42)]),
+            initial_field_references: Vec::new(),
+            shared_initial_field_references: Vec::new(),
+        };
+        assert!(super::source_visible_function(&function, Some(&roots)));
+        function.code_reference = 42;
+        assert!(!super::source_visible_function(&function, Some(&roots)));
+        function.code_reference = 1;
+        function.code_alias_references.push(42);
+        assert!(!super::source_visible_function(&function, Some(&roots)));
+        // Display names alone are not evidence that a function is a VM stub.
+        function.code_alias_references.clear();
+        function.name = "stub Resume".to_owned();
+        assert!(super::source_visible_function(&function, Some(&roots)));
     }
 
     fn recovered_type(snapshot_reference: i32, display_name: &str) -> RecoveredType {

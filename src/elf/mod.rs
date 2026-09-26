@@ -49,8 +49,17 @@ impl<'a> ElfImage<'a> {
     }
 
     pub fn snapshot_regions(&self) -> Result<Vec<SnapshotRegion>> {
-        let mut regions = Vec::with_capacity(SNAPSHOT_SYMBOLS.len());
-        for name in SNAPSHOT_SYMBOLS {
+        self.regions_named(&SNAPSHOT_SYMBOLS)
+    }
+
+    /// A deferred loading unit carries only isolate data and instructions.
+    pub fn unit_snapshot_regions(&self) -> Result<Vec<SnapshotRegion>> {
+        self.regions_named(&["_kDartIsolateSnapshotData", "_kDartIsolateSnapshotInstructions"])
+    }
+
+    fn regions_named(&self, names: &[&str]) -> Result<Vec<SnapshotRegion>> {
+        let mut regions = Vec::with_capacity(names.len());
+        for &name in names {
             let symbol = self
                 .file
                 .symbols()

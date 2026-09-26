@@ -181,12 +181,16 @@ pub struct RecoveredProgram {
     pub strings: Vec<RecoveredString>,
     pub functions: Vec<RecoveredFunction>,
     pub snapshot_evidence: Option<SnapshotEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_roots: Option<SnapshotRootEvidence>,
     pub dispatch_table: Option<RecoveredDispatchTable>,
     pub cross_abi: Option<CrossAbiReport>,
     /// Physical-body / logical-occurrence resolution summary: shared bodies,
     /// extent conflicts, and unbound oracle occurrences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_graph_report: Option<crate::evidence::body::BodyGraphReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_graph: Option<crate::evidence::body::BodyGraph>,
     /// ABI-neutral consensus over aligned occurrences; facts promoted to
     /// `CrossAbiCorroborated` live here, disputes are retained verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,6 +209,116 @@ pub struct RecoveredProgram {
     /// which libraries are rendered. Not serialized.
     #[serde(skip)]
     pub declaration_evidence: Vec<RecoveredDeclaration>,
+    /// Typed constant values reachable from the object pool, keyed by
+    /// snapshot reference (the `@N` in `snapshotInstance(Class@N)` and the
+    /// `N` in `snapshotRef(N)` labels).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub constants: BTreeMap<i32, SnapshotConstant>,
+    /// Deferred loading units recovered against the root snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loading_units: Vec<LoadingUnitRecovery>,
+    /// Snapshot dispatch-table evidence for the final semantic relift. Not
+    /// serialized; `dispatch_table` carries the reported summary.
+    #[serde(skip)]
+    pub dispatch_analysis: Option<std::sync::Arc<crate::analysis::disassembly::DispatchTableData>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SnapshotRootEvidence {
+    pub profile: String,
+    pub root_library_reference: Option<i32>,
+    pub global_object_pool_reference: Option<i32>,
+    pub named_stub_references: BTreeMap<String, i32>,
+    /// Field-table index is the vector index; the referenced value lives in
+    /// `constants` when its retained object could be decoded.
+    pub initial_field_references: Vec<i32>,
+    pub shared_initial_field_references: Vec<i32>,
+}
+
+/// One typed value from the snapshot's constant graph. Edges are snapshot
+/// references into the same graph.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SnapshotConstant {
+    Null,
+    Bool {
+        value: bool,
+    },
+    Int {
+        value: i64,
+    },
+    Double {
+        value: f64,
+    },
+    String {
+        value: String,
+    },
+    List {
+        elements: Vec<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        type_arguments: Option<String>,
+        immutable: bool,
+    },
+    Map {
+        entries: Vec<(i32, i32)>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        type_arguments: Option<String>,
+    },
+    Set {
+        elements: Vec<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        type_arguments: Option<String>,
+    },
+    Record {
+        fields: Vec<i32>,
+        /// Index into the VM's record field-name table; nonzero means some
+        /// fields are named, but the names themselves are not serialized.
+        field_names_index: usize,
+    },
+    Instance {
+        class_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        library_uri: Option<String>,
+        /// The constant's name when the class is an enum.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        enum_name: Option<String>,
+        canonical: bool,
+        slots: Vec<ConstantSlot>,
+    },
+    Type {
+        display: String,
+    },
+    Closure {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        function: Option<String>,
+    },
+}
+
+/// One instance field slot by byte offset.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConstantSlot {
+    pub offset: i64,
+    pub value: ConstantSlotValue,
+    /// Field an exact Field object places at this offset, including
+    /// inherited and out-of-scope framework fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// That field's declared type, which decides how unboxed bits read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_type: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConstantSlotValue {
+    Reference {
+        reference: i32,
+    },
+    /// Raw unboxed bits; the snapshot does not say whether they are a
+    /// double or an int.
+    Unboxed {
+        bits: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -589,10 +703,17 @@ pub struct RecoveredFieldMetadata {
     pub is_late: bool,
     pub has_initializer: bool,
     pub has_nontrivial_initializer: bool,
+    /// Static field stored in the isolate group's shared field table
+    /// (`Field::SharedBit`), whose ids are separate from ordinary statics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_shared: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance_field_offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_field_offset: Option<i64>,
+    /// Index into the (shared) field table for a static field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_field_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_value_object_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -624,13 +745,36 @@ pub struct RecoveredFunction {
     pub kind: Option<RecoveredFunctionKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_static: Option<bool>,
+    /// `async`, `sync*` or `async*`, from `Function::ModifierBits` when the
+    /// snapshot's exact layout is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_modifier: Option<AsyncModifier>,
+    /// Optional positional parameter defaults recovered from the prologue's
+    /// missing-argument path, keyed by visible parameter position. These
+    /// describe the compiled program (see `RecoveredSignatureSource`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameter_defaults: BTreeMap<usize, String>,
+    /// Deferred loading unit whose image holds this body; `None` for the
+    /// root unit. Addresses of unit bodies carry the unit id in bits 40+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loading_unit: Option<u32>,
     /// Name of the lexically enclosing member for closures, recovered from
     /// the snapshot's `ClosureData.parent_function` edge without debug info.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lexical_parent: Option<String>,
+    /// The retained runtime signature (snapshot FunctionType or oracle).
+    /// It describes the compiled program after TFA signature shaking, which
+    /// can remove unused or constant parameters and turn always-supplied
+    /// named parameters into positional ones; it is not proof of the
+    /// original source declaration.
     pub signature: Option<RecoveredSignature>,
     pub signature_source: Option<RecoveredSignatureSource>,
     pub parameter_count: Option<usize>,
+    /// Where the compiled body receives its parameters, inferred from the
+    /// calling convention and the body's own reads. A machine-level fact,
+    /// separate from both the retained signature and the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_interface: Option<MachineInterface>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_evidence: Option<VmFunctionEvidence>,
     pub address: String,
@@ -664,6 +808,9 @@ pub struct RecoveredCodeMetadata {
     pub unchecked_entry_offset: Option<u64>,
     pub has_monomorphic_entrypoint: bool,
     pub catch_entry_reference: Option<i32>,
+    /// Decoded `catch_entry` move maps, one per call site inside a try.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catch_entry_moves: Vec<CatchEntryMoves>,
     pub inlined_functions_reference: Option<i32>,
     pub pc_descriptors_reference: Option<i32>,
     pub pc_descriptors: Vec<RecoveredPcDescriptor>,
@@ -722,6 +869,42 @@ impl RecoveredCodeMetadata {
     }
 }
 
+/// Moves the VM performs when an exception thrown at the call returning to
+/// `pc_offset` enters its handler.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CatchEntryMoves {
+    pub pc_offset: u32,
+    pub moves: Vec<CatchEntryMove>,
+}
+
+/// Copies `source` into the tagged frame slot `destination`. Slots are
+/// frame variable indices: slot `s >= 0` lives at `fp - (s + 1) * word` in
+/// AOT frames. A constant's source is an object-pool index.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CatchEntryMove {
+    pub kind: CatchMoveSource,
+    pub source: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_high: Option<i32>,
+    pub destination: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchMoveSource {
+    Constant,
+    Tagged,
+    Float,
+    Double,
+    Float32x4,
+    Float64x2,
+    Int32x4,
+    Int64Pair,
+    Int64,
+    Int32,
+    Uint32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RecoveredPcDescriptor {
     pub pc_offset: u32,
@@ -740,6 +923,10 @@ pub struct CodeSourceMapEntry {
     pub source_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_reference: Option<i32>,
+    /// Name recorded for a null check, resolved through the exact-version
+    /// global object-pool root. Absent when the root or pool entry is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub null_check_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -844,6 +1031,19 @@ pub struct RecoveredInlineRegion {
     /// Inclusive start / exclusive end pc offsets relative to the code entry.
     pub start_pc_offset: u32,
     pub end_pc_offset: u32,
+    /// Nesting depth: 1 for a callee inlined into the host body.
+    #[serde(default)]
+    pub depth: usize,
+    /// Index of the enclosing region in the same list, for nested inlining.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
+    /// Regions with the same occurrence id are one inlined call split into
+    /// discontiguous pc ranges (same callee, same parent, same call line).
+    #[serde(default)]
+    pub occurrence: usize,
+    /// Source line of the call site in the caller, when the map recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_line: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -915,6 +1115,32 @@ impl RecoveredFunctionKind {
     }
 }
 
+/// Incoming parameter locations of one compiled body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MachineInterface {
+    pub parameters: Vec<MachineParameter>,
+    /// The body returns its value in the FPU return register (an unboxed
+    /// double).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub returns_unboxed_double: bool,
+    /// Whether the parameter count came from retained metadata; otherwise
+    /// the list holds only the parameters the body was seen to read.
+    pub parameter_count_known: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MachineParameter {
+    pub name: String,
+    /// Register name, register pair `lo:hi`, or `stack[word]` counted from
+    /// the last stacked parameter.
+    pub location: String,
+    /// `tagged`, `unboxed_int64` or `unboxed_double`.
+    pub representation: &'static str,
+    /// `proven` when every convention hypothesis consistent with the body
+    /// agrees, `assumed` when this is the compiler default among several.
+    pub proof: &'static str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredSignature {
     pub fixed_parameter_count: usize,
@@ -965,6 +1191,9 @@ pub struct RecoveredType {
     pub library_uri: Option<String>,
 }
 
+/// Provenance of a retained runtime signature. Every source here describes
+/// the compiled callable after TFA transformations, not the original
+/// declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveredSignatureSource {
@@ -1003,6 +1232,10 @@ pub struct MachineCodeEvidence {
     pub dispatch_table_calls: usize,
     pub resolved_dispatch_table_calls: usize,
     pub semantic_statements: usize,
+    /// The semantic dataflow pass hit its visit budget. Expressions from
+    /// partial block states were discarded instead of treated as converged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub semantic_worklist_exhausted: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1071,10 +1304,44 @@ pub enum SemanticStatement {
         confidence: EvidenceConfidence,
         address: String,
     },
+    /// Assigns a value merged at a control-flow join (`phi_<join>_<loc>`)
+    /// from one predecessor. Emitted at that predecessor's last instruction.
+    Assign {
+        variable: String,
+        value: String,
+        confidence: EvidenceConfidence,
+        address: String,
+    },
+    /// A static or top-level field read through the thread's field table.
+    /// `field` is `Owner.name`, or `_static_<id>` when no Field object
+    /// survived to name the table slot.
+    StaticFieldRead {
+        field: String,
+        field_id: i64,
+        shared: bool,
+        confidence: EvidenceConfidence,
+        address: String,
+    },
+    StaticFieldWrite {
+        field: String,
+        field_id: i64,
+        shared: bool,
+        value: String,
+        confidence: EvidenceConfidence,
+        address: String,
+    },
     Condition {
         expression: String,
         true_target: Option<String>,
         false_target: Option<String>,
+        confidence: EvidenceConfidence,
+        address: String,
+    },
+    /// `throw expression`, from a call to the VM's `Throw` stub. A
+    /// `ReThrow` stub call also carries the original stack trace.
+    Throw {
+        expression: String,
+        stack_trace: Option<String>,
         confidence: EvidenceConfidence,
         address: String,
     },
@@ -1094,13 +1361,58 @@ impl SemanticStatement {
             | Self::ResolvedCall { address, .. }
             | Self::FieldRead { address, .. }
             | Self::FieldWrite { address, .. }
+            | Self::StaticFieldRead { address, .. }
+            | Self::Assign { address, .. }
+            | Self::StaticFieldWrite { address, .. }
             | Self::Condition { address, .. }
-            | Self::StringInterpolation { address, .. } => address,
+            | Self::StringInterpolation { address, .. }
+            | Self::Throw { address, .. } => address,
         }
     }
 
     pub fn is_return(&self) -> bool {
         matches!(self, Self::Return { .. })
+    }
+
+    /// Whether any value this statement reads or produces mentions `needle`.
+    pub fn mentions(&self, needle: &str) -> bool {
+        let mut texts = Vec::<&str>::new();
+        match self {
+            Self::Return { expression, .. } | Self::Condition { expression, .. } => {
+                texts.push(expression)
+            }
+            Self::ResolvedCall {
+                target, arguments, ..
+            } => {
+                texts.push(target);
+                texts.extend(arguments.iter().map(String::as_str));
+            }
+            Self::FieldRead {
+                receiver,
+                expression,
+                ..
+            } => texts.extend([receiver.as_str(), expression.as_str()]),
+            Self::FieldWrite {
+                receiver, value, ..
+            } => texts.extend([receiver.as_str(), value.as_str()]),
+            Self::Assign {
+                variable, value, ..
+            } => texts.extend([variable.as_str(), value.as_str()]),
+            Self::StaticFieldRead { field, .. } => texts.push(field),
+            Self::StaticFieldWrite { value, .. } => texts.push(value),
+            Self::Throw {
+                expression,
+                stack_trace,
+                ..
+            } => {
+                texts.push(expression);
+                texts.extend(stack_trace.as_deref());
+            }
+            Self::StringInterpolation { parts, .. } => {
+                texts.extend(parts.iter().map(String::as_str))
+            }
+        }
+        texts.iter().any(|text| text.contains(needle))
     }
 
     #[allow(dead_code)]
@@ -1110,10 +1422,33 @@ impl SemanticStatement {
             | Self::ResolvedCall { confidence, .. }
             | Self::FieldRead { confidence, .. }
             | Self::FieldWrite { confidence, .. }
+            | Self::StaticFieldRead { confidence, .. }
+            | Self::Assign { confidence, .. }
+            | Self::StaticFieldWrite { confidence, .. }
             | Self::Condition { confidence, .. }
-            | Self::StringInterpolation { confidence, .. } => *confidence,
+            | Self::StringInterpolation { confidence, .. }
+            | Self::Throw { confidence, .. } => *confidence,
         }
     }
+}
+
+/// Outcome of recovering one deferred loading unit against the root.
+#[derive(Clone, Debug, Serialize)]
+pub struct LoadingUnitRecovery {
+    pub id: u32,
+    pub path: String,
+    pub functions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsyncModifier {
+    None,
+    Async,
+    SyncStar,
+    AsyncStar,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

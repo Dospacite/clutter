@@ -172,6 +172,7 @@ recovered/
 │   ├── resources.json
 │   ├── symbols.json             identifiers and strings with provenance
 │   ├── snapshot_evidence.json   typed object-graph and VM metadata totals
+│   ├── snapshot_roots.json      validated root, stub and field-table references
 │   ├── vm_oracle.json           optional VM validation and match totals
 │   ├── vm_snapshot_analyzer.json complete optional VM semantic index
 │   └── deferred_units.json      when deferred AOT units are packaged
@@ -415,6 +416,16 @@ contain confidential strings, API endpoints, or other sensitive material.
   Future-return-type heuristic plus an explanatory comment. Generator
   (`sync*`/`async*`) identity is reported as documentation because recovered
   bodies use `return`, not `yield`.
+- For the exact Dart 3.9.2 and 3.12.2 snapshot hashes, retained Function
+  modifier bits identify synchronous, async and generator bodies without
+  readable names. Yield PC descriptors in an async body identify suspension
+  calls and recover `await` boundaries. A proven synchronous modifier takes
+  precedence over async-callee heuristics. Other hashes keep the existing
+  fallback. `reports/functions.json` includes the decoded modifier.
+- Validated object-store roots identify the root library even when its URI is
+  an opaque obfuscated token. This token does not establish an original package
+  boundary. Code identities reached through VM stub roots stay in the reports
+  and are excluded from the source view without requiring an oracle.
 - Closures with a provable enclosing member — an authoritative VM
   lexical-parent link or containment inside the parent's source-line span —
   render as local functions nested in that parent; identically named

@@ -236,12 +236,27 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         .info()
         .deferred_payloads
         .iter()
-        .filter(|deferred| deferred.module == payload.module && deferred.abi == payload.abi)
+        // Loading units ship in feature modules of a bundle, not only next
+        // to the root payload.
+        .filter(|deferred| deferred.abi == payload.abi)
         .cloned()
         .collect::<Vec<_>>();
+    let mut unit_images = Vec::new();
     for deferred in &deferred_payloads {
-        match artifact
-            .read_payload(&deferred.path)
+        let bytes = artifact.read_payload(&deferred.path);
+        if let Ok(bytes) = bytes.as_ref() {
+            match crate::snapshot::deferred_unit_image(bytes, deferred.abi, &deferred.path) {
+                Ok(image) => unit_images.push(image),
+                Err(error) => program.warnings.push(Warning {
+                    code: "W_DEFERRED_UNIT_UNREADABLE".to_owned(),
+                    message: format!(
+                        "Deferred loading unit {} has no readable snapshot: {error}",
+                        deferred.path
+                    ),
+                }),
+            }
+        }
+        match bytes
             .and_then(|bytes| analysis::inspect_deferred_unit(&deferred.path, deferred.abi, &bytes))
         {
             Ok(evidence) => program.deferred_units.push(evidence),
@@ -254,15 +269,7 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
             }),
         }
     }
-    if !deferred_payloads.is_empty() {
-        program.warnings.push(Warning {
-            code: "W_DEFERRED_UNITS_INDEXED".to_owned(),
-            message: format!(
-                "The selected payload has {} deferred AOT loading unit(s). Their ELF identity, snapshot symbols, and instruction-section sizes are recorded in metadata/deferred_units.json; logical function reconstruction currently covers the root unit.",
-                deferred_payloads.len(),
-            ),
-        });
-    }
+    unit_images.sort_by_key(|image| image.id);
     let obfuscation_map = arguments
         .obfuscation_map
         .as_deref()
@@ -282,6 +289,7 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
             snapshot_scope,
             program.application_package.as_deref(),
             obfuscation_map.as_ref(),
+            &unit_images,
         )
     };
     let (snapshot_recovery, debug_symbols) = if let Some(symbol_path) = arguments.symbols.as_deref()
@@ -330,8 +338,24 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         });
     }
     let ownership_obfuscated = snapshot_recovery.ownership_obfuscated;
+    program.root_library_uri = snapshot_recovery.root_library_uri;
     program.snapshot_evidence = Some(snapshot_recovery.snapshot_evidence.clone());
+    program.snapshot_roots = snapshot_recovery.snapshot_roots;
     program.dispatch_table = snapshot_recovery.dispatch_table;
+    program.dispatch_analysis = Some(std::sync::Arc::new(snapshot_recovery.dispatch_analysis));
+    program.constants = snapshot_recovery.constants;
+    for unit in &snapshot_recovery.loading_units {
+        if let Some(error) = &unit.error {
+            program.warnings.push(Warning {
+                code: "W_DEFERRED_UNIT_NOT_RECOVERED".to_owned(),
+                message: format!(
+                    "Deferred loading unit {} was indexed but not recovered: {error}",
+                    unit.path
+                ),
+            });
+        }
+    }
+    program.loading_units = snapshot_recovery.loading_units;
     analysis::attach_snapshot_strings(&mut program, snapshot_recovery.snapshot_strings);
     let vm_oracle_present = arguments.vm_oracle.is_some();
     let oracle_subject = crate::evidence::subject::ArtifactSubject::observe(
@@ -387,7 +411,7 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
     // Full declaration evidence (every scope) enriches call sites with field
     // layouts, constructor identities, and signatures even when --scope
     // restricts which libraries are rendered.
-    let full_declarations = snapshot_declarations.clone();
+    let full_declarations = snapshot_recovery.evidence_declarations;
     let all_snapshot_functions = snapshot_functions.clone();
     let functions = if let Some(debug) = debug_symbols {
         let linked_declarations = analysis::recover_linked_snapshot_declarations(
@@ -450,69 +474,18 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
     // closures are appended as distinct occurrences, never overwritten.
     let body_graph = crate::evidence::body::build(
         &program,
-        payload.abi,
+        &oracle_subject,
         snapshot
             .regions
             .iter()
-            .find(|region| region.name == "_kDartIsolateSnapshotInstructions"),
+            .find(|region| region.name == "_kDartIsolateSnapshotInstructions")
+            .ok_or_else(|| {
+                ClutterError::Analysis("isolate instruction region is missing".to_owned())
+            })?,
         vm_oracle.as_ref().map_or(&[], |oracle| oracle.functions()),
     )?;
     program.body_graph_report = Some(body_graph.report());
-
-    // Signature/type constraint solving over static evidence. Descriptor
-    // facts come only from an exactly bound oracle; everything else stays a
-    // bounded or unknown outcome in the appropriate tier.
-    let mut descriptor_by_name: std::collections::BTreeMap<
-        (Option<String>, Option<String>, String),
-        crate::evidence::signature_solver::DescriptorShape,
-    > = std::collections::BTreeMap::new();
-    if let Some(oracle) = &vm_oracle {
-        for candidate in oracle.functions() {
-            let (fixed, optional, optional_named, implicit) = match (
-                candidate.fixed_parameter_count,
-                candidate.optional_parameter_count,
-                candidate.optional_parameters_are_named,
-                candidate.implicit_parameter_count,
-            ) {
-                (Some(fixed), Some(optional), Some(named), Some(implicit)) => {
-                    (fixed, optional, named, implicit)
-                }
-                _ => continue,
-            };
-            let key = (
-                candidate.library_uri.clone(),
-                candidate.owner.clone(),
-                candidate.name.clone(),
-            );
-            descriptor_by_name.insert(key, (fixed, optional, optional_named, implicit));
-        }
-    }
-    let mut problems = Vec::new();
-    {
-        let mut seen_names = std::collections::BTreeSet::new();
-        for function in &program.functions {
-            let key = (
-                function.library_uri.clone(),
-                function.owner.clone(),
-                function.name.clone(),
-            );
-            if !seen_names.insert(key.clone()) {
-                continue;
-            }
-            let descriptor = descriptor_by_name.get(&key).copied();
-            problems.push(crate::evidence::signature_solver::SignatureProblem {
-                name_key: key,
-                call_site_constraints: Vec::new(),
-                descriptor,
-                receivers: Vec::new(),
-            });
-        }
-        for function in &program.functions {
-            crate::evidence::signature_solver::accumulate_call_sites(function, &mut problems);
-        }
-    }
-    let signature_results = crate::evidence::signature_solver::solve(&mut problems);
-    program.signature_solutions = Some(signature_results);
+    program.body_graph = Some(body_graph);
 
     let mut stub_cleanup = None;
     if let Some(oracle) = vm_oracle {
@@ -524,6 +497,15 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         )?);
     }
     analysis::relink_calls(&mut program);
+    // Call-shape solving runs after oracle attachment so exactly bound
+    // Function metadata is authoritative, and before the final relift so
+    // solved facts reach the lifter and renderer. Every recovered body,
+    // in or out of the output scope, contributes call sites.
+    program.signature_solutions = Some(crate::evidence::signature_solver::solve_program(
+        payload.abi,
+        &program.functions,
+        &all_snapshot_functions,
+    ));
     analysis::enrich_semantics(
         &mut program,
         payload.abi,
@@ -576,6 +558,7 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
                     output_scope,
                     program.application_package.as_deref(),
                     obfuscation_map.as_ref(),
+                    &[],
                 )?
                 .functions)
             })();
@@ -630,6 +613,7 @@ fn decompile(arguments: DecompileArgs) -> Result<()> {
         }
     }
 
+    crate::analysis::assign_unique_output_paths(&mut program.libraries);
     let backup = crate::output::write(
         &arguments.out,
         WriteRequest {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +89,8 @@ pub struct Coverage {
     pub semantic_statements: usize,
     pub recovered_field_reads: usize,
     pub recovered_field_writes: usize,
+    pub recovered_static_field_reads: usize,
+    pub recovered_static_field_writes: usize,
     pub recovered_conditions: usize,
     pub high_confidence_returns: usize,
     pub rendered_source_functions: usize,
@@ -149,6 +151,7 @@ struct FunctionSummary<'a> {
     kind: Option<&'static str>,
     signature: &'a Option<crate::model::RecoveredSignature>,
     signature_source: Option<&'static str>,
+    async_modifier: Option<crate::model::AsyncModifier>,
     vm_evidence: &'a Option<crate::model::VmFunctionEvidence>,
     code_metadata: &'a Option<crate::model::RecoveredCodeMetadata>,
     machine_code: &'a crate::model::MachineCodeEvidence,
@@ -288,8 +291,15 @@ fn write_generated_files(stage: &Path, request: &WriteRequest<'_>) -> Result<()>
         &call_graph(request.program),
     )?;
     write_assembly(&stage.join("reports/assembly.s"), request.program)?;
+    write_json(
+        &stage.join("reports/inline_fragments.json"),
+        &inline_fragments(request.program),
+    )?;
     if let Some(evidence) = &request.program.snapshot_evidence {
         write_json(&stage.join("metadata/snapshot_evidence.json"), evidence)?;
+    }
+    if let Some(roots) = &request.program.snapshot_roots {
+        write_json(&stage.join("metadata/snapshot_roots.json"), roots)?;
     }
     if let Some(evidence) = &request.program.vm_oracle {
         write_json(&stage.join("metadata/vm_oracle.json"), evidence)?;
@@ -302,7 +312,7 @@ fn write_generated_files(stage: &Path, request: &WriteRequest<'_>) -> Result<()>
     if let Some(consensus) = &request.program.cross_abi_consensus {
         write_json(&stage.join("reports/cross_abi_consensus.json"), consensus)?;
     }
-    if let Some(body_graph) = &request.program.body_graph_report {
+    if let Some(body_graph) = &request.program.body_graph {
         write_json(&stage.join("reports/body_graph.json"), body_graph)?;
     }
     if let Some(dispatch_table) = &request.program.dispatch_table {
@@ -363,6 +373,8 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
     let mut semantic_statements = 0usize;
     let mut recovered_field_reads = 0usize;
     let mut recovered_field_writes = 0usize;
+    let mut recovered_static_field_reads = 0usize;
+    let mut recovered_static_field_writes = 0usize;
     let mut recovered_conditions = 0usize;
     let mut high_confidence_returns = 0usize;
     let mut unique_ranges = std::collections::BTreeSet::new();
@@ -402,6 +414,17 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
                     )
                 })
                 .count();
+            for statement in &function.semantic_statements {
+                match statement {
+                    crate::model::SemanticStatement::StaticFieldRead { .. } => {
+                        recovered_static_field_reads += 1;
+                    }
+                    crate::model::SemanticStatement::StaticFieldWrite { .. } => {
+                        recovered_static_field_writes += 1;
+                    }
+                    _ => {}
+                }
+            }
             recovered_conditions += function
                 .semantic_statements
                 .iter()
@@ -644,19 +667,31 @@ fn coverage(request: &WriteRequest<'_>) -> Coverage {
         semantic_statements,
         recovered_field_reads,
         recovered_field_writes,
+        recovered_static_field_reads,
+        recovered_static_field_writes,
         recovered_conditions,
         high_confidence_returns,
         rendered_source_functions: request
             .program
             .functions
             .iter()
-            .filter(|function| crate::render::source_visible_function(function))
+            .filter(|function| {
+                crate::render::source_visible_function(
+                    function,
+                    request.program.snapshot_roots.as_ref(),
+                )
+            })
             .count(),
         evidence_only_functions: request
             .program
             .functions
             .iter()
-            .filter(|function| !crate::render::source_visible_function(function))
+            .filter(|function| {
+                !crate::render::source_visible_function(
+                    function,
+                    request.program.snapshot_roots.as_ref(),
+                )
+            })
             .count(),
         decoded_function_bytes,
         undecoded_function_bytes,
@@ -712,6 +747,7 @@ fn function_index(program: &RecoveredProgram) -> FunctionIndex<'_> {
                 kind: function.kind.map(|kind| kind.label()),
                 signature: &function.signature,
                 signature_source: function.signature_source.map(|source| source.label()),
+                async_modifier: function.async_modifier,
                 vm_evidence: &function.vm_evidence,
                 code_metadata: &function.code_metadata,
                 machine_code: &function.machine_code,
@@ -720,6 +756,107 @@ fn function_index(program: &RecoveredProgram) -> FunctionIndex<'_> {
                 inlined_function_count: function.inlined_functions.len(),
             })
             .collect(),
+    }
+}
+
+#[derive(Serialize)]
+struct InlineFragments<'a> {
+    note: &'static str,
+    fragments: Vec<InlineFragment<'a>>,
+}
+
+/// One inlined call: a callee's code folded into a host body, possibly split
+/// into several pc ranges. Statements are those whose innermost inline
+/// occurrence is this one.
+#[derive(Serialize)]
+struct InlineFragment<'a> {
+    callee: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callee_library_uri: Option<&'a str>,
+    callee_reference: i32,
+    /// Whether a standalone body of the callee was recovered as well.
+    standalone_body: bool,
+    host: String,
+    host_address: &'a str,
+    depth: usize,
+    /// Callees enclosing this one, outermost first.
+    inlined_through: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_line: Option<i64>,
+    pc_ranges: Vec<[u32; 2]>,
+    statements: Vec<&'a crate::model::SemanticStatement>,
+}
+
+fn inline_fragments(program: &RecoveredProgram) -> InlineFragments<'_> {
+    let standalone = program
+        .functions
+        .iter()
+        .map(|function| (function.name.as_str(), function.library_uri.as_deref()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut fragments = Vec::new();
+    for function in &program.functions {
+        let Some(entry) = u64::from_str_radix(function.address.trim_start_matches("0x"), 16).ok()
+        else {
+            continue;
+        };
+        let regions = &function.inline_regions;
+        let innermost = |pc: u32| {
+            regions
+                .iter()
+                .filter(|region| region.start_pc_offset <= pc && pc < region.end_pc_offset)
+                .max_by_key(|region| region.depth)
+                .map(|region| region.occurrence)
+        };
+        let mut by_occurrence = BTreeMap::<usize, Vec<usize>>::new();
+        for (index, region) in regions.iter().enumerate() {
+            by_occurrence.entry(region.occurrence).or_default().push(index);
+        }
+        for (occurrence, members) in by_occurrence {
+            let first = &regions[members[0]];
+            let mut inlined_through = Vec::new();
+            let mut parent = first.parent;
+            while let Some(index) = parent {
+                inlined_through.push(regions[index].name.as_str());
+                parent = regions[index].parent;
+            }
+            inlined_through.reverse();
+            let statements = function
+                .semantic_statements
+                .iter()
+                .filter(|statement| {
+                    u64::from_str_radix(statement.address().trim_start_matches("0x"), 16)
+                        .ok()
+                        .and_then(|address| u32::try_from(address.checked_sub(entry)?).ok())
+                        .is_some_and(|pc| innermost(pc) == Some(occurrence))
+                })
+                .collect();
+            fragments.push(InlineFragment {
+                callee: &first.name,
+                callee_library_uri: first.library_uri.as_deref(),
+                callee_reference: first.function_reference,
+                standalone_body: standalone
+                    .contains(&(first.name.as_str(), first.library_uri.as_deref())),
+                host: match function.owner.as_deref() {
+                    Some(owner) if !matches!(owner, "::" | "top_level") => {
+                        format!("{owner}.{}", function.name)
+                    }
+                    _ => function.name.clone(),
+                },
+                host_address: &function.address,
+                depth: first.depth,
+                inlined_through,
+                call_line: first.call_line,
+                pc_ranges: members
+                    .iter()
+                    .map(|index| [regions[*index].start_pc_offset, regions[*index].end_pc_offset])
+                    .collect(),
+                statements,
+            });
+        }
+    }
+    InlineFragments {
+        note: "Each fragment is one inlined call as compiled into its host. Fragments of the same callee from different hosts can differ after constant propagation and specialization; they are not assembled into one body.",
+        fragments,
     }
 }
 
@@ -971,15 +1108,15 @@ fn write_unresolved(path: &Path, program: &RecoveredProgram) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).at(parent)?;
     }
-    let mut file = File::create(path).at(path)?;
+    let mut file = BufWriter::new(File::create(path).at(path)?);
     for warning in &program.warnings {
-        serde_json::to_writer(&mut file, warning)?;
+        write_json_line(&mut file, warning)?;
         file.write_all(b"\n").at(path)?;
     }
     for function in &program.functions {
         for statement in &function.statements {
             if let crate::model::PseudoStatement::UnknownOperation { address, bytes } = statement {
-                serde_json::to_writer(
+                write_json_line(
                     &mut file,
                     &serde_json::json!({
                         "code": "W_UNKNOWN_INSTRUCTION",
@@ -994,7 +1131,7 @@ fn write_unresolved(path: &Path, program: &RecoveredProgram) -> Result<()> {
             }
         }
     }
-    Ok(())
+    file.flush().at(path)
 }
 
 fn prepare_destination(output: &Path, replace: bool) -> Result<Option<PathBuf>> {
@@ -1026,9 +1163,97 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).at(parent)?;
     }
-    let file = File::create(path).at(path)?;
-    serde_json::to_writer_pretty(file, value)?;
-    Ok(())
+    let mut file = BufWriter::new(File::create(path).at(path)?);
+    let mut serializer = serde_json::Serializer::with_formatter(
+        &mut file,
+        SafeText(serde_json::ser::PrettyFormatter::new()),
+    );
+    value.serialize(&mut serializer)?;
+    file.flush().at(path)
+}
+
+/// Serializes `value` as one compact JSON line through [`SafeText`].
+fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> serde_json::Result<()> {
+    let mut serializer =
+        serde_json::Serializer::with_formatter(writer, SafeText(serde_json::ser::CompactFormatter));
+    value.serialize(&mut serializer)
+}
+
+/// JSON formatting that also escapes bidirectional formatting characters.
+/// Snapshot strings are data the analyzed app chose; a report must not
+/// display differently from what it contains ("Trojan Source"). JSON
+/// already escapes the C0 controls before they reach a string fragment.
+struct SafeText<F>(F);
+
+impl<F: serde_json::ser::Formatter> serde_json::ser::Formatter for SafeText<F> {
+    fn write_string_fragment<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        fragment: &str,
+    ) -> std::io::Result<()> {
+        let mut start = 0;
+        for (index, character) in fragment.char_indices() {
+            if crate::analysis::disassembly::needs_unicode_escape(character) {
+                writer.write_all(&fragment.as_bytes()[start..index])?;
+                write!(writer, "\\u{:04x}", character as u32)?;
+                start = index + character.len_utf8();
+            }
+        }
+        writer.write_all(&fragment.as_bytes()[start..])
+    }
+
+    fn begin_array<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.0.begin_array(writer)
+    }
+
+    fn end_array<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.0.end_array(writer)
+    }
+
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        self.0.begin_array_value(writer, first)
+    }
+
+    fn end_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        self.0.end_array_value(writer)
+    }
+
+    fn begin_object<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.0.begin_object(writer)
+    }
+
+    fn end_object<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+        self.0.end_object(writer)
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        self.0.begin_object_key(writer, first)
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        self.0.begin_object_value(writer)
+    }
+
+    fn end_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        self.0.end_object_value(writer)
+    }
 }
 
 fn write_text(path: &Path, contents: &str) -> Result<()> {
@@ -1046,7 +1271,7 @@ fn generated_readme(request: &WriteRequest<'_>) -> String {
          - Dart snapshot: `{}`\n\
          - ABI: `{}`\n\
          - Application package: `{}`\n\
-         - VM-resolved root library: `{}`\n\
+         - Snapshot/VM root library: `{}`\n\
          - Recovered libraries: {}\n\
          - Recovered identifiers: {}\n\
          - Recovered strings: {}\n\
@@ -1143,5 +1368,36 @@ mod tests {
             fs::read_to_string(output.join("keep.txt")).unwrap(),
             "user data"
         );
+    }
+
+    #[test]
+    fn buffered_json_writes_complete_nested_reports() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("reports/nested.json");
+        let value = serde_json::json!({"entries": vec!["retained evidence"; 2000]});
+        super::write_json(&path, &value).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffered_report_flush_errors_are_not_silently_dropped() {
+        // This fits in the buffer. Only the explicit flush sees ENOSPC.
+        let path = std::path::Path::new("/dev/full");
+        let error = super::write_json(path, &serde_json::json!({"small": true})).unwrap_err();
+        assert!(matches!(error, crate::diagnostic::ClutterError::Io { .. }));
+        let error = super::write_unresolved(
+            path,
+            &crate::model::RecoveredProgram {
+                warnings: vec![crate::model::Warning {
+                    code: "W_TEST".to_owned(),
+                    message: "flush failure".to_owned(),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::diagnostic::ClutterError::Io { .. }));
     }
 }

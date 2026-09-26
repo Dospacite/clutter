@@ -21,11 +21,6 @@ use serde::Serialize;
 
 use super::tier::EvidenceTier;
 
-/// Maximum distinct values hashed per fingerprint component. Keeps the
-/// fingerprint small and stable; overflow is folded into a saturating mix so
-/// two bodies differing only past the cap still differ in the mixed digest.
-const FINGERPRINT_COMPONENT_CAP: usize = 16;
-
 /// ABI-neutral alignment key for one logical function occurrence.
 ///
 /// Every component survives obfuscation or is deliberately tolerant of its
@@ -36,13 +31,15 @@ const FINGERPRINT_COMPONENT_CAP: usize = 16;
 pub struct OccurrenceKey {
     pub library_uri: Option<String>,
     pub owner: Option<String>,
-    /// Index of this member among the owner's recovered members in snapshot
-    /// order. Two ABIs compiling the same Dart source produce the same order.
+    pub member: Option<String>,
+    /// Occurrence index among members with the same qualified display name.
     pub lexical_index: usize,
     /// Fixed + optional arity when proven by a signature; `None` otherwise.
     pub arity: Option<(usize, usize)>,
     /// Key of the enclosing closure occurrence, when any.
     pub parent_lexical: Option<usize>,
+    /// Repeated names without a proven parent remain local to one ABI.
+    pub ambiguous_abi: Option<crate::model::Abi>,
 }
 
 /// One ABI-neutral semantic observation extracted per ABI.
@@ -74,21 +71,18 @@ impl SemanticObservation {
 }
 
 fn fold_hashed(hashes: impl Iterator<Item = u64>) -> u64 {
-    // Commutative accumulation: scheduling order differs across ABIs, so the
-    // fold must not depend on element order. XOR of per-element digests with
-    // a count tag distinguishes multisets while staying order-free.
-    let mut mixed = 0u64;
-    let mut count = 0usize;
-    for hash in hashes {
-        if count >= FINGERPRINT_COMPONENT_CAP {
-            break;
+    let mut values = hashes.collect::<Vec<_>>();
+    values.sort_unstable();
+    // Hash the complete sorted multiset. Repeated equal values still change
+    // the digest, and no tail is silently discarded.
+    let mut mixed = 0xcbf29ce484222325u64;
+    for value in &values {
+        for byte in value.to_le_bytes() {
+            mixed ^= u64::from(byte);
+            mixed = mixed.wrapping_mul(0x100000001b3);
         }
-        mixed ^= scramble(hash);
-        count += 1;
     }
-    // Fold the true element count in so truncation at the cap still
-    // distinguishes multisets of different sizes.
-    mixed ^ scramble(count as u64)
+    mixed ^ scramble(values.len() as u64)
 }
 
 fn scramble(value: u64) -> u64 {
@@ -219,7 +213,18 @@ pub fn reach_consensus(
         let constants_agree = constants.len() == 1;
         let call_topology_agrees = topology.len() == 1;
         let pool_objects_agree = pools.len() == 1;
-        let consensus = constants_agree && call_topology_agrees && pool_objects_agree;
+        let has_evidence = abis.iter().all(|abi| {
+            observations
+                .get(abi)
+                .and_then(|map| map.get(&key))
+                .is_some_and(|observation| {
+                    !observation.constants.is_empty()
+                        || !observation.callees.is_empty()
+                        || !observation.pool_identities.is_empty()
+                })
+        });
+        let consensus =
+            has_evidence && constants_agree && call_topology_agrees && pool_objects_agree;
         let multi_abi = abis.len() > 1;
         match (multi_abi, consensus) {
             (true, true) => report.corroborated_occurrences += 1,
@@ -258,7 +263,9 @@ pub fn reach_consensus(
 pub fn observe_function(function: &crate::model::RecoveredFunction) -> SemanticObservation {
     let mut observation = SemanticObservation::default();
     for instruction in &function.instructions {
-        if let Some(value) = &instruction.object_pool_value {
+        if let Some(value) = &instruction.object_pool_value
+            && !is_opaque_identity(value)
+        {
             observation.pool_identities.push(value.clone());
         }
     }
@@ -266,17 +273,22 @@ pub fn observe_function(function: &crate::model::RecoveredFunction) -> SemanticO
     for statement in &function.statements {
         match statement {
             crate::model::PseudoStatement::DirectCall {
-                target_address,
-                target,
+                target: Some(target),
                 ..
             } => {
-                callees.push(target.clone().unwrap_or_else(|| target_address.clone()));
+                if !is_opaque_identity(target) {
+                    callees.push(target.clone());
+                }
             }
             crate::model::PseudoStatement::RecoveredIndirectCall { target, .. } => {
-                callees.push(target.clone());
+                if !is_opaque_identity(target) {
+                    callees.push(target.clone());
+                }
             }
             crate::model::PseudoStatement::ObjectPoolCall { target, .. } => {
-                callees.push(target.clone());
+                if !is_opaque_identity(target) {
+                    callees.push(target.clone());
+                }
             }
             _ => {}
         }
@@ -290,8 +302,7 @@ pub fn observe_function(function: &crate::model::RecoveredFunction) -> SemanticO
 fn collect_constants(function: &crate::model::RecoveredFunction) -> Vec<i64> {
     let mut constants = Vec::new();
     for instruction in &function.instructions {
-        let value = parse_pool_double(instruction.object_pool_value.as_deref())
-            .or_else(|| parse_immediate(&instruction.operands));
+        let value = parse_pool_double(instruction.object_pool_value.as_deref());
         if let Some(value) = value {
             constants.push(value);
         }
@@ -306,6 +317,9 @@ fn collect_constants(function: &crate::model::RecoveredFunction) -> Vec<i64> {
 /// lifter's pool decoding. Anything else yields no constant evidence.
 fn parse_pool_double(value: Option<&str>) -> Option<i64> {
     let value = value?;
+    if !value.starts_with("doubleBits(") && !value.starts_with("poolDouble(") {
+        return None;
+    }
     let bits_start = value.find('(')? + 1;
     let bits_end = value.rfind(')')?;
     if bits_end < bits_start {
@@ -318,31 +332,11 @@ fn parse_pool_double(value: Option<&str>) -> Option<i64> {
     inner.parse::<i64>().ok()
 }
 
-/// Pull small integer immediates out of operand text (`#0x10`, `#12`,
-/// `$0x2a`). Large or negative-looking machine words are skipped: they are
-/// usually addresses, masks, or ABI-specific encodings rather than source
-/// constants.
-fn parse_immediate(operands: &str) -> Option<i64> {
-    for token in operands.split([',', ' ', '[', ']']) {
-        let token = token.trim();
-        let number = token
-            .strip_prefix('#')
-            .or_else(|| token.strip_prefix('$'))?;
-        let parsed = if let Some(hex) = number
-            .strip_prefix("0x")
-            .or_else(|| number.strip_prefix("0X"))
-        {
-            i64::from_str_radix(hex, 16)
-        } else {
-            number.parse::<i64>()
-        };
-        if let Ok(value) = parsed {
-            if (0..=0xffff).contains(&value) {
-                return Some(value);
-            }
-        }
-    }
-    None
+fn is_opaque_identity(value: &str) -> bool {
+    value.starts_with("sub_")
+        || value.starts_with("snapshotRef(")
+        || value.starts_with("snapshotInstance(")
+        || value.starts_with("0x")
 }
 
 /// Build per-ABI observation maps plus owner lexical indices from recovered
@@ -356,30 +350,32 @@ pub fn consensus_from_functions(
         // Lexical position: first-seen index of each name within its owner's
         // member sequence. Duplicate names (overloads are impossible in Dart,
         // but closures repeat) get their first occurrence's index.
-        let mut owner_members: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+        let mut owner_members: BTreeMap<(Option<String>, Option<String>, String), usize> =
+            BTreeMap::new();
         for function in functions {
-            owner_members
-                .entry(function.owner.clone())
-                .or_default()
-                .push(function.name.clone());
+            *owner_members
+                .entry((
+                    function.library_uri.clone(),
+                    function.owner.clone(),
+                    function.name.clone(),
+                ))
+                .or_default() += 1;
         }
-        let mut lexical: BTreeMap<(Option<String>, String), usize> = BTreeMap::new();
-        for (owner, members) in &owner_members {
-            for (index, name) in members.iter().enumerate() {
-                lexical
-                    .entry((owner.clone(), name.clone()))
-                    .or_insert(index);
-            }
-        }
+        let mut lexical: BTreeMap<(Option<String>, Option<String>, String), usize> =
+            BTreeMap::new();
         let mut maps = BTreeMap::new();
         for function in functions {
+            let identity = (
+                function.library_uri.clone(),
+                function.owner.clone(),
+                function.name.clone(),
+            );
+            let ordinal = lexical.entry(identity.clone()).or_default();
             let key = OccurrenceKey {
                 library_uri: function.library_uri.clone(),
                 owner: function.owner.clone(),
-                lexical_index: lexical
-                    .get(&(function.owner.clone(), function.name.clone()))
-                    .copied()
-                    .unwrap_or(0),
+                member: Some(function.name.clone()),
+                lexical_index: *ordinal,
                 arity: function.signature.as_ref().map(|signature| {
                     (
                         signature.fixed_parameter_count,
@@ -387,7 +383,9 @@ pub fn consensus_from_functions(
                     )
                 }),
                 parent_lexical: None,
+                ambiguous_abi: (owner_members[&identity] > 1).then_some(abi),
             };
+            *ordinal += 1;
             maps.insert(key, observe_function(function));
         }
         observations.insert(abi, maps);
@@ -417,9 +415,11 @@ mod tests {
                     OccurrenceKey {
                         library_uri: Some("package:app/main.dart".into()),
                         owner: Some("Counter".into()),
+                        member: Some("increment".into()),
                         lexical_index: 0,
                         arity: Some((1, 0)),
                         parent_lexical: None,
+                        ambiguous_abi: None,
                     },
                     observation(&[42], &["_interpolate"], &["snapshotString(Deal: )"]),
                 )]),
@@ -448,9 +448,11 @@ mod tests {
                     OccurrenceKey {
                         library_uri: None,
                         owner: None,
+                        member: Some("formatPrice".into()),
                         lexical_index: 3,
                         arity: None,
                         parent_lexical: None,
+                        ambiguous_abi: None,
                     },
                     observation(&extra, &["formatPrice"], &[]),
                 )]),
@@ -480,9 +482,11 @@ mod tests {
                     OccurrenceKey {
                         library_uri: None,
                         owner: Some("A".into()),
+                        member: Some("f".into()),
                         lexical_index: 0,
                         arity: None,
                         parent_lexical: None,
+                        ambiguous_abi: None,
                     },
                     observation(&[1], &["sameCallee"], &pools),
                 )]),
@@ -505,15 +509,55 @@ mod tests {
     }
 
     #[test]
-    fn immediates_and_pool_doubles_are_recognised_but_masks_are_not() {
-        assert_eq!(parse_immediate("#0x10"), Some(16));
-        assert_eq!(parse_immediate("$0x2a"), Some(42));
-        assert_eq!(parse_immediate("#255"), Some(255));
-        assert_eq!(parse_immediate("#0xffffffffffffffff"), None);
+    fn only_typed_pool_doubles_count_as_numeric_evidence() {
         assert_eq!(
             parse_pool_double(Some("doubleBits(1.5)")),
             Some(1.5f64.to_bits() as i64)
         );
+        assert_eq!(parse_pool_double(Some("snapshotRef(123)")), None);
         assert_eq!(parse_pool_double(Some("plainLabel")), None);
+    }
+
+    #[test]
+    fn fingerprints_include_repetitions_and_values_after_sixteen() {
+        let prefix = (0..16).collect::<Vec<i64>>();
+        let mut changed_tail = prefix.clone();
+        changed_tail.push(17);
+        let mut another_tail = prefix.clone();
+        another_tail.push(18);
+        assert_ne!(
+            observation(&changed_tail, &[], &[]).fingerprint(),
+            observation(&another_tail, &[], &[]).fingerprint()
+        );
+        assert_ne!(
+            observation(&[7, 7], &[], &[]).fingerprint(),
+            observation(&[], &[], &[]).fingerprint()
+        );
+    }
+
+    #[test]
+    fn empty_observations_do_not_corroborate() {
+        let key = OccurrenceKey {
+            library_uri: None,
+            owner: None,
+            member: Some("empty".into()),
+            lexical_index: 0,
+            arity: None,
+            parent_lexical: None,
+            ambiguous_abi: None,
+        };
+        let observations = BTreeMap::from([
+            (
+                crate::model::Abi::Arm64V8a,
+                BTreeMap::from([(key.clone(), SemanticObservation::default())]),
+            ),
+            (
+                crate::model::Abi::X86_64,
+                BTreeMap::from([(key, SemanticObservation::default())]),
+            ),
+        ]);
+        let report = reach_consensus(observations);
+        assert_eq!(report.corroborated_occurrences, 0);
+        assert_eq!(report.disputed_occurrences, 1);
     }
 }

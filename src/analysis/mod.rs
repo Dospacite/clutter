@@ -1,3 +1,4 @@
+pub(crate) mod calling_convention;
 mod debug_recovery;
 mod debug_symbols;
 pub(crate) mod disassembly;
@@ -115,14 +116,19 @@ pub fn recover(libapp: &[u8], snapshot: &SnapshotInfo, scope: Scope) -> Recovere
         strings: recovered_strings,
         functions: Vec::new(),
         snapshot_evidence: None,
+        snapshot_roots: None,
         dispatch_table: None,
         cross_abi: None,
         cross_abi_consensus: None,
         body_graph_report: None,
+        body_graph: None,
         signature_solutions: None,
         deferred_units: Vec::new(),
         warnings,
         declaration_evidence: Vec::new(),
+        constants: BTreeMap::new(),
+        loading_units: Vec::new(),
+        dispatch_analysis: None,
     }
 }
 
@@ -621,12 +627,14 @@ fn merge_field_metadata(
     existing.is_late |= incoming.is_late;
     existing.has_initializer |= incoming.has_initializer;
     existing.has_nontrivial_initializer |= incoming.has_nontrivial_initializer;
+    existing.is_shared |= incoming.is_shared;
     existing.instance_field_offset = existing
         .instance_field_offset
         .or(incoming.instance_field_offset);
     existing.static_field_offset = existing
         .static_field_offset
         .or(incoming.static_field_offset);
+    existing.static_field_id = existing.static_field_id.or(incoming.static_field_id);
     existing.static_value_object_id = existing
         .static_value_object_id
         .or(incoming.static_value_object_id);
@@ -748,6 +756,36 @@ pub(crate) fn readable_snapshot_name(value: &str) -> String {
     PRIVATE_KEY.replace_all(value, "").into_owned()
 }
 
+/// Names constant instance slots from exact Field objects of every scope,
+/// so framework constants such as `Color` or `EdgeInsets` render with their
+/// real field names and declared unboxed types. Slots without an exact
+/// Field keep only their offset.
+fn name_constant_slots(
+    constants: &mut BTreeMap<i32, crate::model::SnapshotConstant>,
+    layouts: &disassembly::RecoveredFieldLayout,
+) {
+    for constant in constants.values_mut() {
+        let crate::model::SnapshotConstant::Instance {
+            class_name,
+            library_uri,
+            slots,
+            ..
+        } = constant
+        else {
+            continue;
+        };
+        let class_name = readable_snapshot_name(class_name);
+        for slot in slots {
+            if let Some((name, declared_type)) =
+                layouts.exact_field(&class_name, library_uri.as_deref(), slot.offset)
+            {
+                slot.field = Some(name.to_owned());
+                slot.field_type = declared_type.map(str::to_owned);
+            }
+        }
+    }
+}
+
 /// Re-lifts every recovered function with full semantic evidence:
 /// parameter names from resolved signatures, VM-verified field layouts for
 /// every surviving class (including out-of-scope Flutter/Dart SDK classes),
@@ -766,7 +804,7 @@ pub fn enrich_semantics(
     let mut all_functions = extra_functions.to_vec();
     all_functions.extend(program.functions.iter().cloned());
     let (mut symbols, target_library_candidates) =
-        build_function_symbols(&all_functions, application_package.as_deref());
+        build_function_symbols(abi, &all_functions, application_package.as_deref());
     // The initial snapshot lift names calls through every code range,
     // including out-of-scope Flutter/Dart SDK targets. Preserve those names
     // when re-lifting with enriched layouts.
@@ -811,7 +849,16 @@ pub fn enrich_semantics(
 
     let mut layout_declarations = extra_declarations.to_vec();
     layout_declarations.extend(program.declarations.iter().cloned());
-    let layouts = disassembly::RecoveredFieldLayout::from_declarations(abi, &layout_declarations);
+    attach_retained_argument_counts(&mut symbols, &layout_declarations);
+    let layouts = disassembly::RecoveredFieldLayout::from_declarations(abi, &layout_declarations)
+        .with_exact_thread_layout(
+            abi,
+            program
+                .snapshot_roots
+                .as_ref()
+                .map(|roots| roots.profile.as_str()),
+        );
+    name_constant_slots(&mut program.constants, &layouts);
 
     // Per-class allocation stubs surface as ranges named after their Class
     // but carry no function kind. Backfill their result class from class
@@ -839,32 +886,204 @@ pub fn enrich_semantics(
         let leaf = symbol.label.rsplit('.').next().unwrap_or(&symbol.label);
         if let Some((class, library_uri)) = class_lookup.get(leaf) {
             symbol.result_class = Some(class.clone());
+            symbol.result_library_uri = library_uri.clone();
             if symbol.library_uri.is_none() {
                 symbol.library_uri = library_uri.clone();
             }
         }
     }
 
-    for function in &mut program.functions {
-        let parameter_hints = semantic_parameter_hints(function);
-        let owner = function.owner.as_deref().map(readable_snapshot_name);
-        let receiver_class = owner
+    let dispatch_analysis = program.dispatch_analysis.clone();
+    // Functions a caller can reach other than by a direct call: dispatch
+    // table rows, closures and tear-offs. Their direct callers do not see
+    // every argument.
+    let dispatched = dispatch_analysis
+        .as_deref()
+        .map(|data| data.targets.iter().flatten().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let mut inferred = disassembly::InferredClasses::default();
+    let mut exhausted_worklists = Vec::new();
+    // The second pass lifts again with the parameter and result classes
+    // the first pass's direct calls and returns agree on.
+    for pass in 0..2 {
+        let label_results = disassembly::label_result_classes(&symbols);
+        let dispatch_table = dispatch_analysis
             .as_deref()
-            .map(|owner| (owner, function.library_uri.as_deref()));
-        function.semantic_statements = disassembly::relift_semantics(
-            function,
-            abi,
-            &parameter_hints,
-            Some(&layouts),
-            receiver_class,
-            &symbols,
+            .and_then(disassembly::DispatchTableData::analysis)
+            .map(|table| disassembly::DispatchTableAnalysis {
+                label_results: Some(&label_results),
+                ..table
+            });
+        exhausted_worklists.clear();
+        let mut facts = Vec::new();
+        for function in &mut program.functions {
+            let mut parameter_hints = semantic_parameter_hints(function);
+            let address = disassembly::parse_immediate_public(&function.address);
+            if let Some(classes) = address.and_then(|address| inferred.parameters.get(&address)) {
+                for (index, (class, library)) in classes {
+                    if let Some(hint) = parameter_hints.get_mut(*index)
+                        && hint.class_name.is_none()
+                        && hint.name != "this"
+                    {
+                        hint.class_name = Some(class.clone());
+                        hint.class_library_uri = library.clone();
+                    }
+                }
+            }
+            let owner = function.owner.as_deref().map(readable_snapshot_name);
+            let receiver_class = owner
+                .as_deref()
+                .map(|owner| (owner, function.library_uri.as_deref()));
+            let lifted = disassembly::relift_semantics(
+                function,
+                abi,
+                &parameter_hints,
+                Some(&layouts),
+                receiver_class,
+                &symbols,
+                dispatch_table.as_ref(),
+            );
+            function.semantic_statements = lifted.statements;
+            // Lifter indices count implicit parameters (receiver, closure
+            // context); signatures number visible parameters.
+            // Only optional slots of the retained signature can
+            // carry a prologue default; a merge of a fixed parameter with a
+            // constant is ordinary control flow.
+            function.parameter_defaults = function
+                .signature
+                .as_ref()
+                .filter(|signature| signature.optional_parameter_count > 0)
+                .map(|signature| {
+                    let first_optional = signature
+                        .implicit_parameter_count
+                        .saturating_add(signature.fixed_parameter_count);
+                    let end = first_optional.saturating_add(signature.optional_parameter_count);
+                    lifted
+                        .parameter_defaults
+                        .iter()
+                        .filter(|(index, _)| (first_optional..end).contains(*index))
+                        .map(|(index, value)| {
+                            (index - signature.implicit_parameter_count, value.clone())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            function.machine_code.semantic_worklist_exhausted = lifted.worklist_exhausted;
+            if pass == 0
+                && let Some(address) = address
+            {
+                let reachable_indirectly = matches!(
+                    function.kind,
+                    Some(
+                        crate::model::RecoveredFunctionKind::Closure
+                            | crate::model::RecoveredFunctionKind::ImplicitClosure
+                    )
+                ) || symbols
+                    .get(&address)
+                    .is_none_or(|symbol| dispatched.contains(&symbol.label));
+                facts.push((address, reachable_indirectly, lifted.facts));
+            }
+            if lifted.worklist_exhausted {
+                exhausted_worklists.push(format!("{} at {}", function.name, function.address));
+            }
+            function.machine_interface =
+                disassembly::machine_interface(function, abi, &parameter_hints);
+            promote_recovered_indirect_calls(
+                function,
+                &target_libraries,
+                application_package.as_deref(),
+            );
+            function.machine_code.semantic_statements = function.semantic_statements.len();
+        }
+        if pass == 0 {
+            inferred = disassembly::infer_interprocedural_classes(&facts);
+            if inferred.parameters.is_empty() && inferred.results.is_empty() {
+                break;
+            }
+            for symbol in symbols.values_mut() {
+                if symbol.result_class.is_some() {
+                    continue;
+                }
+                if let Some((class, library)) = symbol
+                    .code_address
+                    .and_then(|address| inferred.results.get(&address))
+                {
+                    symbol.result_class = Some(class.clone());
+                    symbol.result_library_uri = library.clone();
+                }
+            }
+        }
+    }
+    if !exhausted_worklists.is_empty() {
+        program.warnings.push(Warning {
+            code: "W_SEMANTIC_WORKLIST_EXHAUSTED".to_owned(),
+            message: format!(
+                "Semantic analysis reached its visit limit for {} function(s); partial dataflow states were discarded. First affected: {}",
+                exhausted_worklists.len(),
+                exhausted_worklists.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
+}
+
+fn attach_retained_argument_counts(
+    symbols: &mut BTreeMap<u64, disassembly::Symbol>,
+    layout_declarations: &[RecoveredDeclaration],
+) {
+    // A named code target can lack a recovered body, but its retained
+    // FunctionType may still bound the number of values supplied at a call.
+    // Require a unique declaration identity; same-named methods in different
+    // libraries must not lend one another an argument count.
+    let mut signature_counts: BTreeMap<String, BTreeMap<(Option<String>, i32), usize>> =
+        BTreeMap::new();
+    for declaration in layout_declarations {
+        if declaration.kind != crate::model::RecoveredDeclarationKind::Function {
+            continue;
+        }
+        let Some(signature) = declaration.signature.as_ref() else {
+            continue;
+        };
+        if signature.optional_parameter_count != 0 {
+            continue;
+        }
+        let name = readable_snapshot_name(&declaration.name);
+        let qualified = declaration
+            .owner
+            .as_deref()
+            .filter(|owner| !matches!(*owner, "::" | "top_level"))
+            .map_or(name.clone(), |owner| {
+                format!("{}.{}", readable_snapshot_name(owner), name)
+            });
+        signature_counts.entry(qualified).or_default().insert(
+            (
+                declaration.library_uri.clone(),
+                declaration.snapshot_reference,
+            ),
+            signature
+                .implicit_parameter_count
+                .saturating_add(signature.fixed_parameter_count),
         );
-        promote_recovered_indirect_calls(
-            function,
-            &target_libraries,
-            application_package.as_deref(),
-        );
-        function.machine_code.semantic_statements = function.semantic_statements.len();
+    }
+    for symbol in symbols.values_mut() {
+        symbol.value_argument_count = None;
+        if symbol.parameters.is_some() || !symbol.semantic_name {
+            continue;
+        }
+        let Some(candidates) = signature_counts.get(&symbol.label) else {
+            continue;
+        };
+        let matching = candidates
+            .iter()
+            .filter(|((library, _), _)| {
+                symbol
+                    .library_uri
+                    .as_ref()
+                    .is_none_or(|expected| library.as_ref() == Some(expected))
+            })
+            .collect::<Vec<_>>();
+        if let [(_, count)] = matching.as_slice() {
+            symbol.value_argument_count = Some(**count);
+        }
     }
 }
 
@@ -879,7 +1098,7 @@ pub(crate) fn promote_recovered_indirect_calls(
         .filter_map(|statement| match statement {
             crate::model::SemanticStatement::ResolvedCall {
                 target, address, ..
-            } => Some((address.clone(), target.clone())),
+            } if !target.starts_with("dispatch ") => Some((address.clone(), target.clone())),
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
@@ -912,34 +1131,83 @@ pub(crate) fn promote_recovered_indirect_calls(
     }
 }
 
+/// Transfers a retained signature between a member and its compiler-made
+/// companions: the tear-off (`ImplicitClosure`) and the dynamic invocation
+/// forwarder (`dyn:name`) of the same library/owner/member.
+///
+/// These share the member's visible parameters but not its implicit ones:
+/// an instance method's receiver, a tear-off's closure context, and a
+/// static method's absence of either. The visible parameter list is copied
+/// and the implicit count recomputed for the target's kind. Unrelated kinds
+/// with a coinciding display name (anonymous closures of one class,
+/// getters and methods) never exchange signatures.
 fn propagate_matching_signatures(functions: &mut [crate::model::RecoveredFunction]) {
-    let signatures = functions
-        .iter()
-        .filter_map(|function| {
-            let signature = function.signature.clone()?;
-            Some((
-                (
-                    function.library_uri.clone(),
-                    function.owner.clone(),
-                    function.name.clone(),
-                ),
-                (signature, function.parameter_count),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
+    use crate::model::RecoveredFunctionKind as Kind;
+    fn member_name(function: &crate::model::RecoveredFunction) -> Option<String> {
+        match function.kind? {
+            Kind::Regular | Kind::ImplicitClosure => Some(function.name.clone()),
+            Kind::DynamicInvocationForwarder => Some(
+                function
+                    .name
+                    .strip_prefix("dyn:")
+                    .unwrap_or(&function.name)
+                    .to_owned(),
+            ),
+            _ => None,
+        }
+    }
+    fn implicit_count(function: &crate::model::RecoveredFunction) -> Option<usize> {
+        match function.kind? {
+            Kind::ImplicitClosure | Kind::DynamicInvocationForwarder => Some(1),
+            Kind::Regular => function.is_static.map(|is_static| usize::from(!is_static)),
+            _ => None,
+        }
+    }
+    let mut signatures = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for function in functions.iter() {
+        let (Some(signature), Some(name)) = (function.signature.clone(), member_name(function))
+        else {
+            continue;
+        };
+        let key = (function.library_uri.clone(), function.owner.clone(), name);
+        let visible = (
+            signature.fixed_parameter_count,
+            signature.optional_parameter_count,
+            signature.optional_parameters_are_named,
+            signature.resolved.clone(),
+        );
+        match signatures.get(&key) {
+            Some((existing, _)) if *existing != visible => {
+                ambiguous.insert(key);
+            }
+            Some(_) => {}
+            None => {
+                signatures.insert(key, (visible, signature));
+            }
+        }
+    }
     for function in functions {
         if function.signature.is_some() {
             continue;
         }
-        let key = (
-            function.library_uri.clone(),
-            function.owner.clone(),
-            function.name.clone(),
-        );
-        if let Some((signature, parameter_count)) = signatures.get(&key) {
-            function.signature = Some(signature.clone());
+        let (Some(name), Some(implicit)) = (member_name(function), implicit_count(function)) else {
+            continue;
+        };
+        let key = (function.library_uri.clone(), function.owner.clone(), name);
+        if ambiguous.contains(&key) {
+            continue;
+        }
+        if let Some((_, signature)) = signatures.get(&key) {
+            let mut signature = signature.clone();
+            signature.implicit_parameter_count = implicit;
+            function.parameter_count = Some(
+                signature
+                    .fixed_parameter_count
+                    .saturating_add(signature.optional_parameter_count),
+            );
+            function.signature = Some(signature);
             function.signature_source = Some(RecoveredSignatureSource::RelatedFunction);
-            function.parameter_count = *parameter_count;
         }
     }
 }
@@ -1090,7 +1358,22 @@ pub(crate) fn relink_calls(program: &mut RecoveredProgram) {
             // An interior address proves physical code ownership but not a
             // callable Dart entry point. Promote semantic identity only for
             // exact checked/unchecked entries.
-            if exact.contains_key(&address) {
+            // `WriteBarrierWrappers` is entered at per-register offsets; its
+            // root-proven identity covers the whole body.
+            let interior_stub = containing_code_range(&ranges, address)
+                .is_some()
+                && ranges
+                    .get(
+                        ranges
+                            .partition_point(|range| range.code_address <= address)
+                            .saturating_sub(1),
+                    )
+                    .and_then(|range| range.label.as_deref())
+                    == Some("stub WriteBarrierWrappers");
+            if interior_stub {
+                *target = Some("stub WriteBarrierWrappers".to_owned());
+                *target_scope = crate::model::CallTargetScope::Runtime;
+            } else if exact.contains_key(&address) {
                 if let Some(label) = identity.label {
                     *target = Some(label.clone());
                     *target_library_uri = identity.library_uri.clone();
@@ -1174,7 +1457,6 @@ fn containing_code_range(
 
 fn semantic_function_name(function: &crate::model::RecoveredFunction) -> Option<String> {
     if function.name_source == crate::model::RecoveredNameSource::Synthetic
-        || function.name.starts_with("sub_")
         || matches!(function.name.as_str(), "" | "unknownFunction")
         || function.vm_evidence.as_ref().is_some_and(|evidence| {
             matches!(
@@ -1279,6 +1561,55 @@ pub(crate) fn library_output_path(uri: &str, application_package: Option<&str>) 
     PathBuf::from(format!("recovered_{}.dart", &hex::encode(digest)[..12]))
 }
 
+/// Makes every library's output path unique, comparing case-insensitively
+/// so case-only differences cannot overwrite each other on macOS or Windows.
+/// Sanitizing and the `dart/` and `packages/` roots let different URIs share
+/// a path: an application file `lib/dart/core.dart` maps where `dart:core`
+/// does. The library whose URI scheme owns the path keeps it (`dart:` under
+/// `dart/`, a dependency package under `packages/`, the application
+/// elsewhere); every other one gets a URI digest before its extension.
+pub(crate) fn assign_unique_output_paths(libraries: &mut [crate::model::RecoveredLibrary]) {
+    let key = |path: &std::path::Path| path.to_string_lossy().to_lowercase();
+    let owns = |library: &crate::model::RecoveredLibrary| {
+        let path = key(&library.output_path);
+        if path.starts_with("dart/") {
+            library.uri.starts_with("dart:")
+        } else if path.starts_with("packages/") {
+            library.uri.starts_with("package:") && !library.is_application
+        } else {
+            library.is_application || !library.uri.starts_with("package:")
+        }
+    };
+    let mut order = (0..libraries.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        owns(&libraries[right])
+            .cmp(&owns(&libraries[left]))
+            .then_with(|| libraries[left].uri.cmp(&libraries[right].uri))
+    });
+    let mut taken = BTreeSet::new();
+    for index in order {
+        let library = &mut libraries[index];
+        if taken.insert(key(&library.output_path)) {
+            continue;
+        }
+        let digest = hex::encode(Sha256::digest(library.uri.as_bytes()));
+        let stem = library
+            .output_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for length in (10..=digest.len()).step_by(6) {
+            let candidate = library
+                .output_path
+                .with_file_name(format!("{stem}.{}.dart", &digest[..length]));
+            if taken.insert(key(&candidate)) {
+                library.output_path = candidate;
+                break;
+            }
+        }
+    }
+}
+
 fn sanitize_relative(value: &str) -> PathBuf {
     let mut path = PathBuf::new();
     for segment in value.split('/') {
@@ -1317,8 +1648,9 @@ mod tests {
     };
 
     use super::{
-        choose_application_package, compare_cross_abi, declarations_represent_same_object,
-        library_output_path, relink_calls,
+        attach_retained_argument_counts, choose_application_package, compare_cross_abi,
+        declarations_represent_same_object, library_output_path, propagate_matching_signatures,
+        relink_calls,
     };
 
     fn recovered_function(
@@ -1343,6 +1675,10 @@ mod tests {
             signature: None,
             signature_source: None,
             parameter_count: None,
+            machine_interface: None,
+            loading_unit: None,
+            parameter_defaults: Default::default(),
+            async_modifier: None,
             lexical_parent: None,
             vm_evidence: None,
             address: "0x1000".to_owned(),
@@ -1458,6 +1794,43 @@ mod tests {
     }
 
     #[test]
+    fn keeps_output_paths_unique_against_impersonating_libraries() {
+        let library = |uri: &str, is_application: bool| crate::model::RecoveredLibrary {
+            uri: uri.to_owned(),
+            package: None,
+            output_path: library_output_path(uri, Some("app")),
+            is_application,
+            vm_object_id: None,
+            imports: Vec::new(),
+            referenced_libraries: Vec::new(),
+        };
+        // Application files that map where SDK libraries do, and two that
+        // differ only by case.
+        let mut libraries = vec![
+            library("package:app/dart/core/bool.dart", true),
+            library("dart:core/bool.dart", false),
+            library("package:app/packages/flutter/src/widgets/framework.dart", true),
+            library("package:flutter/src/widgets/framework.dart", false),
+            library("package:app/case.dart", true),
+            library("package:app/Case.dart", true),
+        ];
+        super::assign_unique_output_paths(&mut libraries);
+
+        let path = |index: usize| libraries[index].output_path.to_string_lossy().into_owned();
+        assert_eq!(path(1), "dart/core/bool.dart");
+        assert_eq!(path(3), "packages/flutter/src/widgets/framework.dart");
+        assert!(path(0).starts_with("dart/core/bool.") && path(0) != path(1));
+        assert!(path(2).starts_with("packages/flutter/src/widgets/framework."));
+        assert_eq!(path(5), "Case.dart");
+        assert!(path(4).starts_with("case.") && path(4).ends_with(".dart"));
+        let unique = libraries
+            .iter()
+            .map(|library| library.output_path.to_string_lossy().to_lowercase())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), libraries.len());
+    }
+
+    #[test]
     fn maps_package_uri_to_source_path() {
         assert_eq!(
             library_output_path("package:my_app/features/home.dart", Some("my_app")),
@@ -1539,5 +1912,88 @@ mod tests {
             program.functions[0].machine_code.code_resolved_direct_calls,
             1
         );
+    }
+
+    fn signature(fixed: usize, implicit: usize) -> RecoveredSignature {
+        RecoveredSignature {
+            fixed_parameter_count: fixed,
+            optional_parameter_count: 0,
+            optional_parameters_are_named: false,
+            implicit_parameter_count: implicit,
+            type_parameters_reference: None,
+            result_type_reference: None,
+            parameter_types_reference: None,
+            named_parameter_names_reference: None,
+            flags: 0,
+            packed_type_parameter_counts: 0,
+            resolved: None,
+        }
+    }
+
+    #[test]
+    fn retained_arity_needs_a_unique_qualified_declaration() {
+        let mut first = closure_declaration(10, None, "int");
+        first.name = "toStringAsFixed".to_owned();
+        first.owner = Some("_Double".to_owned());
+        first.signature = Some(signature(1, 1));
+        let mut second = first.clone();
+        second.snapshot_reference = 11;
+        second.library_uri = Some("package:other/double.dart".to_owned());
+        second.signature = Some(signature(2, 1));
+
+        let mut symbols = BTreeMap::from([
+            (
+                1,
+                super::disassembly::Symbol::new("_Double.toStringAsFixed".to_owned(), None, None),
+            ),
+            (
+                2,
+                super::disassembly::Symbol::new(
+                    "_Double.toStringAsFixed".to_owned(),
+                    first.library_uri.clone(),
+                    None,
+                ),
+            ),
+        ]);
+        attach_retained_argument_counts(&mut symbols, &[first.clone(), second]);
+        assert_eq!(symbols[&1].value_argument_count, None);
+        assert_eq!(symbols[&2].value_argument_count, Some(2));
+
+        // Even within one library, two different retained Function objects
+        // do not establish which one owns an opaque code target.
+        let mut duplicate = first.clone();
+        duplicate.snapshot_reference = 12;
+        attach_retained_argument_counts(&mut symbols, &[first, duplicate]);
+        assert_eq!(symbols[&2].value_argument_count, None);
+    }
+
+    #[test]
+    fn tear_offs_inherit_visible_parameters_with_their_own_implicit_count() {
+        let mut method = recovered_function("area", 0, "x");
+        method.is_static = Some(true);
+        method.signature = Some(signature(2, 0));
+        let mut tear_off = recovered_function("area", 0, "x");
+        tear_off.kind = Some(RecoveredFunctionKind::ImplicitClosure);
+        tear_off.address = "0x2000".to_owned();
+        let mut functions = vec![method, tear_off];
+        propagate_matching_signatures(&mut functions);
+        let inherited = functions[1].signature.as_ref().expect("signature");
+        assert_eq!(inherited.fixed_parameter_count, 2);
+        // A static method has no receiver; its tear-off still receives the
+        // closure context.
+        assert_eq!(inherited.implicit_parameter_count, 1);
+    }
+
+    #[test]
+    fn anonymous_closures_do_not_share_signatures_by_name() {
+        let mut first = recovered_function("<anonymous closure>", 0, "x");
+        first.kind = Some(RecoveredFunctionKind::Closure);
+        first.signature = Some(signature(1, 1));
+        let mut second = first.clone();
+        second.signature = None;
+        second.address = "0x2000".to_owned();
+        let mut functions = vec![first, second];
+        propagate_matching_signatures(&mut functions);
+        assert!(functions[1].signature.is_none());
     }
 }

@@ -8,14 +8,6 @@ use crate::model::{
 use super::cid::Cids;
 use super::types::{FunctionType, ParseResult, SnapshotObject, SnapshotObjectKind, SnapshotScalar};
 
-const NULL_REFERENCE: i32 = 1;
-const EMPTY_ARRAY_REFERENCE: i32 = 4;
-const DYNAMIC_TYPE_REFERENCE: i32 = 7;
-const VOID_TYPE_REFERENCE: i32 = 8;
-const EMPTY_TYPE_ARGUMENTS_REFERENCE: i32 = 9;
-const TRUE_REFERENCE: i32 = 10;
-const FALSE_REFERENCE: i32 = 11;
-
 const TYPE_CLASS_ID_SHIFT: u32 = 3;
 const MAX_TYPE_DEPTH: usize = 12;
 
@@ -125,6 +117,11 @@ pub(super) struct TypeRecovery<'a> {
 }
 
 impl<'a> TypeRecovery<'a> {
+    /// Target `intptr_t` width in bytes.
+    pub fn native_word(&self) -> i64 {
+        self.cids.layout.native_word
+    }
+
     pub fn new(
         isolate: &'a ParseResult,
         vm: &'a ParseResult,
@@ -278,12 +275,12 @@ impl<'a> TypeRecovery<'a> {
         // class bits into phantom fields (probe EC-7 gave `E15Vec` four
         // slots for two source fields), and clear bits inside the range are
         // ordinary reference slots the unboxed bitmap never records.
-        let (header_words, word_size): (i64, i64) = match self.abi {
-            Abi::Arm64V8a => (2, 4),
-            Abi::ArmeabiV7a => (1, 4),
-            Abi::X86_64 => (2, 8),
-        };
-        let header_bytes = header_words * word_size;
+        // Bitmap words are compressed words; x64 builds may use compressed
+        // pointers too, so widths come from the snapshot's features.
+        let layout = self.cids.layout;
+        let word_size = layout.compressed_word;
+        let header_bytes = layout.header_bytes;
+        let header_words = header_bytes / word_size;
         let mut instance_slots = Vec::new();
         for snapshot in [self.isolate, self.vm] {
             let Some(bitmap) = snapshot.instance_bitmaps.get(&class_id) else {
@@ -296,11 +293,28 @@ impl<'a> TypeRecovery<'a> {
                 .find(|cluster| cluster.cid == class_id && cluster.next_field_words > 0)
                 .map(|cluster| i64::from(cluster.next_field_words));
             let field_end = next_field_words.map(|words| words.min(64)).unwrap_or(64);
-            for word in header_words..field_end {
+            // Every unboxed Dart field (double, int64, SIMD) is at least
+            // eight bytes, so with four-byte words an unboxed value spans
+            // two consecutive bitmap bits and is one slot.
+            let unboxed_words = (8 / word_size).max(1);
+            let mut word = header_words;
+            while word < field_end {
                 if word < 0 {
+                    word += 1;
                     continue;
                 }
                 let unboxed = bitmap & (1u64 << word) != 0;
+                let width = if unboxed
+                    && (1..unboxed_words).all(|extra| {
+                        word + extra < field_end && bitmap & (1u64 << (word + extra)) != 0
+                    }) {
+                    unboxed_words
+                } else {
+                    1
+                };
+                let current = word;
+                word += width;
+                let word = current;
                 if !unboxed && next_field_words.is_none() {
                     // Without a trustworthy field count only unboxed bits
                     // mean anything; clear bits could be anything.
@@ -348,7 +362,7 @@ impl<'a> TypeRecovery<'a> {
         let references = snapshot.references_of(object);
         let scalars = snapshot.scalars_of(object);
         let type_reference = references.get(2).copied()?;
-        let initializer_reference = references.get(3).copied().unwrap_or(NULL_REFERENCE);
+        let initializer_reference = references.get(3).copied().unwrap_or(self.cids.base.null);
         let kind_bits = match scalars.first()? {
             SnapshotScalar::Tagged32(value) => *value,
             _ => return None,
@@ -357,6 +371,13 @@ impl<'a> TypeRecovery<'a> {
             Some(SnapshotScalar::Reference(reference)) => Some(*reference),
             _ => None,
         };
+        // The serializer writes `Field::TargetOffsetOf` (compressed words)
+        // for instance fields and the field-table id for static fields,
+        // each as a Smi reference.
+        let is_static = bit(kind_bits, 1);
+        let offset_value =
+            offset_or_field_id_reference.and_then(|reference| self.integer(reference));
+        let layout = self.cids.layout;
         let mut declared_type = self.recover_type(type_reference);
         let owner_type_parameters = references
             .get(1)
@@ -377,12 +398,74 @@ impl<'a> TypeRecovery<'a> {
             has_nontrivial_initializer: bit(kind_bits, 3),
             is_late: bit(kind_bits, 10),
             has_initializer: bit(kind_bits, 14),
-            instance_field_offset: None,
-            static_field_offset: None,
+            is_shared: bit(kind_bits, 15),
+            instance_field_offset: offset_value
+                .filter(|_| !is_static)
+                .map(|words| words * layout.compressed_word),
+            // Field-table slots hold full (uncompressed) object pointers.
+            static_field_offset: offset_value
+                .filter(|_| is_static)
+                .map(|id| id * layout.native_word),
+            static_field_id: offset_value.filter(|_| is_static),
             static_value_object_id: None,
             is_reference: None,
             unboxed_type: None,
         })
+    }
+
+    /// Class id of a Class object's direct superclass, read from the same
+    /// `super_type` slot `class_metadata` decodes. `Object` has none.
+    pub fn super_class_id(&self, class_reference: i32) -> Option<usize> {
+        let (snapshot, object) = self.object(class_reference)?;
+        if object.cid != self.cids.class {
+            return None;
+        }
+        self.type_class_id(snapshot.references_of(object).get(9).copied()?)
+    }
+
+    /// Class ids of a Class object's directly implemented interfaces
+    /// (including the mixins of a transformed mixin application).
+    pub fn interface_class_ids(&self, class_reference: i32) -> Vec<usize> {
+        let Some((snapshot, object)) = self.object(class_reference) else {
+            return Vec::new();
+        };
+        if object.cid != self.cids.class {
+            return Vec::new();
+        }
+        snapshot
+            .references_of(object)
+            .get(5)
+            .map(|reference| {
+                self.array_elements(*reference)
+                    .into_iter()
+                    .filter_map(|reference| self.type_class_id(reference))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether a Class object is abstract (never a runtime receiver class).
+    pub fn class_is_abstract(&self, class_reference: i32) -> Option<bool> {
+        let (snapshot, object) = self.object(class_reference)?;
+        if object.cid != self.cids.class {
+            return None;
+        }
+        match snapshot.scalars_of(object).get(6)? {
+            SnapshotScalar::Tagged32(value) => Some(bit(*value, 6)),
+            _ => None,
+        }
+    }
+
+    fn type_class_id(&self, type_reference: i32) -> Option<usize> {
+        let (snapshot, object) = self.object(type_reference)?;
+        if object.cid != self.cids.type_ {
+            return None;
+        }
+        let flags = match snapshot.scalars_of(object).first()? {
+            SnapshotScalar::Unsigned(value) => u64::try_from(*value).ok()?,
+            _ => return None,
+        };
+        usize::try_from(flags >> TYPE_CLASS_ID_SHIFT).ok()
     }
 
     pub fn recover_type(&self, reference: i32) -> Option<RecoveredType> {
@@ -391,11 +474,15 @@ impl<'a> TypeRecovery<'a> {
     }
 
     pub fn scalar_label(&self, reference: i32) -> Option<String> {
-        match reference {
-            NULL_REFERENCE => Some("null".to_owned()),
-            TRUE_REFERENCE => Some("true".to_owned()),
-            FALSE_REFERENCE => Some("false".to_owned()),
-            _ => self.integer(reference).map(|value| value.to_string()),
+        let base = self.cids.base;
+        if reference == base.null {
+            Some("null".to_owned())
+        } else if reference == base.true_value {
+            Some("true".to_owned())
+        } else if reference == base.false_value {
+            Some("false".to_owned())
+        } else {
+            self.integer(reference).map(|value| value.to_string())
         }
     }
 
@@ -408,18 +495,19 @@ impl<'a> TypeRecovery<'a> {
         if depth >= MAX_TYPE_DEPTH || !visiting.insert(reference) {
             return None;
         }
+        let base = self.cids.base;
         let result = match reference {
-            DYNAMIC_TYPE_REFERENCE => Some(RecoveredType {
+            _ if reference == base.dynamic_type => Some(RecoveredType {
                 snapshot_reference: reference,
                 display_name: "dynamic".to_owned(),
                 library_uri: Some("dart:core".to_owned()),
             }),
-            VOID_TYPE_REFERENCE => Some(RecoveredType {
+            _ if reference == base.void_type => Some(RecoveredType {
                 snapshot_reference: reference,
                 display_name: "void".to_owned(),
                 library_uri: Some("dart:core".to_owned()),
             }),
-            NULL_REFERENCE => None,
+            _ if reference == base.null => None,
             _ => {
                 if let Some((snapshot, object)) = self.object(reference) {
                     if object.cid == self.cids.type_ {
@@ -805,7 +893,7 @@ impl<'a> TypeRecovery<'a> {
     }
 
     fn type_argument_references(&self, reference: i32) -> Vec<i32> {
-        if reference == EMPTY_TYPE_ARGUMENTS_REFERENCE || reference == NULL_REFERENCE {
+        if reference == self.cids.base.empty_type_arguments || reference == self.cids.base.null {
             return Vec::new();
         }
         let Some((snapshot, object)) = self.object(reference) else {
@@ -829,7 +917,7 @@ impl<'a> TypeRecovery<'a> {
     }
 
     pub(crate) fn array_elements(&self, reference: i32) -> Vec<i32> {
-        if reference == EMPTY_ARRAY_REFERENCE || reference == NULL_REFERENCE {
+        if reference == self.cids.base.empty_array || reference == self.cids.base.null {
             return Vec::new();
         }
         let Some((snapshot, object)) = self.object(reference) else {
@@ -850,6 +938,60 @@ impl<'a> TypeRecovery<'a> {
             .get(1..1 + count.unwrap_or_else(|| references.len().saturating_sub(1)))
             .unwrap_or_default()
             .to_vec()
+    }
+
+    /// Descriptor-element view of a referenced object, resolved through
+    /// both the VM and isolate snapshots.
+    pub(crate) fn descriptor_element(
+        &self,
+        reference: i32,
+    ) -> crate::evidence::call_shape::DescriptorElement {
+        use crate::evidence::call_shape::DescriptorElement;
+        if reference == self.cids.base.null {
+            return DescriptorElement::Null;
+        }
+        if let Some(value) = self.integer(reference) {
+            return DescriptorElement::Integer(value);
+        }
+        if let Some(value) = self.string(reference) {
+            return DescriptorElement::String(value.to_owned());
+        }
+        DescriptorElement::Other
+    }
+
+    /// The string a reference denotes in either snapshot.
+    pub(crate) fn resolved_string(&self, reference: i32) -> Option<&str> {
+        self.string(reference)
+    }
+
+    /// The call shape of an `ArgumentsDescriptor` array: the array's value
+    /// elements follow its type-arguments reference.
+    pub(crate) fn arguments_shape(
+        &self,
+        reference: i32,
+    ) -> Option<crate::evidence::call_shape::ArgumentsShape> {
+        // Cached descriptors are VM base objects: the runtime builds them
+        // (`ArgumentsDescriptor::Init`) and the snapshot only refers to them.
+        if let Some((type_args_len, count)) = self.cids.base.cached_descriptor(reference) {
+            return Some(crate::evidence::call_shape::ArgumentsShape {
+                type_args_len,
+                count,
+                size: count,
+                positional: count,
+                named: Vec::new(),
+            });
+        }
+        let (snapshot, object) = self.object(reference)?;
+        if object.kind != SnapshotObjectKind::Array {
+            return None;
+        }
+        let elements = snapshot
+            .references_of(object)
+            .get(1..)?
+            .iter()
+            .map(|element| self.descriptor_element(*element))
+            .collect::<Vec<_>>();
+        crate::evidence::call_shape::ArgumentsShape::from_elements(&elements)
     }
 
     fn integer(&self, reference: i32) -> Option<i64> {
@@ -1065,13 +1207,12 @@ mod tests {
         let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::Arm64V8a, None);
         let metadata = types.class_metadata(60).expect("class metadata");
         let slots = &metadata.instance_slots;
-        assert_eq!(slots.len(), 2);
-        // ARM64 compressed layout: 8-byte header, 4-byte field words.
+        // ARM64 compressed layout: 8-byte header, 4-byte field words. The two
+        // unboxed words are one eight-byte unboxed field, not two slots.
+        assert_eq!(slots.len(), 1);
         assert!(!slots[0].is_reference);
         assert_eq!(slots[0].offset, 8);
         assert_eq!(slots[0].slot_type, "unboxed_field");
-        assert_eq!(slots[1].offset, 12);
-        assert!(!slots[1].is_reference);
     }
 
     #[test]
@@ -1276,5 +1417,104 @@ mod tests {
             replace_type_parameter("SomeT0Name<T0?>", 0, "Value"),
             "SomeT0Name<Value?>"
         );
+    }
+
+    fn field_snapshot(cids: &super::Cids, kind_bits: u32, offset_words: i64) -> ParseResult {
+        use super::SnapshotScalar;
+        let mut snapshot = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        snapshot.insert_object(
+            70,
+            cids.field,
+            false,
+            SnapshotObjectKind::Standard,
+            SnapshotObjectPayload {
+                references: vec![-1, -1, cids.base.dynamic_type, cids.base.null],
+                scalars: vec![
+                    SnapshotScalar::Tagged32(kind_bits),
+                    SnapshotScalar::Reference(71),
+                ],
+                bytes: Vec::new(),
+            },
+        );
+        snapshot.insert_object(
+            71,
+            cids.mint,
+            false,
+            SnapshotObjectKind::Integer,
+            SnapshotObjectPayload {
+                references: Vec::new(),
+                scalars: vec![SnapshotScalar::Tagged64(offset_words)],
+                bytes: Vec::new(),
+            },
+        );
+        snapshot
+    }
+
+    #[test]
+    fn decodes_instance_field_offsets_in_compressed_words() {
+        let mut cids = test_cids();
+        let snapshot = field_snapshot(&cids, 0, 3);
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::X86_64, None);
+        // Compressed pointers (the default x64 Flutter build): 4-byte words.
+        assert_eq!(
+            types.field_metadata(70).unwrap().instance_field_offset,
+            Some(12)
+        );
+        cids.layout = super::super::cid::ObjectLayout::new(8, false);
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::X86_64, None);
+        assert_eq!(
+            types.field_metadata(70).unwrap().instance_field_offset,
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn static_fields_carry_field_table_ids_not_instance_offsets() {
+        let cids = test_cids();
+        let snapshot = field_snapshot(&cids, 1 << 1, 5);
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::Arm64V8a, None);
+        let metadata = types.field_metadata(70).unwrap();
+        assert!(metadata.is_static);
+        assert_eq!(metadata.instance_field_offset, None);
+        assert_eq!(metadata.static_field_offset, Some(40));
+    }
+
+    #[test]
+    fn uncompressed_x64_slots_are_eight_bytes_after_one_header_word() {
+        use super::SnapshotScalar;
+        let mut cids = test_cids();
+        cids.layout = super::super::cid::ObjectLayout::new(8, false);
+        let mut snapshot = ParseResult::new(ClusterHeader {
+            num_base_objects: 0,
+            num_objects: 0,
+            num_clusters: 0,
+            instruction_table_length: 0,
+            instruction_table_data_offset: 0,
+        });
+        snapshot.insert_object(
+            60,
+            cids.class,
+            false,
+            SnapshotObjectKind::Class,
+            SnapshotObjectPayload {
+                references: Vec::new(),
+                scalars: (0..7)
+                    .map(|index| SnapshotScalar::Tagged32(if index == 0 { 44 } else { 0 }))
+                    .collect(),
+                bytes: Vec::new(),
+            },
+        );
+        // Word 1 (the first field word after the 8-byte header) is unboxed.
+        snapshot.instance_bitmaps.insert(44, 0b10);
+        let types = super::TypeRecovery::new(&snapshot, &snapshot, &cids, Abi::X86_64, None);
+        let slots = types.class_metadata(60).unwrap().instance_slots;
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].offset, 8);
     }
 }
