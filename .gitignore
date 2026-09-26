@@ -21,3 +21,7 @@
 
 # Local JADX outputs (never commit decompiled apps)
 /analysis/jadx/
+
+# Local review notes
+PAVO_REVIEW.md
+RECOVERY_REVIEW.md

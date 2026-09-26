@@ -3,9 +3,8 @@
 The local Pavo Connect APK has a separate static regression check. After
 decompiling it, run `python3 test/tool/evaluate_pavo.py OUTPUT_DIRECTORY`.
 The check verifies the exact artifact, root metadata, async modifiers, await
-PC descriptors, stub filtering and function preservation. See
-[`PAVO_REVIEW.md`](../PAVO_REVIEW.md) for measured results and limitations.
-The APK and recovered application data are not committed.
+PC descriptors, stub filtering and function preservation. The APK and
+recovered application data are not committed.
 
 Two minimal Flutter apps used as ground truth for measuring and improving
 Clutter's decompilation. Both contain identical Dart code
